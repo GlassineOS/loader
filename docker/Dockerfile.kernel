@@ -1,0 +1,5 @@
+# Test payload: Alpine linux-lts (EFI stub) + busybox-static for a tiny initramfs.
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+LABEL org.glassine.spike=loader
+RUN apk add --no-cache linux-lts busybox-static cpio
+

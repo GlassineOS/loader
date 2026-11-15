@@ -2,3 +2,8 @@
 !/specs/*/spec.md
 /target
 /out
+/.tmp/
+/.cache/
+/third_party/lvgl-*/
+/third_party/*.tar.gz
+__pycache__/

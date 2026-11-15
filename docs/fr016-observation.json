@@ -1,0 +1,80 @@
+[
+ {
+  "variant": "quiet",
+  "cmdline": "console=ttyS0 quiet",
+  "exclusive_gop": "0",
+  "frames": 26,
+  "frames_changed": 0,
+  "first_change": null,
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=1"
+ },
+ {
+  "variant": "no-quiet",
+  "cmdline": "console=ttyS0",
+  "exclusive_gop": "0",
+  "frames": 25,
+  "frames_changed": 0,
+  "first_change": null,
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=1"
+ },
+ {
+  "variant": "no-quiet-exclusive-gop",
+  "cmdline": "console=ttyS0",
+  "exclusive_gop": "1",
+  "frames": 26,
+  "frames_changed": 0,
+  "first_change": null,
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=1"
+ },
+ {
+  "variant": "console-tty0",
+  "cmdline": "console=ttyS0 console=tty0 quiet",
+  "exclusive_gop": "0",
+  "frames": 25,
+  "frames_changed": 0,
+  "first_change": null,
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=1"
+ },
+ {
+  "variant": "fbcon-nodefer",
+  "cmdline": "console=ttyS0 quiet fbcon=nodefer",
+  "exclusive_gop": "0",
+  "frames": 22,
+  "frames_changed": 10,
+  "first_change": [
+   12,
+   1024000,
+   [
+    0,
+    0,
+    1279,
+    799
+   ]
+  ],
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=0 (M) frame buffer device=1"
+ },
+ {
+  "variant": "console-tty0-noquiet",
+  "cmdline": "console=ttyS0 console=tty0",
+  "exclusive_gop": "0",
+  "frames": 22,
+  "frames_changed": 10,
+  "first_change": [
+   12,
+   1024000,
+   [
+    0,
+    0,
+    1279,
+    799
+   ]
+  ],
+  "fb": "0 simpledrmdrmfb;",
+  "vtcon": "(S) dummy device=0 (M) frame buffer device=1"
+ }
+]

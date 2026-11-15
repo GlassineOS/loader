@@ -1,0 +1,22 @@
+[package]
+name = "glassine-loader"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
+sha2 = { version = "0.10", default-features = false }
+uefi-raw = "=0.17.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[profile.dev]
+panic = "abort"
