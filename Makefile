@@ -1,6 +1,6 @@
 # Everything runs in Docker; the host needs only docker, make and git.
 #   make                 the loader and the test kernel for ARCH (x86_64 or aarch64)
-#   make check           host tests of the core
+#   make check           host tests of the core and of tools/gspl-encode
 #   make test            QEMU cases for ARCH (CASES=... to pick)
 #   make test-fw2        the x86_64 QEMU cases again with Alpine's OVMF (another EDK2 release)
 #   make notices         out/release/NOTICES-ARCH.txt: what the loader has compiled in
@@ -27,11 +27,12 @@ third_party/lvgl-9.6.0/.ok: scripts/fetch-lvgl.sh | image
 
 loader: image third_party/lvgl-9.6.0/.ok
 	$(RUN) cargo build --release --locked --target $(TARGET) -p glassine-loader -p glassine-test-kernel -p glassine-test-parent
+	$(RUN) cargo build --release --locked -p gspl-encode
 	@ls -l $(EFI) | awk '{print "loader ($(ARCH)):", $$5, "bytes"}'
 	@sha256sum $(EFI)
 
 check: image
-	$(RUN) cargo test --locked -p glassine-loader-core
+	$(RUN) cargo test --locked -p glassine-loader-core -p gspl-encode
 
 mkboot: image
 	$(RUN) sh -c 'cd tests/mkboot && cargo build --release --locked'
