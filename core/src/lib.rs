@@ -17,6 +17,7 @@ pub mod plan;
 pub mod raw;
 pub mod record;
 pub mod setrec;
+pub mod touch;
 
 use alloc::string::String;
 use sha2::{Digest, Sha256};
