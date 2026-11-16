@@ -1,4 +1,8 @@
 /specs/*/*
 !/specs/*/spec.md
 /target
+/tests/mkboot/target
 /out
+/.cache
+/.tmp
+/third_party
