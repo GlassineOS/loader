@@ -33,7 +33,8 @@ once, then decides and answers as in 002.
 (`parent.fakefw=1`), the stand-in counts one refresh with the rectangle (0, 0,
 1872, 1404), stride 1872, mode 0, and the CRC-32 of the framebuffer's packed RGB565
 equals the one the test computes from the splash; no `SetMode`, no `Blt`; the answer and
-the count are as without the display.
+the count are as without the display; after the refresh the record is written once more
+with `drew` empty.
 
 ### Scenario 1a – A Mode smaller than the panel (Priority: P1)
 
@@ -111,9 +112,9 @@ no `GetFrameBuffer`, no refresh, the splash store left as it is.
   refresh's status is logged; it says nothing about the panel.
 - **FR-006**: It draws before the answer, never after `ExitBootServices` (the loader
   never calls it), and never calls `SetMode`, `Blt` or a display power protocol.
-- **FR-007**: No key line, no list and no message: which key a person would press at
-  power-on is not defined on such a machine, and each change of the picture would be one
-  more full refresh. The key wait isn't run.
+- **FR-007**: No key line and no message: which key a person would press at power-on is
+  not defined on such a machine. The key wait isn't run. The list is spec 004's start
+  menu, which opens only when it says.
 - **FR-008**: The PC path (001) is unchanged and draws only on a `standard` GOP.
 - **FR-009**: The order and the guards against a refresh that never returns:
   - the decision and its record write (002 FR-004) come first; the draw follows, before
@@ -121,6 +122,9 @@ no `GetFrameBuffer`, no refresh, the splash store left as it is.
   - the loader draws only on a start counted by that write (the answer `default`, the
     record written with `unmarked` raised): a recovery, a request, a pick or a record it
     can't write draws nothing; that counting write sets the loader-owned `drew=1`;
+  - after the refresh returned, before the answer, the loader writes the record once
+    more with `drew` cleared; a failure of that write is logged and changes nothing
+    else, so `drew=1` at entry means a draw that never returned;
   - the loader draws only when the record's `unmarked` was 0 at entry; else it logs
     `EPD_FW_SKIPPED` and stays headless.
 - **FR-010**: The sticky key. A start that finds `unmarked` above 0 and `drew=1` sets
@@ -143,8 +147,8 @@ no outside rewrite of the record; the draw stays off until a deliberate
 
 ## Out of scope
 
-Partial refreshes, other waveforms, a key line or list on such a machine, drawing after
-the answer.
+Other waveforms, a key line on such a machine, drawing after the answer. The menu and
+its partial refreshes are spec 004.
 
 ## Success criteria
 
