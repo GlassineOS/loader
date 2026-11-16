@@ -509,13 +509,27 @@ fn a_bad_or_slow_splash_falls_to_the_default() {
 }
 
 #[test]
-fn epd_draw_only_on_a_counted_start_after_a_healthy_one() {
+fn epd_plan_draws_counted_after_healthy_and_sticks_after_a_drawn_unmarked_start() {
+    let rec = |lines: &str| {
+        let body = format!("format=1\nseq=1\n{lines}");
+        let t = format!("{body}check={}\n", crate::sha256_hex(body.as_bytes()));
+        InUse { rec: record::parse(t.as_bytes()).unwrap(), slot: 0, seq: 1, both_valid: true }
+    };
     let a = |why| Answer::new(Boot::Baseline, why);
-    assert_eq!(epd_draw_allowed(Some(0), &a("default")), Ok(()));
-    assert!(epd_draw_allowed(Some(1), &a("default")).is_err(), "unmarked at entry");
-    assert!(epd_draw_allowed(Some(3), &a("limit")).is_err());
-    assert!(epd_draw_allowed(None, &a("no-record")).is_err());
-    for why in ["not-written", "request", "choice", "limit"] {
-        assert!(epd_draw_allowed(Some(0), &a(why)).is_err(), "{why} isn't counted");
+    let p = epd_plan(Some(&rec("unmarked=0\n")));
+    assert!(p.draw && p.counted == vec![("drew", S::from("1"))] && p.any.is_empty(), "{p:?}");
+    assert_eq!(epd_draws(&p, &a("default")), Ok(()));
+    for why in ["not-written", "request", "choice", "limit", "no-record"] {
+        assert!(epd_draws(&p, &a(why)).is_err(), "{why} isn't counted");
     }
+    // unmarked, the start before didn't draw: no draw, nothing sticky
+    let p = epd_plan(Some(&rec("unmarked=1\n")));
+    assert!(!p.draw && p.any.is_empty() && epd_draws(&p, &a("default")).is_err(), "{p:?}");
+    // unmarked, the start before drew: display_failed set, drew cleared
+    let p = epd_plan(Some(&rec("unmarked=1\ndrew=1\n")));
+    assert_eq!(p.any, vec![("display_failed", S::from("1")), ("drew", S::new())]);
+    // display_failed: no draw even after a healthy mark
+    let p = epd_plan(Some(&rec("unmarked=0\ndisplay_failed=1\n")));
+    assert!(!p.draw && epd_draws(&p, &a("default")).is_err(), "{p:?}");
+    assert!(epd_plan(None).skip.is_some());
 }

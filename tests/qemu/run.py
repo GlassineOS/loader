@@ -1461,11 +1461,25 @@ def epd_golden(px, w, h, bg):
     return f"{crc32(out.tobytes()):08x}"
 
 
-def mark_healthy(d, **keys):
-    """What the running system does after a healthy start: unmarked back to 0 (both slots
-    rewritten, as an installer's record)."""
+def rewrite(d, **changes):
+    """The running system's record write: the record in use with `changes`, seq one
+    higher, every other key kept (both slots, as glassine-loader-mark's library would
+    after two writes)."""
+    seq, r, _ = d.record()
+    r = dict(r, **changes, seq=str(seq + 1))
+    lines = [("format", "1")] + [(k, v) for k, v in r.items() if k != "format"]
     for i in range(2):
-        d.put(REGIONS["record"][0] + i * 16384, slot_bytes(hb_record(**keys)))
+        d.put(REGIONS["record"][0] + i * 16384, slot_bytes(lines))
+
+
+def mark_healthy(d):
+    """glassine-loader-mark healthy: unmarked=0, nothing else."""
+    rewrite(d, unmarked="0")
+
+
+def display_retry(d):
+    """glassine-loader-mark display-retry: the sticky display_failed cleared."""
+    rewrite(d, display_failed="", drew="")
 
 
 def refreshes(log):
@@ -1509,29 +1523,40 @@ def handback_epd_fw_draws_the_splash_once():
 @case("x86_64", "aarch64")
 def handback_epd_fw_hang_is_counted_then_skipped():
     """A refresh that never returns (the stand-in hangs; the parent's watchdog resets):
-    the start was counted before the draw; the next starts, with unmarked > 0 at entry,
-    don't draw and don't hang, and the count reaches the limit (no previous set: the
-    recovery)."""
+    the start was counted before the draw (drew=1). The next start doesn't draw and sets
+    the sticky display_failed; the count reaches the limit; a healthy mark doesn't bring
+    the draw back; display-retry plus a healthy mark does (and it hangs again, counted
+    first)."""
     splash = mksplash.encode(portrait_px(600, 800, 0, 0xC0C0C0), 600, 800, PORTRAIT, 0xFFFFFF)
     d = hb_disk("hb-epd-hang", hb_record(display="epd-fw"), cfg="parent.fakefw=hang", images={"splash": splash})
-    vm = VM("hb-epd-hang", d)
-    vm.finish(timeout=150)
-    log = vm.log()
-    assert "PARENT_FAKEFW_HANG" in log, "the stand-in didn't hang"
-    assert "PARENT_RETURNED" not in log and "PARENT_POWEROFF" not in log, "the loader returned from a hung refresh"
-    assert log.index("WRITE slot=") < log.index("PARENT_FAKEFW_REFRESH_START"), "drawn before counted"
-    assert d.record()[1]["unmarked"] == "1", d.record()
-    for n, (want_boot, want_unmarked) in enumerate([("baseline", "2"), ("baseline", "3"), ("recovery", "3")], 2):
-        log, boot, floor, _ = parent_run(f"hb-epd-hang-{n}", d)
-        assert (boot, floor) == (want_boot, None), (n, boot, floor)
-        assert "EPD_FW_SKIPPED the previous start wasn't marked healthy" in log, (n, log[-800:])
-        assert fakefw_calls(log)["refresh"] == "0" and "PARENT_FAKEFW_REFRESH_START" not in log, n
-        assert d.record()[1]["unmarked"] == want_unmarked, (n, d.record())
-    # Marked healthy: the next start draws again (and hangs again: counted first).
-    mark_healthy(d, display="epd-fw")
-    vm = VM("hb-epd-hang-healthy", d)
-    vm.finish(timeout=150)
-    assert "PARENT_FAKEFW_HANG" in vm.log() and d.record()[1]["unmarked"] == "1", d.record()
+
+    def hung(name):
+        vm = VM(name, d)
+        vm.finish(timeout=150)
+        log = vm.log()
+        assert "PARENT_FAKEFW_HANG" in log, f"{name}: the stand-in didn't hang"
+        assert "PARENT_RETURNED" not in log and "PARENT_POWEROFF" not in log, f"{name}: returned from a hung refresh"
+        assert log.index("WRITE slot=") < log.index("PARENT_FAKEFW_REFRESH_START"), f"{name}: drawn before counted"
+        r = d.record()[1]
+        assert (r["unmarked"], r["drew"], r.get("display_failed", "")) == ("1", "1", ""), (name, r)
+
+    def skipped(name, want_boot, want_unmarked, why):
+        log, boot, floor, _ = parent_run(name, d)
+        assert (boot, floor) == (want_boot, None), (name, boot, floor)
+        assert f"EPD_FW_SKIPPED {why}" in log, (name, log[-800:])
+        assert fakefw_calls(log)["refresh"] == "0" and "PARENT_FAKEFW_REFRESH_START" not in log, name
+        r = d.record()[1]
+        assert r["unmarked"] == want_unmarked and r["display_failed"] == "1" and r.get("drew", "") == "", (name, r)
+
+    hung("hb-epd-hang")
+    skipped("hb-epd-hang-2", "baseline", "2", "the previous start drew and wasn't marked healthy: display_failed=1")
+    skipped("hb-epd-hang-3", "baseline", "3", "display_failed=1")
+    skipped("hb-epd-hang-4", "recovery", "3", "display_failed=1")
+    mark_healthy(d)
+    skipped("hb-epd-hang-healthy", "baseline", "1", "display_failed=1")
+    display_retry(d)
+    mark_healthy(d)
+    hung("hb-epd-hang-retry")
 
 
 @case("x86_64", "aarch64")
@@ -1551,7 +1576,7 @@ def handback_epd_fw_override_removed_before_drawn():
     assert want == EPD_GOLDEN_OVERRIDE, f"the Python twin changed: {want}"
     assert [r.split("crc=")[1] for r in refreshes(log)] == [want], (refreshes(log), want)
     assert d.region("override")[:64] == b"\0" * 64, "the override is still there"
-    mark_healthy(d, display="epd-fw")
+    mark_healthy(d)
     log, _, _, _ = parent_run("hb-epd-ovr-2", d)
     assert [r.split("crc=")[1] for r in refreshes(log)] == [epd_golden(spx, sw, sh, 0xFFFFFF)], refreshes(log)
 

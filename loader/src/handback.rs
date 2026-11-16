@@ -219,22 +219,25 @@ fn wants_epd(rec: Option<&glassine_loader_core::record::InUse>) -> bool {
     rec.is_some_and(|r| r.rec.get("display") == "epd-fw")
 }
 
-/// The decision and its writes, then, with `display=epd-fw`, the draw (spec 003 FR-009):
-/// the count is durable before the refresh runs, and a start after an unmarked one
-/// doesn't draw.
+/// The decision and its writes, then, with `display=epd-fw`, the draw (spec 003 FR-009,
+/// FR-010): the count is durable before the refresh runs; a start after an unmarked one
+/// doesn't draw, and after an unmarked one that drew it sets the sticky
+/// `display_failed`, which only the running system clears.
 fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(
     store: &mut S,
     rec: Option<glassine_loader_core::record::InUse>,
     pick_recovery: bool,
 ) -> Answer {
-    let want = wants_epd(rec.as_ref());
-    let entry = rec.as_ref().map(plan::unmarked);
-    let answer = plan::handback(store, rec, pick_recovery);
-    if want {
-        match plan::epd_draw_allowed(entry, &answer) {
-            Ok(()) => epd_splash(store),
-            Err(why) => log!("EPD_FW_SKIPPED {}", why),
-        }
+    if !wants_epd(rec.as_ref()) {
+        return plan::handback(store, rec, pick_recovery);
+    }
+    let ep = plan::epd_plan(rec.as_ref());
+    let any: Vec<(&str, &str)> = ep.any.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let counted: Vec<(&str, &str)> = ep.counted.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let answer = plan::handback_with(store, rec, pick_recovery, &any, &counted);
+    match plan::epd_draws(&ep, &answer) {
+        Ok(()) => epd_splash(store),
+        Err(why) => log!("EPD_FW_SKIPPED {}", why),
     }
     answer
 }
