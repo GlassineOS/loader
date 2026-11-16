@@ -23,6 +23,11 @@
 //! framebuffer is that whole region, below 4 GiB (the variable's words are 32 bits).
 //! `device-<var>` changes the variable, see [`Var`].
 //!
+//! With each shape the stand-in also installs an absolute pointer
+//! (`EFI_ABSOLUTE_POINTER_PROTOCOL`) on a handle of its own with the device path
+//! Vendor(HW, [`POINTER_PATH`])/End and the Mode of [`POINTER_MODE`]; its `Reset` and
+//! `GetState` count their calls, and `GetState` gives `EFI_NOT_READY` (nothing touched).
+//!
 //! Every function counts its calls. After the loader returns, [`report`] prints the counts
 //! and each refresh: its rectangle and the CRC-32 of the framebuffer's packed RGB565
 //! rows at the time of the call.
@@ -41,6 +46,14 @@ pub const GOP_GUID: Guid = guid!("9042a9de-23dc-4a38-96fb-7aded080516a");
 pub const W: u32 = 1872;
 pub const H: u32 = 1404;
 const INFO_SIZE: usize = 0x24;
+
+/// The stand-in pointer's device path vendor GUID.
+pub const POINTER_PATH: Guid = guid!("5c8a3f1e-7b2d-4e9a-8c6f-1d3e5a7b9c0f");
+/// The stand-in pointer's Mode: `[min_x, min_y, min_z, max_x, max_y, max_z]`, attributes.
+pub const POINTER_MODE: ([u64; 6], u32) = ([0, 0, 0, 4095, 3071, 0], 0);
+const ABS_POINTER_GUID: Guid = guid!("8d59d32b-c655-4ae9-9b15-f25904992a43");
+static PTR_RESET: AtomicU32 = AtomicU32::new(0);
+static PTR_STATE: AtomicU32 = AtomicU32::new(0);
 
 static QUERY: AtomicU32 = AtomicU32::new(0);
 static SET_MODE: AtomicU32 = AtomicU32::new(0);
@@ -190,6 +203,45 @@ unsafe extern "efiapi" fn get_frame_buffer(this: u64, fb: *mut u64, w: *mut u32,
     Status::SUCCESS
 }
 
+#[repr(C)]
+struct PointerMode {
+    min: [u64; 3],
+    max: [u64; 3],
+    attributes: u32,
+}
+
+#[repr(C)]
+struct AbsPointer {
+    reset: unsafe extern "efiapi" fn(u64, u8) -> Status,
+    get_state: unsafe extern "efiapi" fn(u64, *mut u64) -> Status,
+    wait_for_input: u64,
+    mode: *const PointerMode,
+}
+
+unsafe extern "efiapi" fn ptr_reset(_this: u64, _ext: u8) -> Status {
+    PTR_RESET.fetch_add(1, SeqCst);
+    Status::SUCCESS
+}
+
+unsafe extern "efiapi" fn ptr_get_state(_this: u64, _state: *mut u64) -> Status {
+    PTR_STATE.fetch_add(1, SeqCst);
+    Status::NOT_READY
+}
+
+/// Installs the absolute pointer on a handle of its own. Returns the interface.
+fn install_pointer() -> u64 {
+    let ([a, b, c, d, e, f], attributes) = POINTER_MODE;
+    let mode = leak(PointerMode { min: [a, b, c], max: [d, e, f], attributes });
+    let iface = leak(AbsPointer { reset: ptr_reset, get_state: ptr_get_state, wait_for_input: 0, mode: mode as *const PointerMode });
+    let h = unsafe { boot::install_protocol_interface(None, &ABS_POINTER_GUID, iface as *const c_void) }.expect("install pointer");
+    let mut dp: Vec<u8> = alloc::vec![1, 4, 20, 0];
+    dp.extend_from_slice(&POINTER_PATH.to_bytes());
+    dp.extend_from_slice(&[0x7f, 0xff, 4, 0]);
+    let p = Box::leak(dp.into_boxed_slice()).as_ptr();
+    unsafe { boot::install_protocol_interface(Some(h), &DevicePath::GUID, p as *const c_void) }.expect("install pointer path");
+    iface
+}
+
 fn leak<T>(v: T) -> u64 {
     Box::leak(Box::new(v)) as *mut T as u64
 }
@@ -244,7 +296,8 @@ pub fn install_all(shape: Shape) -> String {
     let garbage = leak([0x0000_1234_7777_0000_u64, 0x0123_4567_89ab_cdef, 0x9999, 0, 0]);
     install([gq, sm, bl, garbage, 0, 0], None);
     install([gq, sm, bl, 0x0000_7ead_0000_0000, 0, 0], None);
-    alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}{var}", fb.as_ptr() as u64)
+    let ptr = install_pointer();
+    alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}{var} pointer=0x{ptr:x}", fb.as_ptr() as u64)
 }
 
 /// Sets `DisplaySplashBufferInfo` as `v` says, volatile (attributes 0x6: it leaves no
@@ -277,13 +330,15 @@ fn set_splash_info(v: Var, base: u64) -> String {
 /// The counts and the refresh calls.
 pub fn report() -> Vec<String> {
     let mut out = alloc::vec![alloc::format!(
-        "PARENT_FAKEFW calls query={} set_mode={} blt={} get_fb={} garbage_query={} refresh={}",
+        "PARENT_FAKEFW calls query={} set_mode={} blt={} get_fb={} garbage_query={} refresh={} ptr_reset={} ptr_state={}",
         QUERY.load(SeqCst),
         SET_MODE.load(SeqCst),
         BLT.load(SeqCst),
         GET_FB.load(SeqCst),
         GARBAGE_QUERY.load(SeqCst),
-        unsafe { (*core::ptr::addr_of!(REFRESHES)).len() }
+        unsafe { (*core::ptr::addr_of!(REFRESHES)).len() },
+        PTR_RESET.load(SeqCst),
+        PTR_STATE.load(SeqCst)
     )];
     for c in unsafe { (*core::ptr::addr_of!(REFRESHES)).iter() } {
         out.push(alloc::format!(
