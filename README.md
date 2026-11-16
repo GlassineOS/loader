@@ -6,7 +6,7 @@ arm64 UEFI machines). It is an EFI program written in Rust that draws with
 
 GlassineOS is a hobby project, written largely with AI coding agents and not reviewed by
 subsystem experts. **Nothing here has run on a real PC.** Every behaviour below is tested
-in QEMU with OVMF (and the default start with AAVMF on arm64) only.
+in QEMU with OVMF (and the default start and the list with AAVMF on arm64) only.
 
 What it does is specified in GlassineOS/boot, and its own spec maps to those
 requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
@@ -29,7 +29,8 @@ requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
    on each and no override.
 4. Shows the key line for 2 s (5 s after an unmarked start) and restores the picture.
    Space opens the list: GlassineOS, the previous deployment, more deployments, the
-   previous kernel, the recovery, the firmware's set-up.
+   previous kernel, the recovery. (The firmware's set-up of 010 FR-039 is left out:
+   spec 001 FR-033.)
 5. Picks the set (a request, else by the count of unmarked starts: below 3 the default,
    at 3 the previous set, above the recovery), writes the other slot of the record
    (flush, read back), checks the set (`set.rec` and its sum, the sizes and sha256 of
