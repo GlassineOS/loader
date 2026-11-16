@@ -46,11 +46,13 @@ test: loader mkboot $(if $(filter x86_64,$(ARCH)),payload)
 	$(RUN) python3 -I tests/qemu/run.py --arch $(ARCH) $(CASES)
 
 # Another firmware build than the build image's: Alpine's ovmf (scripts/fetch-alpine-ovmf.sh,
-# never committed), for x86_64.
+# never committed), for x86_64. Without the hand-back cases: their stand-in parent loads
+# the loader from memory with no device path, as the Note Air's ABL does, which this
+# EDK2 release refuses (EFI_INVALID_PARAMETER) before the loader runs.
 test-fw2: loader mkboot payload
 	scripts/fetch-alpine-ovmf.sh .tmp/fw2
 	QTEST_FW_CODE=/work/.tmp/fw2/OVMF_CODE.fd QTEST_FW_VARS=/work/.tmp/fw2/OVMF_VARS.fd \
-	    $(RUN) python3 -I tests/qemu/run.py --arch x86_64 $(CASES)
+	    $(RUN) python3 -I tests/qemu/run.py --arch x86_64 --skip handback_ $(CASES)
 
 notices: loader
 	$(RUN) scripts/notices.sh $(ARCH)

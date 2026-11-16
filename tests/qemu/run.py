@@ -1176,6 +1176,8 @@ def main():
     global A
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="x86_64", choices=sorted(ARCHES))
+    ap.add_argument("--skip", action="append", default=[], metavar="PREFIX",
+                    help="leave out the cases whose names start with PREFIX")
     ap.add_argument("cases", nargs="*")
     a = ap.parse_args()
     A = ARCHES[a.arch]
@@ -1185,7 +1187,7 @@ def main():
     pictures()
     os.makedirs(OUT, exist_ok=True)
     for c in CASES:
-        if a.arch in c.arches and (not a.cases or c.__name__ in a.cases):
+        if a.arch in c.arches and (not a.cases or c.__name__ in a.cases) and not any(c.__name__.startswith(x) for x in a.skip):
             c()
     fails = [r for r in RESULTS if r[1] != "PASS"]
     print(f"{len(RESULTS) - len(fails)}/{len(RESULTS)} passed ({a.arch})")
