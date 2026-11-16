@@ -205,7 +205,8 @@ pub fn run(opts: Opts) -> ! {
                 write(&mut d);
             }
             let (a, menu) = decide_then_draw(&mut d, rec, opts.pick_recovery);
-            // Again after the menu, so its log holds the menu's lines (004 FR-014).
+            // Again after the menu (or MENU_NO_INPUT), so its log holds those lines (004
+            // FR-014).
             if probe && menu {
                 write(&mut d);
             }
@@ -247,7 +248,8 @@ fn pairs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
 /// FR-010) or the start menu (spec 004): the count is durable before any refresh runs,
 /// `drew` is cleared after the last one returned; a start after an unmarked one that
 /// drew and never came back sets the sticky `display_failed`, which only the running
-/// system clears. Returns the answer and whether the menu was shown.
+/// system clears. Returns the answer and whether the menu was shown or would have been
+/// but for a tap source.
 fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec: Option<InUse>, pick_recovery: bool) -> (Answer, bool) {
     // A `request=menu` that opens no menu is cleared in the start's first write (004
     // FR-002).
@@ -258,6 +260,8 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
     }
     let ep = plan::epd_plan(rec.as_ref());
     let mut found: Option<Result<EpdFw, String>> = None;
+    // Whether the menu would have opened but for a tap source (004 FR-014).
+    let mut no_input = false;
     if let (Some(why), Some(entry)) = (menu::opens(rec.as_ref(), &ep, pick_recovery), rec.as_ref()) {
         found = Some(crate::display::epdfw::find());
         match found.as_mut().unwrap() {
@@ -271,7 +275,10 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
                     }
                     // No tap source: no menu, the default at once, counted as without
                     // one (spec 004 FR-001).
-                    None => log!("MENU_NO_INPUT why={}: no tap source, the default", why.name()),
+                    None => {
+                        log!("MENU_NO_INPUT why={}: no tap source, the default", why.name());
+                        no_input = true;
+                    }
                 }
             }
             Err(e) => log!("EPD_FW_NONE {}: no menu", e),
@@ -299,7 +306,7 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
         }
         Err(why) => log!("EPD_FW_SKIPPED {}", why),
     }
-    (answer, false)
+    (answer, no_input)
 }
 
 /// The start menu (spec 004): the menu write, the menu, the splash, the pick's write.

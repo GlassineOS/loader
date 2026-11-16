@@ -1891,9 +1891,12 @@ def menu_without_a_tap_source():
     device's own; the console splitter's doesn't count): no menu. On request: logged
     MENU_NO_INPUT, the request cleared, the default at once, counted, the splash of 003.
     After an unmarked start: the same without a draw (003 draws only at unmarked 0)."""
-    d = menu_disk("menu-noinput", extra="parent.nopointer=1", **MENU_REC)
+    d = menu_disk("menu-noinput", extra="parent.nopointer=1", **MENU_REC, probe="1")
     log, boot, ans = menu_run("menu-noinput", d)
     assert "MENU_NO_INPUT why=request" in log and "MENU_OPEN" not in log, log[-800:]
+    # 004 FR-014: the probe written again, its log with MENU_NO_INPUT.
+    assert log.count("PROBE_WRITTEN ok=1") == 2, "the probe wasn't written again"
+    assert any(k.startswith("log") and "MENU_NO_INPUT" in v for k, v in d.probe()), "no MENU_NO_INPUT in the probe"
     assert ans.startswith(f"format=1 boot=set:{SET_A} ") and " why=default " in ans, ans
     assert menu_rects(log) == [FULL] and crcs(log) == [EPD_GOLDEN_SPLASH], refreshes(log)
     seq, r, _ = d.record()
