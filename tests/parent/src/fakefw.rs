@@ -12,6 +12,9 @@
 //! - three GOPs a standard reader must not trust: NULL at +0x18, a mapped Mode with a
 //!   MaxMode of 0x77770000, an unmapped Mode pointer.
 //!
+//! With `parent.fakefw=hang` the refresh never returns, as a refresh that hangs inside
+//! the firmware would; the parent's watchdog then resets the machine.
+//!
 //! Every function counts its calls. After the loader returns, [`report`] prints the counts
 //! and each refresh: its rectangle and the CRC-32 of the framebuffer's packed RGB565
 //! rows at the time of the call.
@@ -37,6 +40,8 @@ static GET_FB: AtomicU32 = AtomicU32::new(0);
 static GARBAGE_QUERY: AtomicU32 = AtomicU32::new(0);
 static EXT: AtomicU64 = AtomicU64::new(0);
 static FB: AtomicU64 = AtomicU64::new(0);
+/// `parent.fakefw=hang`: the refresh never returns (the parent's watchdog resets).
+static HANG: AtomicU32 = AtomicU32::new(0);
 /// The refresh calls: `[this_ok, fb, x, y, w, h, stride, mode, crc]`.
 static mut REFRESHES: Vec<[u64; 9]> = Vec::new();
 
@@ -95,6 +100,13 @@ unsafe extern "efiapi" fn blt(_this: u64, _b: u64, _op: u64, _sx: u64, _sy: u64,
 
 /// The refresh: always 0, as the interface says.
 unsafe extern "efiapi" fn refresh(this: u64, fb: u64, x: u64, y: u64, w: u64, h: u64, stride: u64, mode: u64) -> Status {
+    crate::say("PARENT_FAKEFW_REFRESH_START");
+    if HANG.load(SeqCst) != 0 {
+        crate::say("PARENT_FAKEFW_HANG");
+        loop {
+            boot::stall(core::time::Duration::from_millis(100));
+        }
+    }
     let base = FB.load(SeqCst);
     // The rows the call names, packed RGB565 from the framebuffer's start.
     let rows = (stride.min(W as u64) * (y + h).min(H as u64) * 2) as usize;
@@ -135,7 +147,8 @@ fn install(words: [u64; 6], path: Option<Guid>) -> u64 {
 }
 
 /// Installs the five GOPs. Returns a line for the log.
-pub fn install_all() -> String {
+pub fn install_all(hang: bool) -> String {
+    HANG.store(hang as u32, SeqCst);
     let bytes = (W * H * 4) as usize;
     let fb = boot::allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, bytes.div_ceil(4096)).expect("framebuffer");
     // A pattern the loader must overwrite.

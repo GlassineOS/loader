@@ -507,3 +507,15 @@ fn a_bad_or_slow_splash_falls_to_the_default() {
     f.files.remove(DEFAULT_SPLASH);
     assert_eq!(colour(&pick_picture(&mut f, &[(4, 2)])), ("nothing", 0));
 }
+
+#[test]
+fn epd_draw_only_on_a_counted_start_after_a_healthy_one() {
+    let a = |why| Answer::new(Boot::Baseline, why);
+    assert_eq!(epd_draw_allowed(Some(0), &a("default")), Ok(()));
+    assert!(epd_draw_allowed(Some(1), &a("default")).is_err(), "unmarked at entry");
+    assert!(epd_draw_allowed(Some(3), &a("limit")).is_err());
+    assert!(epd_draw_allowed(None, &a("no-record")).is_err());
+    for why in ["not-written", "request", "choice", "limit"] {
+        assert!(epd_draw_allowed(Some(0), &a(why)).is_err(), "{why} isn't counted");
+    }
+}
