@@ -41,15 +41,16 @@ requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
 ## Under a parent bootloader
 
 On a machine that keeps a bootloader of its own (the Boox Note Air's ABL), that parent
-starts the loader from a raw partition with the load option `glassine.handback=1`
-([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-handback/spec.md),
+starts the loader from the boot partition (`glassine-boot`, FAT as on a PC, or raw with a
+region table) with the load option `glassine.handback=1`
+([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-device-boot-partition/spec.md),
 [`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md); this
 repository's [`specs/002-handback/spec.md`](specs/002-handback/spec.md); pinned at boot
-`ca082bc2`). Then the loader
-draws nothing: it reads its record from the raw partition, counts the start, and exits
+`24b20725`). Then the loader
+draws nothing: it reads its record from the boot partition, counts the start, and exits
 with its answer (`baseline`, `recovery` or a kernel set) in the exit data. With `probe=1`
 in the record it first writes a read-only report of the firmware (protocols, GOP modes,
-consoles) to the partition's probe area. The QEMU cases run it under a stand-in parent
+consoles, file systems) to the partition. The QEMU cases run it under a stand-in parent
 (`tests/parent`) that starts it as the ABL does.
 
 ## Layout
