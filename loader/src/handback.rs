@@ -270,6 +270,7 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
     // FR-002).
     let clear_menu: Vec<(&'static str, String)> =
         if rec.as_ref().is_some_and(|r| r.rec.get("request") == "menu") { alloc::vec![("request", String::new())] } else { Vec::new() };
+    crate::touch::set_on(rec.as_ref().is_some_and(|r| r.rec.get("touch") == "on"));
     if !wants_epd(rec.as_ref()) {
         return (plan::handback_with(store, rec, pick_recovery, &pairs(&clear_menu), &[]), false);
     }

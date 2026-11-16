@@ -25,6 +25,15 @@ pub const DEADLINE_MS: u64 = 3000;
 pub const CALL_MS: u64 = 100;
 pub const POLL_MS: u64 = 5;
 
+/// How the controller's axes lie on the display panel's native axes (spec 005 FR-013):
+/// its X along the native x, its Y along the native y flipped. **Unverified on
+/// hardware**: the lab's desktop calibration of the same controller gives it; the one
+/// place to change after the first tap test.
+pub const ORIENT: crate::menu::Orient = crate::menu::Orient { swap: false, flip_x: false, flip_y: true };
+
+/// The controller's resolution without its system information.
+pub const RES: (u16, u16) = (1872, 1404);
+
 /// The registers (two bytes on the wire, low first).
 pub const REG_HID_DESC: u16 = 0x0001;
 pub const REG_INPUT: u8 = 0x03;

@@ -312,3 +312,13 @@ fn frames_and_descriptors() {
     assert_eq!(parse_sysinfo(&sysinfo(1872, 1404, 7)), Some(Sysinfo { res_x: 1872, res_y: 1404, max_tch: 7 }));
     assert_eq!(parse_sysinfo(&sysinfo(1, 1, 1)[..48]), None);
 }
+
+#[test]
+fn the_mapping_to_portrait() {
+    // The lab's calibration: portrait u = 1403 - raw y, v = 1871 - raw x.
+    let r = crate::menu::Range { min_x: 0, max_x: RES.0 as u64 - 1, min_y: 0, max_y: RES.1 as u64 - 1 };
+    for (x, y) in [(0u64, 0u64), (1871, 1403), (100, 1300), (1223, 701)] {
+        let (u, v) = crate::menu::to_portrait(x, y, r, ORIENT, 1872, 1404).unwrap();
+        assert_eq!((u as u64, v as u64), (1403 - y, 1871 - x), "{x},{y}");
+    }
+}
