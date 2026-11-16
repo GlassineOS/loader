@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glassine-loader-core",
  "uefi",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lz4_flex",
  "sha2",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-test-kernel"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glassine-loader-core",
  "sha2",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-test-parent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glassine-loader-core",
  "uefi",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "gspl-encode"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "glassine-loader-core",
 ]
