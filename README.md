@@ -46,7 +46,7 @@ region table) with the load option `glassine.handback=1`
 ([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-device-boot-partition/spec.md),
 [`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md); this
 repository's [`specs/002-handback/spec.md`](specs/002-handback/spec.md); pinned at boot
-`cc8eaf63`). Then the loader
+`24b20725`). Then the loader
 draws nothing: it reads its record from the boot partition, counts the start, and exits
 with its answer (`baseline`, `recovery` or a kernel set) in the exit data. With `probe=1`
 in the record it first writes a read-only report of the firmware (protocols, GOP modes,
