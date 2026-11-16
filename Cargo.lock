@@ -88,7 +88,17 @@ dependencies = [
 name = "glassine-test-kernel"
 version = "0.1.0"
 dependencies = [
+ "glassine-loader-core",
  "sha2",
+ "uefi",
+ "uefi-raw",
+]
+
+[[package]]
+name = "glassine-test-parent"
+version = "0.1.0"
+dependencies = [
+ "glassine-loader-core",
  "uefi",
  "uefi-raw",
 ]

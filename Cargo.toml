@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "loader", "tests/stub"]
+members = ["core", "loader", "tests/stub", "tests/parent"]
 exclude = ["tests/mkboot"]
 resolver = "3"
 

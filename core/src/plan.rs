@@ -8,6 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::answer::{Answer, Boot};
 use crate::gspl::{self, Kind, Picture};
 use crate::record::{self, InUse, SLOTS};
 use crate::setrec::{self, SetRec};
@@ -55,8 +56,39 @@ pub trait Platform {
     fn log(&mut self, line: fmt::Arguments);
 }
 
+/// Where the loader record's two slots are: the slot files on the loader's FAT volume
+/// (a PC; every [`Platform`] is one), or raw on a hand-back partition
+/// ([`crate::raw::Raw`]).
+pub trait RecordStore {
+    /// The whole slot (`0` a, `1` b).
+    fn read_slot(&mut self, slot: usize) -> Result<Vec<u8>, ReadErr>;
+    /// Writes the slot's bytes and flushes them. `false` when any step failed. The
+    /// caller reads the slot back.
+    fn write_slot(&mut self, slot: usize, bytes: &[u8]) -> bool;
+}
+
+/// Where the loader's log lines go.
+pub trait Log {
+    fn log(&mut self, line: fmt::Arguments);
+}
+
+impl<P: Platform> RecordStore for P {
+    fn read_slot(&mut self, slot: usize) -> Result<Vec<u8>, ReadErr> {
+        self.read(SLOTS[slot], SLOT_READ_MAX, None)
+    }
+    fn write_slot(&mut self, slot: usize, bytes: &[u8]) -> bool {
+        self.write_file(SLOTS[slot], bytes)
+    }
+}
+
+impl<P: Platform> Log for P {
+    fn log(&mut self, line: fmt::Arguments) {
+        Platform::log(self, line)
+    }
+}
+
 macro_rules! plog {
-    ($p:expr, $($t:tt)*) => { $p.log(format_args!($($t)*)) };
+    ($p:expr, $($t:tt)*) => { Log::log($p, format_args!($($t)*)) };
 }
 
 /// A checked set, its files in memory.
@@ -81,10 +113,10 @@ fn slot_name(i: usize) -> char {
 }
 
 /// Reads both slots and returns the record in use.
-pub fn read_record<P: Platform>(p: &mut P) -> Option<InUse> {
+pub fn read_record<S: RecordStore + Log>(p: &mut S) -> Option<InUse> {
     let mut slots: [Option<Vec<u8>>; 2] = [None, None];
-    for (i, path) in SLOTS.iter().enumerate() {
-        match p.read(path, SLOT_READ_MAX, None) {
+    for i in 0..2 {
+        match p.read_slot(i) {
             Ok(b) => {
                 if let Err(e) = record::read_slot(&b) {
                     plog!(p, "SLOT {} not valid: {:?}", slot_name(i), e);
@@ -117,7 +149,7 @@ pub fn wait_ms(r: Option<&InUse>) -> u64 {
 
 /// Writes the next record to the slot not in use, flushes it and reads it back.
 /// On success `cur` becomes the record written.
-fn write<P: Platform>(p: &mut P, cur: &mut InUse, changes: &[(&str, &str)]) -> bool {
+fn write<S: RecordStore + Log>(p: &mut S, cur: &mut InUse, changes: &[(&str, &str)]) -> bool {
     let (next, bytes) = match record::next(cur, changes) {
         Ok(x) => x,
         Err(e) => {
@@ -125,8 +157,7 @@ fn write<P: Platform>(p: &mut P, cur: &mut InUse, changes: &[(&str, &str)]) -> b
             return false;
         }
     };
-    let path = SLOTS[next.slot];
-    let ok = p.write_file(path, &bytes) && p.read(path, SLOT_READ_MAX, None).ok().as_deref() == Some(bytes.as_slice());
+    let ok = p.write_slot(next.slot, &bytes) && p.read_slot(next.slot).ok().as_deref() == Some(bytes.as_slice());
     if ok {
         plog!(p, "WRITE slot={} seq={} ok", slot_name(next.slot), next.seq);
         *cur = next;
@@ -431,6 +462,90 @@ fn start_recovery<P: Platform, S: Starter>(p: &mut P, s: &mut S, cur: Option<&In
         }
     }
     false
+}
+
+// ---- under a parent bootloader ------------------------------------------------------------
+
+/// What the loader answers a parent bootloader (GlassineOS/boot spec 012, FR-010 to
+/// FR-013): the choice of a start as [`start`] makes it, with the same writes to the
+/// record, but naming the set instead of checking and starting it. The default set is
+/// the parent's baseline when the record names none; the recovery is the parent's.
+/// `pick_recovery`: the person asked for the recovery at power-on (`glassine.pick=`).
+pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recovery: bool) -> Answer {
+    let Some(mut cur) = rec else {
+        plog!(p, "no loader record: the baseline");
+        return Answer::new(Boot::Baseline, "no-record");
+    };
+    let raw_request = cur.rec.get("request").to_string();
+    let request = if cur.both_valid { raw_request.as_str() } else { "" };
+    if !cur.both_valid && !raw_request.is_empty() {
+        plog!(p, "request={} not taken: only one slot is valid", raw_request);
+    }
+    let set = |cur: &InUse, key: &str| -> Option<Boot> {
+        let id = cur.rec.get(key);
+        (!id.is_empty()).then(|| Boot::Set { id: id.into(), rec: cur.rec.get(&format!("{key}_rec")).into() })
+    };
+
+    // The person's recovery, or a request: cleared before the answer (010 FR-009).
+    let take = match (pick_recovery, request) {
+        (false, "trial" | "recovery") => true,
+        (true, "recovery") => true,
+        _ => false,
+    };
+    if pick_recovery {
+        if take && !write(p, &mut cur, &[("request", "")]) {
+            plog!(p, "the record can't be written; the recovery all the same (it isn't counted)");
+        }
+        plog!(p, "ANSWER recovery why=choice");
+        return Answer::new(Boot::Recovery, "choice");
+    }
+    if take {
+        let trial = cur.rec.get("trial").to_string();
+        let mut ch: Vec<(&str, &str)> = alloc::vec![("request", "")];
+        if request == "trial" && !trial.is_empty() {
+            ch.push(("started", &trial));
+            ch.push(("started_why", "request"));
+        }
+        if !write(p, &mut cur, &ch) {
+            plog!(p, "REQUEST_NOT_TAKEN {}: the record can't be written; the baseline", request);
+            return Answer::new(Boot::Baseline, "not-written");
+        }
+        plog!(p, "REQUEST_TAKEN {}", request);
+        if request == "recovery" {
+            plog!(p, "ANSWER recovery why=request");
+            return Answer::new(Boot::Recovery, "request");
+        }
+        if let Some(b) = set(&cur, "trial") {
+            plog!(p, "ANSWER {:?} why=request", b);
+            return Answer::new(b, "request");
+        }
+        plog!(p, "a trial request with no trial set: by the count");
+    }
+
+    let count = unmarked(&cur);
+    let (key, why) = match count {
+        c if c < LIMIT => ("default", "default"),
+        LIMIT if !cur.rec.get("previous").is_empty() => ("previous", "limit"),
+        _ => {
+            plog!(p, "ANSWER recovery why=limit unmarked={}", count);
+            return Answer::new(Boot::Recovery, "limit");
+        }
+    };
+    let boot = set(&cur, key).unwrap_or(Boot::Baseline);
+    let id = cur.rec.get(key).to_string();
+    let n = count.saturating_add(1).to_string();
+    let mut ch: Vec<(&str, &str)> = alloc::vec![("unmarked", &n), ("started", &id), ("started_why", why)];
+    if !cur.both_valid {
+        ch.push(("request", ""));
+    }
+    if !write(p, &mut cur, &ch) {
+        // 010 FR-009: a loader that can't write starts the default set, uncounted.
+        let b = set(&cur, "default").unwrap_or(Boot::Baseline);
+        plog!(p, "the record can't be written: {:?}, uncounted", b);
+        return Answer::new(b, "not-written");
+    }
+    plog!(p, "ANSWER {:?} why={} unmarked={}", boot, why, n);
+    Answer::new(boot, why)
 }
 
 #[cfg(test)]

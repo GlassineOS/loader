@@ -38,6 +38,20 @@ requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
    initramfs through LoadFile2. A set that fails goes to the next choice; when nothing
    starts, a message names the boot partition and the loader returns to the firmware.
 
+## Under a parent bootloader
+
+On a machine that keeps a bootloader of its own (the Boox Note Air's ABL), that parent
+starts the loader from a raw partition with the load option `glassine.handback=1`
+([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-handback/spec.md),
+[`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md); this
+repository's [`specs/002-handback/spec.md`](specs/002-handback/spec.md); pinned at boot
+`ca082bc2`). Then the loader
+draws nothing: it reads its record from the raw partition, counts the start, and exits
+with its answer (`baseline`, `recovery` or a kernel set) in the exit data. With `probe=1`
+in the record it first writes a read-only report of the firmware (protocols, GOP modes,
+consoles) to the partition's probe area. The QEMU cases run it under a stand-in parent
+(`tests/parent`) that starts it as the ABL does.
+
 ## Layout
 
 - `core/`: what the loader decides, reads and writes, with no firmware calls (`no_std`):
@@ -48,7 +62,8 @@ requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
   serial log); `src/display/` the displays, with the firmware's graphics output as one
   backend; `c/` the LVGL shim and configuration.
 - `tests/stub/`: a stand-in kernel that prints its command line and the sum of the
-  initramfs it gets, for the QEMU tests.
+  initramfs it gets, for the QEMU tests; with `stub.answer=`, a broken loader.
+- `tests/parent/`: a stand-in parent bootloader for the hand-back cases.
 - `tests/mkboot/`: writes a boot partition with the installer's own code
   (GlassineOS/installer `core/src/pc_boot.rs` and `fat.rs`, pinned).
 - `tests/qemu/run.py`: the QEMU cases (frames by QMP `screendump`, serial markers, the
