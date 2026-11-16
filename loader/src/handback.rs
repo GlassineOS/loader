@@ -8,6 +8,8 @@ use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::string::String;
 use alloc::vec::Vec;
 use glassine_loader_core::answer::{Answer, Boot};
+use glassine_loader_core::menu;
+use glassine_loader_core::record::InUse;
 use glassine_loader_core::plan::{self, Log, Platform, ReadErr, RecordStore};
 use glassine_loader_core::raw::{Blocks, Raw};
 use uefi::boot::{self, MemoryType, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol};
@@ -16,6 +18,7 @@ use uefi::proto::media::block::BlockIO;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{Handle, Status};
 
+use crate::display::epdfw::EpdFw;
 use crate::log;
 
 /// What the parent asked for in the load options.
@@ -192,21 +195,38 @@ pub fn run(opts: Opts) -> ! {
         }
         Ok((Store::Raw(mut d), dev)) => {
             let rec = plan::read_record(&mut d);
-            if rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1") {
+            let probe = rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
+            let write = |d: &mut Disk| {
                 let report = crate::probe::report(Some(dev));
                 let ok = d.raw.write_probe(&report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=raw", ok as u8, report.len());
+            };
+            if probe {
+                write(&mut d);
             }
-            decide_then_draw(&mut d, rec, opts.pick_recovery)
+            let (a, menu) = decide_then_draw(&mut d, rec, opts.pick_recovery);
+            // Again after the menu, so its log holds the menu's lines (004 FR-014).
+            if probe && menu {
+                write(&mut d);
+            }
+            a
         }
         Ok((Store::Fat(mut v), dev)) => {
             let rec = plan::read_record(&mut v);
-            if rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1") {
+            let probe = rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
+            let write = |v: &mut crate::fs::Volume| {
                 let report = crate::probe::report(Some(dev));
-                let ok = Platform::write_file(&mut v, PROBE_FILE, &report);
+                let ok = Platform::write_file(v, PROBE_FILE, &report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=fat", ok as u8, report.len());
+            };
+            if probe {
+                write(&mut v);
             }
-            decide_then_draw(&mut v, rec, opts.pick_recovery)
+            let (a, menu) = decide_then_draw(&mut v, rec, opts.pick_recovery);
+            if probe && menu {
+                write(&mut v);
+            }
+            a
         }
     };
     let data = answer.exit_data();
@@ -215,47 +235,112 @@ pub fn run(opts: Opts) -> ! {
 }
 
 /// Whether the record asks for the firmware-refreshed display (`display=epd-fw`).
-fn wants_epd(rec: Option<&glassine_loader_core::record::InUse>) -> bool {
+fn wants_epd(rec: Option<&InUse>) -> bool {
     rec.is_some_and(|r| r.rec.get("display") == "epd-fw")
 }
 
+fn pairs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    v.iter().map(|(k, x)| (*k, x.as_str())).collect()
+}
+
 /// The decision and its writes, then, with `display=epd-fw`, the draw (spec 003 FR-009,
-/// FR-010): the count is durable before the refresh runs; a start after an unmarked one
-/// doesn't draw, and after an unmarked one that drew it sets the sticky
-/// `display_failed`, which only the running system clears.
-fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(
-    store: &mut S,
-    rec: Option<glassine_loader_core::record::InUse>,
-    pick_recovery: bool,
-) -> Answer {
+/// FR-010) or the start menu (spec 004): the count is durable before any refresh runs,
+/// `drew` is cleared after the last one returned; a start after an unmarked one that
+/// drew and never came back sets the sticky `display_failed`, which only the running
+/// system clears. Returns the answer and whether the menu was shown.
+fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec: Option<InUse>, pick_recovery: bool) -> (Answer, bool) {
+    // A `request=menu` that opens no menu is cleared in the start's first write (004
+    // FR-002).
+    let clear_menu: Vec<(&'static str, String)> =
+        if rec.as_ref().is_some_and(|r| r.rec.get("request") == "menu") { alloc::vec![("request", String::new())] } else { Vec::new() };
     if !wants_epd(rec.as_ref()) {
-        return plan::handback(store, rec, pick_recovery);
+        return (plan::handback_with(store, rec, pick_recovery, &pairs(&clear_menu), &[]), false);
     }
     let ep = plan::epd_plan(rec.as_ref());
-    let any: Vec<(&str, &str)> = ep.any.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let counted: Vec<(&str, &str)> = ep.counted.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let answer = plan::handback_with(store, rec, pick_recovery, &any, &counted);
+    let mut found: Option<Result<EpdFw, String>> = None;
+    if let (Some(why), Some(entry)) = (menu::opens(rec.as_ref(), &ep, pick_recovery), rec.as_ref()) {
+        found = Some(crate::display::epdfw::find());
+        match found.as_mut().unwrap() {
+            Ok(epd) => {
+                let (w, h) = epd.size_native();
+                match crate::epdmenu::tap_source(w, h) {
+                    Some(src) => {
+                        if let Some(a) = start_menu(store, epd, entry, &ep, why, src) {
+                            return (a, true);
+                        }
+                    }
+                    // No tap source: no menu, the default at once, counted as without
+                    // one (spec 004 FR-001).
+                    None => log!("MENU_NO_INPUT why={}: no tap source, the default", why.name()),
+                }
+            }
+            Err(e) => log!("EPD_FW_NONE {}: no menu", e),
+        }
+    }
+    let mut any = ep.any.clone();
+    any.extend(clear_menu);
+    let answer = plan::handback_with(store, rec, pick_recovery, &pairs(&any), &pairs(&ep.counted));
     match plan::epd_draws(&ep, &answer) {
-        Ok(()) => epd_splash(store),
+        Ok(()) => {
+            match found.unwrap_or_else(crate::display::epdfw::find) {
+                Ok(mut epd) => epd_splash(store, &mut epd),
+                Err(why) => log!("EPD_FW_NONE {}: headless", why),
+            }
+            // The draw returned (or there was none): `drew` cleared, so drew=1 at the
+            // next start means only a draw that never came back (004 FR-007).
+            match plan::read_record(store) {
+                Some(mut cur) => {
+                    if !plan::write_changes(store, &mut cur, &[("drew", "")]) {
+                        log!("DREW_NOT_CLEARED: the record can't be written");
+                    }
+                }
+                None => log!("DREW_NOT_CLEARED: no record"),
+            }
+        }
         Err(why) => log!("EPD_FW_SKIPPED {}", why),
     }
-    answer
+    (answer, false)
+}
+
+/// The start menu (spec 004): the menu write, the menu, the splash, the pick's write.
+/// `None`: the menu write failed and no menu opened.
+fn start_menu<S: RecordStore + plan::SplashStore + Log>(
+    store: &mut S,
+    epd: &mut EpdFw,
+    entry: &InUse,
+    ep: &plan::EpdPlan,
+    why: menu::Why,
+    src: alloc::boxed::Box<dyn crate::epdmenu::TapSource>,
+) -> Option<Answer> {
+    epd.partial = entry.rec.get("display_partial") != "0";
+    let mut cur = entry.clone();
+    let mut w1 = ep.any.clone();
+    w1.extend(menu::open_write(entry));
+    if !plan::write_changes(store, &mut cur, &pairs(&w1)) {
+        log!("MENU_NOT_OPENED the menu write failed");
+        return None;
+    }
+    log!("MENU_OPEN why={} partial={} {}", why.name(), epd.partial as u8, epd.describe());
+    let choice = crate::epdmenu::run(epd, entry, src);
+    log!("MENU_CLOSED {:?}", choice);
+    epd_splash(store, epd);
+    let d = menu::decide(entry, &choice);
+    let answer = if plan::write_changes(store, &mut cur, &pairs(&menu::pick_write(entry, &d))) {
+        d.answer
+    } else {
+        log!("the pick's write failed: the answer as for a record that can't be written");
+        menu::not_written(&choice)
+    };
+    crate::watchdog::arm();
+    Some(answer)
 }
 
 /// The splash through the firmware's panel refresh (boot `docs/handback.md`, "A display
 /// through the firmware's refresh"): the override used up and the picture picked as on
 /// a PC, composed in portrait, written and refreshed once, after the record's write and
-/// before the answer. With no
-/// such firmware, headless: the store is left as it is. No key line and no list: which
-/// key a person would press at power-on is not defined on such a machine.
-fn epd_splash<S: plan::SplashStore + Log>(store: &mut S) {
-    let mut epd = match crate::display::epdfw::find() {
-        Ok(e) => e,
-        Err(why) => {
-            log!("EPD_FW_NONE {}: headless", why);
-            return;
-        }
-    };
+/// before the answer. No key line: which key a person would press at power-on is not
+/// defined on such a machine.
+fn epd_splash<S: plan::SplashStore + Log>(store: &mut S, epd: &mut EpdFw) {
     log!("EPD_FW {}", epd.describe());
     let (w, h) = epd.size();
     let (pic, what) = match plan::pick_picture(store, &[(w, h)]) {

@@ -24,4 +24,13 @@ void shim_show_message(const char *text);
 void shim_key(uint32_t lv_key);
 uint32_t shim_handle(void);
 void shim_refresh_now(void);
+
+/* The start menu on a firmware-refreshed panel (loader spec 004): white rows with black
+ * text across the screen, the focused row inverted, no pressed style, no scrolling, no
+ * theme. Picks go to shim_list_choice() like the list's. */
+typedef void (*shim_pointer_fn)(int32_t *x, int32_t *y, int32_t *pressed);
+/* A pointer input that calls `read` for its state; created once. */
+void shim_epd_pointer(shim_pointer_fn read);
+void shim_epd_menu(const char *title, const char *const *items, int32_t n, int32_t row_h,
+                   const char *foot);
 #endif

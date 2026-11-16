@@ -25,12 +25,20 @@
 //!
 //! With each shape the stand-in also installs an absolute pointer
 //! (`EFI_ABSOLUTE_POINTER_PROTOCOL`) on a handle of its own with the device path
-//! Vendor(HW, [`POINTER_PATH`])/End and the Mode of [`POINTER_MODE`]; its `Reset` and
-//! `GetState` count their calls, and `GetState` gives `EFI_NOT_READY` (nothing touched).
+//! Vendor(HW, [`POINTER_PATH`])/End and the Mode of [`POINTER_MODE`] (not with
+//! `parent.nopointer=1`); its `Reset` and `GetState` count their calls. `GetState`
+//! gives `EFI_NOT_READY` (nothing touched), except for the scripted taps of
+//! `parent.taps=<n>:<x>:<y>,…`: tap k is a press at pointer position (x, y) once the
+//! loader has made n refreshes (and at least 60 reads after the last tap), held for 5
+//! reads, then a release.
+//!
+//! With `parent.fbdump=1` each refresh also keeps a copy of the whole framebuffer, which
+//! [`dump`] writes to the parent's own partition as `\fb<k>.raw` after the loader
+//! returned.
 //!
 //! Every function counts its calls. After the loader returns, [`report`] prints the counts
-//! and each refresh: its rectangle and the CRC-32 of the framebuffer's packed RGB565
-//! rows at the time of the call.
+//! and each refresh: its rectangle and the CRC-32 of the whole framebuffer's packed
+//! RGB565 (W×H×2 bytes) at the time of the call.
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -54,6 +62,15 @@ pub const POINTER_MODE: ([u64; 6], u32) = ([0, 0, 0, 4095, 3071, 0], 0);
 const ABS_POINTER_GUID: Guid = guid!("8d59d32b-c655-4ae9-9b15-f25904992a43");
 static PTR_RESET: AtomicU32 = AtomicU32::new(0);
 static PTR_STATE: AtomicU32 = AtomicU32::new(0);
+/// The scripted taps: (refreshes before it, x, y).
+static mut TAPS: Vec<(u32, u64, u64)> = Vec::new();
+static TAP_NEXT: AtomicU32 = AtomicU32::new(0);
+/// Reads into the current tap (0: none yet), reads since the last tap ended.
+static TAP_READ: AtomicU32 = AtomicU32::new(0);
+static TAP_QUIET: AtomicU32 = AtomicU32::new(1000);
+static FBDUMP: AtomicU32 = AtomicU32::new(0);
+static NOPOINTER: AtomicU32 = AtomicU32::new(0);
+static mut FRAMES: Vec<Vec<u8>> = Vec::new();
 
 static QUERY: AtomicU32 = AtomicU32::new(0);
 static SET_MODE: AtomicU32 = AtomicU32::new(0);
@@ -182,9 +199,12 @@ unsafe extern "efiapi" fn refresh(this: u64, fb: u64, x: u64, y: u64, w: u64, h:
         }
     }
     let base = FB.load(SeqCst);
-    // The rows the call names, packed RGB565 from the framebuffer's start.
-    let rows = (stride.min(W as u64) * (y + h).min(H as u64) * 2) as usize;
-    let crc = crc32(unsafe { core::slice::from_raw_parts(base as *const u8, rows) });
+    // The whole panel's packed RGB565 from the framebuffer's start.
+    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, (W * H * 2) as usize) };
+    let crc = crc32(bytes);
+    if FBDUMP.load(SeqCst) != 0 {
+        unsafe { (*core::ptr::addr_of_mut!(FRAMES)).push(bytes.to_vec()) };
+    }
     let call = [(this == EXT.load(SeqCst)) as u64, (fb == base) as u64, x, y, w, h, stride, mode, crc as u64];
     unsafe { (*core::ptr::addr_of_mut!(REFRESHES)).push(call) };
     Status::SUCCESS
@@ -223,9 +243,53 @@ unsafe extern "efiapi" fn ptr_reset(_this: u64, _ext: u8) -> Status {
     Status::SUCCESS
 }
 
-unsafe extern "efiapi" fn ptr_get_state(_this: u64, _state: *mut u64) -> Status {
+/// The scripted taps, from `parent.taps=` (empty: none).
+pub fn set_taps(words: &str) {
+    let mut v = Vec::new();
+    for t in words.split(',').filter(|t| !t.is_empty()) {
+        let p: Vec<u64> = t.split(':').map(|x| x.parse().expect("parent.taps")).collect();
+        assert!(p.len() == 3, "parent.taps: n:x:y");
+        v.push((p[0] as u32, p[1], p[2]));
+    }
+    unsafe { *core::ptr::addr_of_mut!(TAPS) = v };
+}
+
+pub fn set_nopointer(on: bool) {
+    NOPOINTER.store(on as u32, SeqCst);
+}
+
+pub fn set_fbdump(on: bool) {
+    FBDUMP.store(on as u32, SeqCst);
+}
+
+/// `EFI_ABSOLUTE_POINTER_STATE`: x, y, z, buttons.
+unsafe extern "efiapi" fn ptr_get_state(_this: u64, state: *mut u64) -> Status {
     PTR_STATE.fetch_add(1, SeqCst);
-    Status::NOT_READY
+    let taps = unsafe { &*core::ptr::addr_of!(TAPS) };
+    let k = TAP_NEXT.load(SeqCst) as usize;
+    let Some(&(after, x, y)) = taps.get(k) else { return Status::NOT_READY };
+    let refreshes = unsafe { (*core::ptr::addr_of!(REFRESHES)).len() } as u32;
+    let r = TAP_READ.load(SeqCst);
+    if r == 0 && (refreshes < after || TAP_QUIET.fetch_add(1, SeqCst) < 60) {
+        return Status::NOT_READY;
+    }
+    TAP_READ.store(r + 1, SeqCst);
+    let pressed = r < 5;
+    if r == 0 {
+        crate::say(&alloc::format!("PARENT_FAKEFW_TAP {k} at={x},{y} after_refresh={refreshes}"));
+    }
+    if !pressed {
+        TAP_READ.store(0, SeqCst);
+        TAP_QUIET.store(0, SeqCst);
+        TAP_NEXT.store(k as u32 + 1, SeqCst);
+    }
+    unsafe {
+        *state = x;
+        *state.add(1) = y;
+        *state.add(2) = 0;
+        *(state.add(3) as *mut u32) = pressed as u32;
+    }
+    Status::SUCCESS
 }
 
 /// Installs the absolute pointer on a handle of its own. Returns the interface.
@@ -296,7 +360,8 @@ pub fn install_all(shape: Shape) -> String {
     let garbage = leak([0x0000_1234_7777_0000_u64, 0x0123_4567_89ab_cdef, 0x9999, 0, 0]);
     install([gq, sm, bl, garbage, 0, 0], None);
     install([gq, sm, bl, 0x0000_7ead_0000_0000, 0, 0], None);
-    let ptr = install_pointer();
+    // parent.nopointer=1: firmware with no tap source (the Note Air's shape).
+    let ptr = if NOPOINTER.load(SeqCst) != 0 { 0 } else { install_pointer() };
     alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}{var} pointer=0x{ptr:x}", fb.as_ptr() as u64)
 }
 
@@ -347,4 +412,23 @@ pub fn report() -> Vec<String> {
         ));
     }
     out
+}
+
+/// The kept frames (`parent.fbdump=1`), written to the parent's own partition as
+/// `\fb<k>.raw` (k from 1), packed RGB565, the native panel row by row.
+pub fn dump() {
+    use uefi::proto::media::file::{File, FileAttribute, FileMode};
+    let frames = unsafe { core::mem::take(&mut *core::ptr::addr_of_mut!(FRAMES)) };
+    if frames.is_empty() {
+        return;
+    }
+    let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else { return };
+    let Ok(mut root) = fs.open_volume() else { return };
+    for (i, f) in frames.iter().enumerate() {
+        let name = uefi::CString16::try_from(alloc::format!("\\fb{}.raw", i + 1).as_str()).unwrap();
+        let Ok(h) = root.open(&name, FileMode::CreateReadWrite, FileAttribute::empty()) else { continue };
+        let Some(mut file) = h.into_regular_file() else { continue };
+        let ok = file.write(f).is_ok() && file.flush().is_ok();
+        crate::say(&alloc::format!("PARENT_FAKEFW_DUMP fb{}.raw ok={}", i + 1, ok as u8));
+    }
 }

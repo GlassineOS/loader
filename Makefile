@@ -10,7 +10,7 @@ KIMG     := glassine-loader:kernel
 ARCH     ?= x86_64
 TARGET   := $(ARCH)-unknown-uefi
 KVM      := $(shell [ -w /dev/kvm ] && echo --device /dev/kvm --group-add $$(stat -c %g /dev/kvm))
-RUN      := docker run --rm $(KVM) -e QTEST_FW_CODE -e QTEST_FW_VARS --user $(shell id -u):$(shell id -g) -v $(CURDIR):/work -w /work $(IMG)
+RUN      := docker run --rm $(KVM) -e QTEST_FW_CODE -e QTEST_FW_VARS -e QTEST_BLESS --user $(shell id -u):$(shell id -g) -v $(CURDIR):/work -w /work $(IMG)
 EFI      := target/$(TARGET)/release/glassine-loader.efi
 
 .PHONY: all image loader gspl-encode-static check mkboot payload test test-fw2 notices clean distclean

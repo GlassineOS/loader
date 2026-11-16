@@ -9,6 +9,7 @@ extern crate alloc;
 
 mod arch;
 mod display;
+mod epdmenu;
 mod fs;
 mod fwgop;
 mod handback;
@@ -16,6 +17,7 @@ mod kernel;
 mod log;
 mod probe;
 mod ui;
+mod watchdog;
 
 use alloc::boxed::Box;
 use alloc::format;
