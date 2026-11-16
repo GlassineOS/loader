@@ -10,7 +10,7 @@
 //! - a console splitter's GOP: the same six words with NULL at +0x18 and +0x20, no device
 //!   path;
 //! - three GOPs a standard reader must not trust: NULL at +0x18, a mapped Mode with a
-//!   MaxMode of 0xa9bb67fa, an unmapped Mode pointer.
+//!   MaxMode of 0x77770000, an unmapped Mode pointer.
 //!
 //! Every function counts its calls. After the loader returns, [`report`] prints the counts
 //! and each refresh: its rectangle and the CRC-32 of the framebuffer's packed RGB565
@@ -151,7 +151,7 @@ pub fn install_all() -> String {
     install([gq, sm, bl, 0, 0, 0], None);
     // A Mode in RAM whose fields are nonsense: what a standard reader sees at +0x18 of
     // an extended GOP.
-    let garbage = leak([0x0000_1234_a9bb_67fa_u64, 0x0123_4567_89ab_cdef, 0x9999, 0, 0]);
+    let garbage = leak([0x0000_1234_7777_0000_u64, 0x0123_4567_89ab_cdef, 0x9999, 0, 0]);
     install([gq, sm, bl, garbage, 0, 0], None);
     install([gq, sm, bl, 0x0000_7ead_0000_0000, 0, 0], None);
     alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}", fb.as_ptr() as u64)
