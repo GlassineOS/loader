@@ -172,17 +172,13 @@ fn partition_of(h: Handle) -> (String, String) {
     ("-".into(), "-".into())
 }
 
-/// The vendor GUID of Qualcomm's display variables (`gQcomTokenSpaceGuid`,
-/// `QcomModulePkg.dec`; ABL reads `DisplaySplashBufferInfo` and
-/// `DisplayPanelConfiguration` under it).
-const QCOM_TOKEN_SPACE: Guid = guid!("882f8c2b-9646-435f-8de5-f208ff80c1bd");
 /// The most bytes of a variable the report shows.
 const VAR_SHOWN: usize = 64;
 
-/// Display variables under [`QCOM_TOKEN_SPACE`], by `GetVariable` (read only): two with
-/// their content, two only whether they exist. A firmware without them says `absent`.
+/// Display variables under [`QCOM_TOKEN_SPACE`](crate::fwgop::QCOM_TOKEN_SPACE), by
+/// `GetVariable` (read only): two with their content, two only whether they exist. A firmware without them says `absent`.
 fn qcom_variables() -> Vec<String> {
-    let vendor = VariableVendor(QCOM_TOKEN_SPACE);
+    let vendor = VariableVendor(crate::fwgop::QCOM_TOKEN_SPACE);
     let mut out = Vec::new();
     for (name, content) in [
         (cstr16!("DisplaySplashBufferInfo"), true),

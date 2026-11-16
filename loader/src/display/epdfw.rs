@@ -12,7 +12,9 @@
 //! hands back: never after `ExitBootServices` (the loader never calls it), never
 //! `SetMode`, `Blt` or a power protocol.
 use alloc::string::String;
-use uefi::Status;
+use glassine_loader_core::plan;
+use uefi::runtime::{self, VariableVendor};
+use uefi::{Status, cstr16};
 
 use crate::fwgop::{self, Gop, Images, Layout, Ram};
 
@@ -24,6 +26,7 @@ pub struct EpdFw {
     fb: u64,
     w: u32,
     h: u32,
+    bound: plan::EpdBound,
 }
 
 /// The first extended GOP whose framebuffer holds a packed RGB565 panel, or why none.
@@ -40,14 +43,25 @@ pub fn find() -> Result<EpdFw, String> {
     if fb == 0 || w == 0 || h == 0 || w % ALIGN != 0 {
         return Err(alloc::format!("framebuffer 0x{fb:x} {w}x{h}"));
     }
-    // The RGB565 picture must lie inside the framebuffer the Mode describes.
-    let m = *gop.mode().ok_or("no Mode")?;
-    let bytes = (w as u64) * (h as u64) * 2;
-    let end = fb.checked_add(bytes).ok_or("framebuffer overflow")?;
-    if fb < m.fb_base || end > m.fb_base.saturating_add(m.fb_size) {
-        return Err(alloc::format!("framebuffer 0x{fb:x}+{bytes} outside the Mode's 0x{:x}+{}", m.fb_base, m.fb_size));
-    }
-    Ok(EpdFw { gop, fb, w, h })
+    // The RGB565 picture must lie inside the framebuffer the Mode names, or inside the
+    // region of DisplaySplashBufferInfo (the variable read only when the Mode's is too
+    // small).
+    let mode = gop.mode().map(|m| (m.fb_base, m.fb_size));
+    let bound = match plan::epd_bound(fb, w, h, mode, None) {
+        Ok(b) => b,
+        Err(_) => {
+            let mut buf = [0u8; 64];
+            let name = cstr16!("DisplaySplashBufferInfo");
+            let var: Option<&[u8]> = match runtime::get_variable(name, &VariableVendor(fwgop::QCOM_TOKEN_SPACE), &mut buf) {
+                Ok((d, _)) => Some(d),
+                // Longer than 64 bytes: not the 12 of version 1, so no region either.
+                Err(e) if e.status() == Status::BUFFER_TOO_SMALL => Some(&[]),
+                Err(_) => None,
+            };
+            plan::epd_bound(fb, w, h, mode, var)?
+        }
+    };
+    Ok(EpdFw { gop, fb, w, h, bound })
 }
 
 fn rgb565(p: u32) -> u16 {
@@ -62,7 +76,11 @@ impl EpdFw {
     }
 
     pub fn describe(&self) -> String {
-        alloc::format!("epd-fw {}x{} (panel {}x{} RGB565) fb 0x{:x}", self.h, self.w, self.w, self.h, self.fb)
+        let bound = match self.bound {
+            plan::EpdBound::Mode => "mode",
+            plan::EpdBound::SplashBufferInfo => "DisplaySplashBufferInfo",
+        };
+        alloc::format!("epd-fw {}x{} (panel {}x{} RGB565) fb 0x{:x} bound={bound}", self.h, self.w, self.w, self.h, self.fb)
     }
 
     /// Writes the portrait picture `px` (`size()`, `0x00RRGGBB`, row by row) into the

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -1504,6 +1505,7 @@ def handback_epd_fw_draws_the_splash_once():
     assert want == EPD_GOLDEN_SPLASH, f"the Python twin changed: {want}"
     assert refreshes(log) == [f"this=1 fb=1 rect=0,0,1872,1404 stride=1872 mode=0 crc={want}"], (refreshes(log), want)
     assert "SPLASH_DRAWN splash" in log and "EPD_FW " in log, "no draw logged"
+    assert re.search(r"EPD_FW epd-fw [^\r\n]* bound=mode", log), "the Mode's bound not logged"
     assert "HINT_SHOWN" not in log, "a key line on a backend with no key"
     seq, r, _ = d.record()
     assert (seq, r["unmarked"]) == (2, "1"), (seq, r)
@@ -1518,6 +1520,63 @@ def handback_epd_fw_draws_the_splash_once():
     d = hb_disk("hb-epd-nokey", hb_record(), cfg="parent.fakefw=1", images={"splash": splash})
     log, boot, floor, _ = parent_run("hb-epd-nokey", d)
     assert fakefw_calls(log)["refresh"] == "0" and fakefw_calls(log)["get_fb"] == "0", fakefw_calls(log)
+
+
+@case("x86_64", "aarch64")
+def handback_epd_fw_bound_is_the_splash_buffer_info():
+    """The Note Air's shape (parent.fakefw=device): GetFrameBuffer gives the 1872x1404
+    panel, the Mode a 325x1423 framebuffer (stride 325, 1,849,900 bytes) too small for
+    its picture, and DisplaySplashBufferInfo (version 1, the base, 0x02300000 bytes)
+    names a region that holds it: the loader draws, with the CRC of the panel's shape,
+    and logs that bound. The variable missing, of version 2, 11 bytes long, or naming a
+    region one byte too small: headless, the override left in place."""
+    sw, sh = 600, 800
+    spx = portrait_px(sw, sh, 0x000000, 0xC0C0C0)
+    images = {"splash": mksplash.encode(spx, sw, sh, PORTRAIT, 0xFFFFFF),
+              "override": mksplash.encode(portrait_px(400, 300, 0x404040, 0xFFFFFF), 400, 300, PORTRAIT, 0x808080)}
+    d = hb_disk("hb-epd-dev", hb_record(display="epd-fw"), cfg="parent.fakefw=device", images={"splash": images["splash"]})
+    log, boot, floor, _ = parent_run("hb-epd-dev", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    fb = re.search(r"PARENT_FAKEFW installed ext=0x[0-9a-f]+ fb=0x([0-9a-f]+) var=([0-9a-f]+)", log)
+    assert fb, "no device-shape stand-in"
+    base = int(fb.group(1), 16)
+    assert fb.group(2) == struct.pack("<III", 1, base, 0x02300000).hex(), fb.group(2)
+    c = fakefw_calls(log)
+    assert (c["refresh"], c["set_mode"], c["blt"], c["get_fb"]) == ("1", "0", "0", "1"), c
+    assert refreshes(log) == [f"this=1 fb=1 rect=0,0,1872,1404 stride=1872 mode=0 crc={EPD_GOLDEN_SPLASH}"], refreshes(log)
+    assert re.search(r"EPD_FW epd-fw 1404x1872 [^\r\n]* bound=DisplaySplashBufferInfo", log), "the variable's bound not logged"
+    assert "SPLASH_DRAWN splash" in log, log[-600:]
+
+    whys = {"novar": "no DisplaySplashBufferInfo",
+            "v2": "a DisplaySplashBufferInfo of 12 bytes that names no region",
+            "short": "a DisplaySplashBufferInfo of 11 bytes that names no region",
+            "small": "DisplaySplashBufferInfo's 0x{base:x}+5256575"}
+    for var, why in whys.items():
+        name = f"hb-epd-dev-{var}"
+        d = hb_disk(name, hb_record(display="epd-fw"), cfg=f"parent.fakefw=device-{var}", images=images)
+        before = d.region("override")
+        log, boot, floor, _ = parent_run(name, d)
+        assert (boot, floor) == ("baseline", None), (name, boot, floor)
+        base = int(re.search(r"PARENT_FAKEFW installed ext=0x[0-9a-f]+ fb=0x([0-9a-f]+)", log).group(1), 16)
+        why = why.format(base=base)
+        want = f"EPD_FW_NONE framebuffer 0x{base:x}+5256576 outside the Mode's 0x{base:x}+1849900 and {why}: headless"
+        assert want in log, (name, want, log[-800:])
+        c = fakefw_calls(log)
+        assert (c["refresh"], c["get_fb"], c["set_mode"], c["blt"]) == ("0", "1", "0", "0"), (name, c)
+        assert "SPLASH_DRAWN" not in log and "OVERRIDE_REMOVED" not in log, name
+        assert d.region("override") == before, f"{name}: the override was touched"
+
+    # The probe reads the stand-in's variable as it reads the device's, and draws nothing.
+    d = hb_disk("hb-epd-dev-probe", hb_record(probe="1"), cfg="parent.fakefw=device")
+    log, boot, floor, _ = parent_run("hb-epd-dev-probe", d)
+    base = int(re.search(r"PARENT_FAKEFW installed ext=0x[0-9a-f]+ fb=0x([0-9a-f]+)", log).group(1), 16)
+    keys = dict(d.probe())
+    want = "present size=12 attr=0x6 hex=" + struct.pack("<III", 1, base, 0x02300000).hex()
+    assert keys["var.DisplaySplashBufferInfo"] == want, keys["var.DisplaySplashBufferInfo"]
+    ext = [g for g in probe_gops(d.probe()) if g["layout"] == "extended"]
+    assert len(ext) == 1 and ext[0]["mode_at_0x28"] == "ok 325x1423 bgr stride=325", ext
+    assert ext[0]["framebuffer"] == f"status=SUCCESS fb=0x{base:x} w=1872 h=1404", ext[0]["framebuffer"]
+    assert fakefw_calls(log)["refresh"] == "0" and "PARENT_FAKEFW_REFRESH" not in log, "the probe refreshed the panel"
 
 
 @case("x86_64", "aarch64")
