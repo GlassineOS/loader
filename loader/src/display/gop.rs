@@ -22,7 +22,18 @@ pub fn all() -> Vec<Gop> {
     let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID)) else {
         return out;
     };
+    // Only a GOP whose Mode is where the standard puts it and passes the checks of
+    // `fwgop`: uefi-rs reads the Mode at +0x18, which an extended GOP uses for code.
+    let ram = crate::fwgop::Ram::read();
+    let images = crate::fwgop::Images::read(&ram);
     for &h in handles.iter() {
+        match crate::fwgop::inspect(&ram, &images, h) {
+            Some(g) if g.layout == crate::fwgop::Layout::Standard => {}
+            g => {
+                crate::log!("GOP skipped: layout {}", g.map_or("unread", |g| g.layout.name()));
+                continue;
+            }
+        }
         let params = OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None };
         if !boot::test_protocol::<DevicePath>(params).unwrap_or(false) {
             continue;
