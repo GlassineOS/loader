@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`f97b49e0dce54e18033b2d50c0eaa606d58e1b31`. Where the documents and
+`babc3abda998f1be7595f8e8b76951e9068975ed`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -73,7 +73,8 @@ handle.
 - **FR-001**: The loader is in hand-back mode exactly when its load options hold the word
   `glassine.handback=1`. Then it uses no display, no splash, no key line, no list, and
   starts no kernel, except the display of spec 003 (`display=epd-fw` and an extended
-  GOP), which draws the splash once. Other start paths are unchanged.
+  GOP), which draws the splash once, and on that display the start menu of spec 004,
+  which answers the pick. Other start paths are unchanged.
 - **FR-002**: It opens the boot partition of its `LoadedImage.DeviceHandle`. When the
   firmware offers a file system on it, it uses the FAT form, with the PC's paths and the
   existing FAT backend. Else the raw form: it refuses a device whose block size doesn't
