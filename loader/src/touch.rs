@@ -3,13 +3,17 @@
 //! `docs/handback.md`, "The loader's touch driver"): the firmware side of
 //! `glassine_loader_core::touch`, over the firmware's GPIO and I2C protocols
 //! ([`crate::fwbus`]).
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use glassine_loader_core::touch::{self, Hw, I2C_ADDRESS, I2C_INSTANCE, I2C_KHZ, REG_INPUT};
+use glassine_loader_core::menu::{self, Range};
+use glassine_loader_core::touch::{self, Hw, I2C_ADDRESS, I2C_INSTANCE, I2C_KHZ, ORIENT, REG_INPUT, RES};
 use uefi::Status;
 
+use crate::epdmenu::TapSource;
 use crate::fwbus::{self, Bus, GPIO, Gpio, I2C, I2c};
 use crate::log;
 
@@ -109,4 +113,127 @@ pub fn probe() -> Vec<String> {
     let up = touch::bring_up(&mut fw, false);
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// Whether the record asks for the driver (`touch=on`), set by the hand-back before the
+/// menu is decided.
+static ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_on(on: bool) {
+    ON.store(on, Ordering::Relaxed);
+}
+
+enum State {
+    /// Offered, not brought up (no hardware touched yet).
+    Offered,
+    Up(touch::Up),
+    Failed,
+}
+
+/// The start menu's tap source (spec 005 FR-011 to FR-015): brought up at its first
+/// poll, one report per poll, powered down when dropped (the menu closing).
+pub struct Source {
+    fw: Fw,
+    state: State,
+    range: Range,
+    w: u32,
+    h: u32,
+    down: bool,
+}
+
+/// The driver as the menu's tap source for a native `w`×`h` panel, with `touch=on` and
+/// both protocols passing their checks. Touches no hardware.
+pub fn source(w: u32, h: u32) -> Option<Box<dyn TapSource>> {
+    if !ON.load(Ordering::Relaxed) {
+        return None;
+    }
+    match Fw::find() {
+        Ok(mut fw) => {
+            fw.quiet_reads = true;
+            log!(
+                "TOUCH_DEVICE loader-cyttsp5 orient=swap:{} flip_x:{} flip_y:{}",
+                ORIENT.swap as u8,
+                ORIENT.flip_x as u8,
+                ORIENT.flip_y as u8
+            );
+            let range = Range { min_x: 0, max_x: RES.0 as u64 - 1, min_y: 0, max_y: RES.1 as u64 - 1 };
+            Some(Box::new(Source { fw, state: State::Offered, range, w, h, down: false }))
+        }
+        Err(why) => {
+            log!("TOUCH_SKIPPED {}", why);
+            None
+        }
+    }
+}
+
+impl Source {
+    fn fail(&mut self, why: &str) {
+        log!("TOUCH {}: no more taps", why);
+        if let State::Up(mut up) = core::mem::replace(&mut self.state, State::Failed) {
+            touch::power_down(&mut self.fw, &mut up);
+            log!("TOUCH_DOWN {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
+        }
+    }
+}
+
+impl TapSource for Source {
+    fn name(&self) -> &'static str {
+        "loader-cyttsp5"
+    }
+
+    fn poll(&mut self) -> Option<(bool, u32, u32)> {
+        if let State::Offered = self.state {
+            log!("TOUCH_START menu");
+            self.fw.quiet_reads = false;
+            let up = touch::bring_up(&mut self.fw, true);
+            self.fw.quiet_reads = true;
+            for (k, v) in &up.lines {
+                log!("TOUCH_UP {}={}", k, v);
+            }
+            if !up.ok() {
+                self.state = State::Failed;
+                log!("TOUCH bring-up failed: no taps");
+                return None;
+            }
+            if let Some(si) = up.sysinfo.filter(|s| s.res_x > 1 && s.res_y > 1) {
+                self.range = Range { min_x: 0, max_x: si.res_x as u64 - 1, min_y: 0, max_y: si.res_y as u64 - 1 };
+            }
+            self.state = State::Up(up);
+        }
+        if !matches!(self.state, State::Up(_)) {
+            return None;
+        }
+        let deadline = crate::arch::now_ms() + touch::CALL_MS;
+        let f = match touch::read_frame(&mut self.fw, deadline) {
+            Ok(Some(f)) => f,
+            Ok(None) => return None,
+            Err(e) => {
+                self.fail(&format!("read {e}"));
+                return None;
+            }
+        };
+        let contact = touch::parse_touch(&f)?;
+        let (pressed, x, y) = match contact {
+            Some((x, y)) => (true, x, y),
+            None => (false, 0, 0),
+        };
+        let (u, v) = menu::to_portrait(x as u64, y as u64, self.range, ORIENT, self.w, self.h).unwrap_or((0, 0));
+        if pressed && !self.down {
+            log!("TOUCH press raw={},{} portrait={},{}", x, y, u, v);
+        } else if !pressed && self.down {
+            log!("TOUCH release");
+        }
+        self.down = pressed;
+        Some((pressed, u, v))
+    }
+}
+
+impl Drop for Source {
+    /// The menu closed (FR-015).
+    fn drop(&mut self) {
+        if let State::Up(mut up) = core::mem::replace(&mut self.state, State::Failed) {
+            touch::power_down(&mut self.fw, &mut up);
+            log!("TOUCH_DOWN {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
+        }
+    }
 }
