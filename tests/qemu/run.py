@@ -1359,6 +1359,7 @@ def handback_probe_reports_the_firmware():
 
 
 GOP_GUID = "9042a9de-23dc-4a38-96fb-7aded080516a"
+POINTER_PATH = "5c8a3f1e-7b2d-4e9a-8c6f-1d3e5a7b9c0f"  # tests/parent/src/fakefw.rs
 
 
 def fakefw_calls(log):
@@ -1384,7 +1385,9 @@ def handback_probe_reads_an_extended_gop_raw():
     GetFrameBuffer at +0x20), its console splitter's (NULL at +0x18 and +0x20) and three
     GOPs whose Mode a standard reader must not trust: each is read raw, the layout named,
     GetFrameBuffer called once on the extended one; the refresh, SetMode and Blt never,
-    nor any QueryMode of a GOP whose Mode failed its checks."""
+    nor any QueryMode of a GOP whose Mode failed its checks. The input devices are listed
+    with their identities, the absolute pointer's Mode read from memory, and no Reset or
+    GetState of the pointer is called."""
     d = hb_disk("hb-probe-ext", hb_record(probe="1"), cfg="parent.fakefw=1")
     log, boot, floor, _ = parent_run("hb-probe-ext", d)
     assert (boot, floor) == ("baseline", None), (boot, floor)
@@ -1421,7 +1424,24 @@ def handback_probe_reads_an_extended_gop_raw():
     assert keys["var.DisplaySplashBufferInfo"] == "absent" and keys["var.DISABLEDISPLAY"] == "absent", keys
     assert any(k.startswith("image") and "base=0x" in v for k, v in p), "no image lines"
     c = fakefw_calls(log)
-    assert c == {"query": "2", "set_mode": "0", "blt": "0", "get_fb": "1", "garbage_query": "0", "refresh": "0"}, c
+    assert c == {"query": "2", "set_mode": "0", "blt": "0", "get_fb": "1", "garbage_query": "0", "refresh": "0",
+                 "ptr_reset": "0", "ptr_state": "0"}, c
+    # The input devices: the stand-in's absolute pointer with its Mode, read from memory
+    # (no Reset, no GetState: the counts above), and the text inputs, one of them conin.
+    n = int(keys["apointers"])
+    ours = [i for i in range(1, n + 1) if keys.get(f"apointer{i}.path") == f"VenHw({POINTER_PATH})"]
+    assert len(ours) == 1, [(k, v) for k, v in p if k.startswith("apointer")]
+    a = f"apointer{ours[0]}"
+    ptr = re.search(r"PARENT_FAKEFW installed [^\r\n]* pointer=0x([0-9a-f]+)", log).group(1)
+    assert re.fullmatch(rf"handle=\d+ conin=0 iface=0x{ptr}", keys[a]), keys[a]
+    assert keys[f"{a}.mode"] == "min_x=0 max_x=4095 min_y=0 max_y=3071 min_z=0 max_z=0 attr=0x0", keys[f"{a}.mode"]
+    ins = keys[f"{a}.in"].split()
+    assert len(ins) == 2 and ins[0] == ins[1] and ins[0].startswith("image") and ins[0] in keys, keys[f"{a}.in"]
+    assert "8d59d32b-c655-4ae9-9b15-f25904992a43" in keys[f"{a}.guids"], keys[f"{a}.guids"]
+    assert int(keys["spointers"]) >= 0 and int(keys["textins"]) >= 1, keys
+    t = [keys[f"textin{i}"] for i in range(1, int(keys["textins"]) + 1)]
+    assert sum(" conin=1 " in x + " " for x in t) == 1, t
+    assert all(f"textin{i}.path" in keys for i in range(1, len(t) + 1)), keys
     assert "PARENT_FAKEFW_REFRESH" not in log, "the probe refreshed the panel"
     assert "PROBE_WRITTEN ok=1" in log
 

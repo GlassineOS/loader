@@ -99,11 +99,11 @@ impl Ram {
 }
 
 /// Reads a `u64` the caller has checked with [`Ram::holds`].
-unsafe fn rd64(addr: u64) -> u64 {
+pub unsafe fn rd64(addr: u64) -> u64 {
     unsafe { core::ptr::read_unaligned(addr as *const u64) }
 }
 
-unsafe fn rd32(addr: u64) -> u32 {
+pub unsafe fn rd32(addr: u64) -> u32 {
     unsafe { core::ptr::read_unaligned(addr as *const u32) }
 }
 
@@ -275,9 +275,15 @@ impl Gop {
 
 /// The interface pointer of the GOP on `h`, by `HandleProtocol`'s rule (`GetProtocol`).
 pub fn interface(h: Handle) -> Option<u64> {
+    interface_of(h, &GOP_GUID)
+}
+
+/// The interface pointer of protocol `g` on `h` (`GetProtocol`), read as a number: the
+/// caller reads its words only where [`Ram::holds`] says they are RAM.
+pub fn interface_of(h: Handle, g: &Guid) -> Option<u64> {
     let bt = unsafe { uefi::table::system_table_raw()?.as_ref().boot_services.as_ref()? };
     let mut iface: *mut c_void = core::ptr::null_mut();
-    let st = unsafe { (bt.open_protocol)(h.as_ptr(), &GOP_GUID, &mut iface, boot::image_handle().as_ptr(), core::ptr::null_mut(), 0x02) };
+    let st = unsafe { (bt.open_protocol)(h.as_ptr(), g, &mut iface, boot::image_handle().as_ptr(), core::ptr::null_mut(), 0x02) };
     (st == Status::SUCCESS && !iface.is_null()).then_some(iface as u64)
 }
 

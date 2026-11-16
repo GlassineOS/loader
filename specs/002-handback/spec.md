@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`bcd248cb2197e73db7d336100739df4f5479a0ee`. Where the documents and
+`f97b49e0dce54e18033b2d50c0eaa606d58e1b31`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -64,6 +64,9 @@ firmware of `tests/parent` (`parent.fakefw=1`: an extended GOP, its console spli
 and GOPs with a NULL, a nonsense and an unmapped Mode), the report names each layout,
 gives the extended GOP's framebuffer from one `GetFrameBuffer` call, and the stand-in
 counts no refresh, no `SetMode`, no `Blt` and no `QueryMode` of a GOP whose Mode failed.
+The stand-in's absolute pointer is listed with its Mode, and the stand-in counts no
+`Reset` and no `GetState` of it; the text inputs are listed, one of them the console-in
+handle.
 
 ## Requirements
 
@@ -107,8 +110,13 @@ counts no refresh, no `SetMode`, no `Blt` and no `QueryMode` of a GOP whose Mode
   display variables read with `GetVariable` under `gQcomTokenSpaceGuid`
   (`882f8c2b-9646-435f-8de5-f208ff80c1bd`, `QcomModulePkg.dec`):
   `DisplaySplashBufferInfo` and `UEFIDisplayInfo` with their bytes (64 at most), and
-  whether `DISABLEDISPLAY` and `DisplayPanelOverride` exist. No `SetMode`, no `Blt`, no
-  refresh, no register access. It is written to the region `probe` (region write) or to
+  whether `DISABLEDISPLAY` and `DisplayPanelOverride` exist, and the input devices:
+  every handle with an absolute pointer, a simple pointer or a simple text input, its
+  identity (index, whether it is the console-in handle, device path, protocols) and a
+  pointer's Mode (the absolute pointer's `AbsoluteMinX` … `AbsoluteMaxZ` and
+  `Attributes`), read from memory where the memory map says RAM. No `SetMode`, no `Blt`,
+  no refresh, no input device's `Reset`, `GetState` or `ReadKeyStroke`, no register
+  access. It is written to the region `probe` (region write) or to
   `\glassine\probe.txt`, padded with newlines to 64 KiB, with its `check=` line, before
   the decision. A failed probe write changes neither the record nor the answer.
 - **FR-008a**: A graphics output is never read through a standard GOP type, whose Mode
