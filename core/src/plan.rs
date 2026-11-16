@@ -95,6 +95,9 @@ macro_rules! plog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
     pub set: SetRec,
+    /// The kernel's path on the boot partition (`\glassine\sets\<id>\vmlinuz`), for the
+    /// firmware: the image's file path when it is loaded from `kernel`.
+    pub kernel_path: String,
     pub kernel: Vec<u8>,
     pub initrd: Option<Vec<u8>>,
 }
@@ -252,12 +255,13 @@ pub fn check_set<P: Platform>(p: &mut P, dir: &str, id: &str, want_rec: Option<&
         }
     }
     let set = setrec::parse(&rec, id, recovery).map_err(|e| format!("set.rec: {e:?}"))?;
-    let kernel = read_checked(p, &format!("{base}\\vmlinuz"), set.kernel_size, &set.kernel_sha256)?;
+    let kernel_path = format!("{base}\\vmlinuz");
+    let kernel = read_checked(p, &kernel_path, set.kernel_size, &set.kernel_sha256)?;
     let initrd = match &set.initrd {
         Some((sha, size)) => Some(read_checked(p, &format!("{base}\\initrd"), *size, sha)?),
         None => None,
     };
-    Ok(Loaded { set, kernel, initrd })
+    Ok(Loaded { set, kernel_path, kernel, initrd })
 }
 
 fn read_checked<P: Platform>(p: &mut P, path: &str, size: u64, sha: &str) -> Result<Vec<u8>, String> {

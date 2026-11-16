@@ -900,7 +900,7 @@ def secure_boot_vars(dirname):
         "-keyout", key, "-out", crt)
     guid = "a5b1e9c3-0d7e-4b2f-8c61-2f3e4d5c6b7a"
     vars_fd = os.path.join(dirname, "vars-sb.fd")
-    run("virt-fw-vars", "-i", ARCHES["x86_64"]["vars"], "-o", vars_fd, "--set-pk", guid, crt, "--add-kek", guid, crt,
+    run("virt-fw-vars", "-i", SB_VARS, "-o", vars_fd, "--set-pk", guid, crt, "--add-kek", guid, crt,
         "--add-db", guid, crt, "--secure-boot")
     signed = os.path.join(dirname, "loader-signed.efi")
     run("sbsign", "--key", key, "--cert", crt, "--output", signed, efi("glassine-loader"))
@@ -908,7 +908,9 @@ def secure_boot_vars(dirname):
     return vars_fd, signed
 
 
+# the build image's (Debian's) Secure Boot firmware, also when QTEST_FW_* names another
 SB_CODE = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+SB_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
 SB_MACHINE = ["-machine", "smm=on", "-global", "driver=cfi.pflash01,property=secure,value=on"]
 
 
@@ -952,6 +954,24 @@ def linux_kernel_gets_its_command_line():
         raise AssertionError("no payload: run make payload")
     d = installed("linux", kernel=open(vmlinuz, "rb").read(), initramfs=open(os.path.join(PAYLOAD, "initrd"), "rb").read())
     vm = VM("linux", d)
+    m = vm.wait(r"INIT_CMDLINE: ([^\r\n]*)\r?\n", timeout=300)
+    vm.finish(300)
+    assert m.group(1).strip() == d.info["cmdline"], m.group(1)
+    assert "/etc/glassine-boot/board.conf: " + BOARD.decode().strip() in vm.log(), "board archive not in the initramfs"
+
+
+@case("x86_64")
+def linux_kernel_with_a_large_initramfs():
+    """The same with an initramfs the size of a release's (24 MiB of ballast that doesn't
+    compress): the loader holds both files in memory and the firmware still loads the
+    kernel from its buffer."""
+    vmlinuz = os.path.join(PAYLOAD, "vmlinuz")
+    if not os.path.exists(os.path.join(PAYLOAD, "initrd-large")):
+        raise AssertionError("no payload: run make payload")
+    ird = open(os.path.join(PAYLOAD, "initrd-large"), "rb").read()
+    assert len(ird) > 20 << 20, len(ird)
+    d = installed("linux-large", kernel=open(vmlinuz, "rb").read(), initramfs=ird)
+    vm = VM("linux-large", d)
     m = vm.wait(r"INIT_CMDLINE: ([^\r\n]*)\r?\n", timeout=300)
     vm.finish(300)
     assert m.group(1).strip() == d.info["cmdline"], m.group(1)
@@ -1156,13 +1176,18 @@ def main():
     global A
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="x86_64", choices=sorted(ARCHES))
+    ap.add_argument("--skip", action="append", default=[], metavar="PREFIX",
+                    help="leave out the cases whose names start with PREFIX")
     ap.add_argument("cases", nargs="*")
     a = ap.parse_args()
     A = ARCHES[a.arch]
+    # another build of the firmware (QTEST_FW_CODE, QTEST_FW_VARS: paths in the container)
+    A["code"] = os.environ.get("QTEST_FW_CODE") or A["code"]
+    A["vars"] = os.environ.get("QTEST_FW_VARS") or A["vars"]
     pictures()
     os.makedirs(OUT, exist_ok=True)
     for c in CASES:
-        if a.arch in c.arches and (not a.cases or c.__name__ in a.cases):
+        if a.arch in c.arches and (not a.cases or c.__name__ in a.cases) and not any(c.__name__.startswith(x) for x in a.skip):
             c()
     fails = [r for r in RESULTS if r[1] != "PASS"]
     print(f"{len(RESULTS) - len(fails)}/{len(RESULTS)} passed ({a.arch})")

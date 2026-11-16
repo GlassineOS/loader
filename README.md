@@ -80,6 +80,7 @@ make check                 # host tests of core/
 make test                  # QEMU + OVMF cases; frames and serial logs in out/test/
 make test ARCH=aarch64     # QEMU virt + AAVMF cases
 make test CASES=trial_request
+make test-fw2              # the x86_64 cases again with Alpine's OVMF (another EDK2 release)
 make clean                 # target/, out/
 ```
 
@@ -88,8 +89,9 @@ make clean                 # target/, out/
 - LVGL 9.6.0 is fetched at a pinned release and checked by SHA-256
   (`scripts/fetch-lvgl.sh`), built by `loader/build.rs` with clang for the target's
   triple and float ABI, and reached only through `loader/c/shim.c`.
-- OVMF and AAVMF come from the build image's Debian packages at test time; nothing of
-  them is committed. The Secure Boot case enrols a key generated for that run only.
+- OVMF and AAVMF come from the build image's Debian packages at test time, and a second
+  OVMF from Alpine's `ovmf` package for `make test-fw2` (`scripts/fetch-alpine-ovmf.sh`);
+  nothing of them is committed. The Secure Boot case enrols a key generated for that run only.
 - The Linux case boots Alpine `linux-lts` with a busybox initramfs (`make payload`,
   fetched, never committed).
 
