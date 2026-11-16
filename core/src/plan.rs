@@ -214,6 +214,13 @@ fn write<S: RecordStore + Log>(p: &mut S, cur: &mut InUse, changes: &[(&str, &st
     ok
 }
 
+/// Writes `changes` over the record in use as one write of the slot not in use (flushed,
+/// read back); on success `cur` becomes the record written. For writes outside
+/// [`start`] and [`handback`]: the start menu's (spec 004).
+pub fn write_changes<S: RecordStore + Log>(p: &mut S, cur: &mut InUse, changes: &[(&str, &str)]) -> bool {
+    write(p, cur, changes)
+}
+
 // ---- the splash ------------------------------------------------------------------------
 
 /// What to draw.

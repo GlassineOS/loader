@@ -12,6 +12,7 @@ extern crate std;
 pub mod answer;
 pub mod deploys;
 pub mod gspl;
+pub mod menu;
 pub mod plan;
 pub mod raw;
 pub mod record;

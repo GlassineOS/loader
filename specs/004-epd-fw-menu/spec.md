@@ -62,7 +62,7 @@ answer and that record; "More" opens the second list and "Back" returns.
 
 ### Scenario 4 – No input (Priority: P1)
 
-No tap and no key for 60 seconds: the loader takes the GlassineOS pick, logs
+No tap for 60 seconds (keys count for nothing): the loader takes the GlassineOS pick, logs
 `MENU_TIMEOUT`, and answers as Scenario 3 does. Throughout, the firmware's watchdog
 never fires: the loader re-arms it for 30 seconds before each refresh and at least every
 10 seconds while it waits, and leaves it armed for 30 seconds when it answers.
@@ -71,12 +71,19 @@ never fires: the loader re-arms it for 30 seconds before each refresh and at lea
 answer comes after more than 60 s, no reset, the stand-in's watchdog log shows the
 re-arms and 30 s as the last setting before the answer.
 
-### Scenario 5 – Keys (Priority: P2)
+### Scenario 5 – No tap source (Priority: P1)
 
-A machine whose touch doesn't arrive as an absolute pointer: arrow or volume keys move the
-focus (one refresh of the two rows' rectangle), Enter or the power key picks.
+The machine has no keys but the power button, and its firmware has no touch driver
+bound: no tap source. The menu doesn't open and nothing waits for input that can't come:
+the loader logs `MENU_NO_INPUT` and the start takes the default at once, counted as
+without a menu, so a failed start still counts toward the limit. Keys that reach the
+console are logged and do nothing.
 
-**Acceptance**: QEMU case: Down, Down, Enter picks the third entry.
+**Acceptance**: QEMU cases: with the stand-in's pointer left out (`parent.nopointer=1`)
+and `request=menu`, `MENU_NO_INPUT`, no menu, the request cleared, the default answer,
+`unmarked=1` and the splash's one refresh; the next start (`unmarked` 1) is the same
+without a draw. With the menu open, Down, Down and Enter are logged with their scan
+codes and characters and change nothing: no refresh, no pick, the timeout as Scenario 4.
 
 ### Scenario 6 – Partial and full refreshes (Priority: P1)
 
@@ -105,8 +112,11 @@ writes `display_failed=1`.
   (`display=epd-fw`, an extended GOP that passes 003 FR-002), only while
   `display_failed` is not set and the start doesn't find `drew=1` with `unmarked` above
   0, never on a start where the parent passed `glassine.pick=recovery`, and only when
-  the record read at entry has `request=menu` (both slots valid) or `unmarked` above 0.
-  Otherwise the start is 003's: no wait, the splash alone, no other refresh.
+  the record read at entry has `request=menu` (both slots valid) or `unmarked` above 0,
+  and only when there is a tap source (FR-010). Otherwise the start is 003's: no wait,
+  the splash alone, no other refresh. When only the tap source is missing the loader
+  logs `MENU_NO_INPUT`; the start takes the default at once, counted as without a
+  menu.
 - **FR-002**: A `request=menu` the loader doesn't open the menu for is cleared in the
   start's first write and the start goes on as without it.
 - **FR-003**: Before the first refresh the loader makes the menu write: `request`
@@ -132,37 +142,42 @@ writes `display_failed=1`.
   animation, no pressed-state style, no scrolling effect. The focused or tapped row is
   shown inverted (white text on black). The first frame is one refresh of the whole
   panel.
-- **FR-009**: Refreshes. After the first, each refresh covers the area of the picture
-  that was redrawn since the last refresh, merged into at most four rectangles (overlapping or touching ones
-  merged; past four, their bounding box), each mapped to the native rectangle (the
-  portrait rectangle (u, v, w, h) is native (W − v − h, u, h, w)), x rounded down and
-  x + width up to multiples of 8, clipped to the panel. The call is
-  `Refresh(This, Fb, x, y, w, h, W, 0)` with `Fb` the framebuffer's base. With
-  `display_partial=0` in the record every refresh is (0, 0, W, H). One input gives one
-  refresh at most, plus the splash's when it is a pick. Each refresh is logged with its
-  rectangle and how long it took (`EPD_REFRESH`).
-- **FR-010**: Touch. When the firmware has an absolute pointer (a device's own first;
-  else the console splitter's, on the console-in handle), the loader reads it with
-  `GetState` only; it never calls `Reset`. A position is mapped through the Mode's ranges to the
-  panel's native axes by one orientation constant (axes swapped or not, each flipped or
-  not; unverified on hardware), then to portrait by the inverse of 003 FR-004. A range
-  with its maximum not above its minimum makes the pointer unusable. A press counts at
-  once; a release less than 30 ms after it is a bounce and ignored; no new state for
-  300 ms after a press is a release; a press within 300 ms of the last release is
-  ignored until it ends. A tap selects
-  the row it lands in; a press that ends outside it does nothing. Each raw and mapped
-  tap is logged (`TOUCH`).
-- **FR-011**: Keys, through the console's text input: up, left and page up (and the
-  volume-up scan code) move the focus up; down, right and page down (and volume down)
-  move it down; Enter, Space and the power key's scan code pick the focused row; Escape
-  takes the GlassineOS pick. The power key is `SCAN_SUSPEND` (0x102), the volume keys 0x80
-  and 0x81, as the Note Air's boot loader source uses them.
+- **FR-009**: Refreshes. After the first, a refresh waits until the picture has stayed
+  unchanged for 100 ms and no touch is down, then covers the bounding box of the area
+  redrawn since the last refresh, mapped to the native rectangle (the portrait rectangle
+  (u, v, w, h) is native (W − v − h, u, h, w)), x rounded down and x + width up to
+  multiples of 8, clipped to the panel. The call is `Refresh(This, Fb, x, y, w, h, W,
+  0)` with `Fb` the framebuffer's base. With `display_partial=0` in the record every
+  refresh is (0, 0, W, H). One input gives one refresh at most, plus the splash's when
+  it is a pick. Each refresh is logged with its rectangle and how long it took
+  (`EPD_REFRESH`).
+- **FR-010**: Taps are the only input, from one tap source: it gives the touch's state,
+  pressed or not, at a position on the portrait panel, polled, never waited on. The menu
+  depends on nothing else, so a touch driver of the loader's own for the panel's
+  controller can be a source behind the same interface. Today the one source is a
+  firmware absolute pointer of a device's own (FR-011); the console splitter's pointer
+  on the console-in handle is not a source (with no touch driver bound under it, it
+  never reports). Keys don't drive the menu and are no input for the timeout: each key
+  the console's input gives (its extended form where the console-in handle has one) is
+  logged (`KEY`) with its scan code and character, and from the extended form its shift
+  and toggle state, so a run shows what a machine sends (the power key, `SCAN_SUSPEND`,
+  among them). The PC path keeps its keys (001).
+- **FR-011**: The firmware pointer source. The loader reads the pointer with `GetState`
+  only: never `Reset`, never a wait on its event. A position is mapped through the
+  Mode's ranges to the panel's native axes by one orientation constant (axes swapped or
+  not, each flipped or not; unverified on hardware), then to portrait by the inverse of
+  003 FR-004. A range with its maximum not above its minimum, or a Mode the loader can't
+  read, makes the pointer no source. Each raw and mapped press is logged (`TOUCH`).
+- **FR-011a**: Taps, from any source. A press counts at once; a release less than 30 ms
+  after it is a bounce and ignored; no new state for 300 ms after a press is a release;
+  a press within 300 ms of the last release is ignored until it ends. A tap selects the
+  row it lands in; a press that ends outside it does nothing.
 - **FR-012**: The watchdog: before each refresh and at least every 10 s while the menu
   waits, `SetWatchdogTimer(30, …)`; 30 s again before the answer. Never disabled.
 - **FR-013**: The timeout: 60 s after the menu opened or after the last input, the
   GlassineOS pick, logged as `MENU_TIMEOUT`.
 - **FR-014**: With `probe=1` the probe report is written again after the menu closed,
-  so its log holds the menu's lines (refreshes, taps, the pick).
+  so its log holds the menu's lines (refreshes, keys, taps, the pick).
 - **FR-015**: The PC path (001) is unchanged: its theme, list, key line and frames.
 
 ## Device scope and risk
@@ -172,9 +187,13 @@ by a device run with the person's go:
 
 - whether the firmware's refresh honours a rectangle other than the whole panel (and
   whether it reads `Fb` as the framebuffer's base); `display_partial=0` is the escape;
-- whether the absolute pointer on the console-in handle reports touches at all (it may
-  be the console splitter's, with no touch driver under it), its ranges and its axes;
-- which keys reach the console as EFI keys;
+- touch: a probe run on a Note Air listed one absolute pointer, on the console-in
+  handle, with ranges 0 to 65536 on each axis and no device path, and no other; most
+  likely the console splitter's with no touch driver under it (an inference: nothing
+  was read from it). So the Note Air has no tap source today and the menu doesn't open
+  there (Scenario 5) until a touch driver of the loader's own exists; its axes then;
+- which keys reach the console-in handle (the Note Air has only the power button; the
+  `KEY` lines of a run show what it sends);
 - the watchdog re-arm on this firmware.
 
 A hang inside the menu is a counted start that leaves `drew=1`: the next start draws
@@ -182,7 +201,8 @@ nothing and sets `display_failed` (003 FR-010).
 
 ## Out of scope
 
-Long press, drag and scrolling; the firmware's set-up; an Android entry; any change to
+A touch driver for the panel's controller (separate work, a tap source behind FR-010);
+keys driving the menu; long press, drag and scrolling; the firmware's set-up; an Android entry; any change to
 the parent; drawing after the answer.
 
 ## Success criteria

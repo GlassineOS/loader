@@ -1528,7 +1528,7 @@ def handback_epd_fw_draws_the_splash_once():
     assert re.search(r"EPD_FW epd-fw [^\r\n]* bound=mode", log), "the Mode's bound not logged"
     assert "HINT_SHOWN" not in log, "a key line on a backend with no key"
     seq, r, _ = d.record()
-    assert (seq, r["unmarked"]) == (2, "1"), (seq, r)
+    assert (seq, r["unmarked"], r["drew"]) == (3, "1", ""), (seq, r)
     w, start = log.index("WRITE slot="), log.index("PARENT_FAKEFW_REFRESH_START")
     assert w < start, "the refresh ran before the count was written"
 
@@ -1658,6 +1658,271 @@ def handback_epd_fw_override_removed_before_drawn():
     mark_healthy(d)
     log, _, _, _ = parent_run("hb-epd-ovr-2", d)
     assert [r.split("crc=")[1] for r in refreshes(log)] == [epd_golden(spx, sw, sh, 0xFFFFFF)], refreshes(log)
+
+
+# ---- the start menu (spec 004) -------------------------------------------------------
+
+POINTER_RANGE = (4095, 3071)  # the stand-in's max_x, max_y (min 0)
+ROW_H = 144  # loader/src/epdmenu.rs
+
+
+def tap_xy(u, v):
+    """The stand-in pointer's position for portrait (u, v): the inverse of the loader's
+    mapping with the identity orientation (core::menu::from_portrait)."""
+    nw, nh = PANEL
+    nx, ny = nw - 1 - v, u
+    mx, my = POINTER_RANGE
+    up = lambda n, span, out: min((n * span + out - 2) // (out - 1), span)
+    return up(nx, mx, nw), up(ny, my, nh)
+
+
+def row_tap(i, after):
+    """A tap in the middle of menu row i (0 the first entry), once the loader has made
+    `after` refreshes."""
+    x, y = tap_xy(PORTRAIT[0] // 2, ROW_H * (i + 2) + ROW_H // 2)
+    return f"{after}:{x}:{y}"
+
+
+def frames(d, name):
+    """The stand-in's frame dumps (parent.fbdump=1), each saved as a portrait PNG."""
+    out, k = [], 1
+    while True:
+        r = subprocess.run(["mtype", "-i", f"{d.path}@@{ESP_OFF}", f"::/fb{k}.raw"], capture_output=True)
+        if r.returncode != 0 or not r.stdout:
+            break
+        nw, nh = PANEL
+        im = Image.frombytes("RGB", (nw, nh), r.stdout, "raw", "BGR;16")
+        im.transpose(Image.ROTATE_90).save(os.path.join(OUT, name, f"frame{k}.png"))
+        out.append(r.stdout)
+        k += 1
+    return out
+
+
+def menu_run(name, d, timeout=400):
+    vm = VM(name, d)
+    vm.wait("PARENT_POWEROFF", timeout=timeout)
+    vm.finish()
+    log = vm.log()
+    boot = re.findall(r"PARENT_BOOT ([^\r\n]*)", log)[-1]
+    ans = re.findall(r"HANDBACK_ANSWER ([^\r\n]*)", log)
+    return log, boot, (ans[-1] if ans else None)
+
+
+GOLDEN_MENU = os.path.join(ROOT, "tests", "golden", "epd-menu.txt")
+
+
+def golden(name, crcs):
+    """The framebuffer CRCs after each refresh of a case, against tests/golden/epd-menu.txt
+    (QTEST_BLESS=1 writes them). The frames are also kept as PNGs in out/test/<case>/."""
+    lines = {}
+    if os.path.exists(GOLDEN_MENU):
+        for l in open(GOLDEN_MENU):
+            if l.strip() and not l.startswith("#"):
+                k, v = l.split(None, 1)
+                lines[k] = v.split()
+    if os.environ.get("QTEST_BLESS") == "1":
+        lines[name] = crcs
+        with open(GOLDEN_MENU, "w") as f:
+            f.write("# The stand-in's CRC-32 of the whole framebuffer after each refresh of a start-menu\n"
+                    "# case (tests/qemu/run.py, golden()); the same on every arch and firmware.\n")
+            for k in sorted(lines):
+                f.write(f"{k} {' '.join(lines[k])}\n")
+        return
+    assert lines.get(name) == crcs, f"{name}: frames {crcs}, golden {lines.get(name)}"
+
+
+def menu_rects(log):
+    """Each refresh's (x, y, w, h), checked aligned and inside the panel."""
+    out = []
+    for r in refreshes(log):
+        x, y, w, h = map(int, re.search(r"rect=(\d+),(\d+),(\d+),(\d+)", r).groups())
+        assert x % 8 == 0 and w % 8 == 0 and w > 0 and h > 0, r
+        assert x + w <= PANEL[0] and y + h <= PANEL[1], r
+        assert "stride=1872 mode=0" in r and "this=1 fb=1" in r, r
+        out.append((x, y, w, h))
+    return out
+
+
+def crcs(log):
+    return [r.split("crc=")[1] for r in refreshes(log)]
+
+
+FULL = (0, 0, PANEL[0], PANEL[1])
+D1, D2 = "d1", "d2"
+MENU_REC = dict(display="epd-fw", request="menu", default=SET_A, default_rec="aa" * 32, previous=SET_B,
+                previous_rec="bb" * 32, deploys="2", deploy1=f"{D1} previous 3.24.1 2026-11-01",
+                deploy2=f"{D2} candidate 3.24.2 2026-11-10")
+MENU_SPLASH = None
+
+
+def menu_disk(name, taps=(), extra="", **keys):
+    global MENU_SPLASH
+    if MENU_SPLASH is None:
+        MENU_SPLASH = mksplash.encode(portrait_px(600, 800, 0, 0xC0C0C0), 600, 800, PORTRAIT, 0xFFFFFF)
+    cfg = f"parent.fakefw=1 parent.fbdump=1 parent.taps={','.join(taps)} {extra}".strip()
+    return hb_disk(name, hb_record(**keys), cfg=cfg, images={"splash": MENU_SPLASH})
+
+
+def menu_case(name, taps=(), extra="", **keys):
+    d = menu_disk(name, taps, extra, **keys)
+    log, boot, ans = menu_run(name, d)
+    frames(d, name)
+    return d, log, boot, ans
+
+
+@case("x86_64", "aarch64")
+def menu_on_request_each_entry_by_tap():
+    """004 Scenarios 1, 3 and 6: request=menu opens the menu (the menu write before the
+    first refresh, the whole panel first); a tap on each entry gives its answer and its
+    write, one partial refresh for the tap, then the splash; the frames match the goldens."""
+    want = {
+        # name: (taps, answer, cmdline_add, unmarked, started, started_why)
+        "glassineos": ([row_tap(0, 1)], f"boot=set:{SET_A}", None, "1", SET_A, "default"),
+        "prevdeploy": ([row_tap(1, 1)], f"boot=set:{SET_A}", f"glassine.deploy.once={D1}", "1", SET_A, "default"),
+        "more": ([row_tap(2, 1), row_tap(0, 3)], f"boot=set:{SET_A}", f"glassine.deploy.once={D2}", "1", SET_A, "default"),
+        "moreback": ([row_tap(2, 1), row_tap(1, 3), row_tap(4, 4)], "boot=recovery", None, "0", "", ""),
+        "prevkernel": ([row_tap(3, 1)], f"boot=set:{SET_B}", None, "1", SET_B, "choice"),
+        "recovery": ([row_tap(4, 1)], "boot=recovery", None, "0", "", ""),
+    }
+    for n, (taps, ans, add, unmarked, started, why) in want.items():
+        name = f"menu-{n}"
+        d, log, boot, got = menu_case(name, taps, **MENU_REC, probe="1" if n == "glassineos" else "")
+        assert got and got.startswith(f"format=1 {ans}"), (name, got)
+        assert ("PARENT_CMDLINE_ADD " + add in log) if add else "PARENT_CMDLINE_ADD" not in log, (name, add)
+        assert "MENU_OPEN why=request partial=1" in log, name
+        w1, first = log.index("WRITE slot="), log.index("PARENT_FAKEFW_REFRESH_START")
+        assert w1 < first, f"{name}: refreshed before the menu write"
+        assert len(re.findall(r"PARENT_FAKEFW_TAP", log)) == len(taps), (name, "not every tap was read")
+        assert "MENU_INPUT firmware-pointer" in log and "TOUCH_SKIPPED the console splitter's pointer" in log, name
+        rects = menu_rects(log)
+        assert rects[0] == FULL and rects[-1] == FULL, (name, rects)
+        # A tap that moves the focus refreshes only the rows it changed (none for the
+        # entry already focused); a new list refreshes the whole panel.
+        partial = [r for r in rects[1:-1] if r != FULL]
+        assert all(r[2] < PANEL[0] for r in partial) and (bool(partial) == (n != "glassineos")), (name, rects)
+        seq, r, _ = d.record()
+        assert seq == 3, (name, seq, "the menu write and the pick's write")
+        assert (r["request"], r["unmarked"], r["drew"], r["started"], r["started_why"]) == ("", unmarked, "", started, why), (name, r)
+        assert crcs(log)[-1] == EPD_GOLDEN_SPLASH, (name, "the splash after the pick")
+        golden(name, crcs(log))
+        if n == "glassineos":
+            # 004 FR-014: the probe written again after the menu, its log with the pick.
+            p = d.probe()
+            assert p and any(k.startswith("log") and "MENU_PICK 0 GlassineOS" in v for k, v in p), "no menu lines in the probe"
+            assert log.count("PROBE_WRITTEN ok=1") == 2, "the probe wasn't written again"
+            assert fakefw_calls(log)["ptr_reset"] == "0", "Reset called on the pointer"
+
+
+@case("x86_64", "aarch64")
+def menu_full_refreshes_with_display_partial_0():
+    """004 Scenario 6: display_partial=0: every refresh is the whole panel, and the frames
+    are the same as with partial refreshes."""
+    d, log, boot, ans = menu_case("menu-full", [row_tap(4, 1)], **MENU_REC, display_partial="0")
+    assert ans.startswith("format=1 boot=recovery"), ans
+    assert "MENU_OPEN why=request partial=0" in log
+    assert all(r == FULL for r in menu_rects(log)) and len(menu_rects(log)) == 3, menu_rects(log)
+    golden("menu-full", crcs(log))
+    golden("menu-recovery", crcs(log))
+
+
+@case("x86_64", "aarch64")
+def menu_after_an_unmarked_start_only():
+    """004 Scenario 2, FR-001, FR-002, FR-007: a start that drew the splash clears drew
+    after the refresh; the next start (not marked healthy) opens the menu by itself; a
+    start with unmarked 0 and no request opens none; request=menu without the display is
+    cleared."""
+    d = menu_disk("menu-unmarked", [row_tap(0, 1)], display="epd-fw")
+    log, boot, ans = menu_run("menu-unmarked", d)
+    assert "MENU_OPEN" not in log and menu_rects(log) == [FULL], "a menu without a request"
+    seq, r, _ = d.record()
+    assert (seq, r["unmarked"], r["drew"]) == (3, "1", ""), (seq, r)
+    assert log.index("SPLASH_DRAWN") < log.rindex("WRITE slot="), "drew cleared before the draw"
+    log, boot, ans = menu_run("menu-unmarked-2", d)
+    assert "MENU_OPEN why=unmarked" in log, log[-600:]
+    assert ans.startswith("format=1 boot=baseline why=default"), ans
+    seq, r, _ = d.record()
+    assert (seq, r["unmarked"], r["drew"]) == (5, "2", ""), (seq, r)
+    # request=menu without display=epd-fw: no menu, cleared.
+    d = hb_disk("menu-nodisplay", hb_record(request="menu"), cfg="parent.fakefw=1")
+    log, boot, _, _ = parent_run("menu-nodisplay", d)
+    assert boot == "baseline" and "MENU_OPEN" not in log and fakefw_calls(log)["refresh"] == "0", log[-400:]
+    assert d.record()[1]["request"] == "", "request=menu left"
+
+
+@case("x86_64", "aarch64")
+def menu_timeout_takes_the_default_under_the_watchdog():
+    """004 Scenario 4, FR-012, FR-013: no input for 60 s: the GlassineOS pick; the
+    parent's 30 s watchdog never fires (the loader re-arms it), and it is 30 s when the
+    loader answers."""
+    d = menu_disk("menu-timeout", **MENU_REC)
+    vm = VM("menu-timeout", d)
+    vm.wait("EPD_REFRESH 1 ", timeout=300)
+    # FR-010: keys are logged and do nothing: no move, no pick, no new timeout.
+    for k in ("down", "down", "ret"):
+        vm.key(k)
+    vm.wait("PARENT_POWEROFF", timeout=400)
+    vm.finish()
+    log = vm.log()
+    frames(d, "menu-timeout")
+    boot = re.findall(r"PARENT_BOOT ([^\r\n]*)", log)[-1]
+    ans = re.findall(r"HANDBACK_ANSWER ([^\r\n]*)", log)[-1]
+    keys = re.findall(r"KEY scan=0x([0-9a-f]{4}) char=0x([0-9a-f]{4})", log)
+    assert keys == [("0002", "0000"), ("0002", "0000"), ("0000", "000d")], keys
+    assert "MENU_PICK" not in log and len(menu_rects(log)) == 2, menu_rects(log)
+    assert "MENU_TIMEOUT 60 s: GlassineOS" in log, log[-600:]
+    assert ans.startswith(f"format=1 boot=set:{SET_A}") and boot == "baseline", ans
+    t0 = int(re.search(r"\[loader +(\d+)\] MENU_OPEN", log).group(1))
+    t1 = int(re.search(r"\[loader +(\d+)\] MENU_TIMEOUT", log).group(1))
+    assert t1 - t0 >= 60000, (t0, t1)
+    menu = log[log.index("MENU_SHOWN"):log.index("HANDBACK_ANSWER")]
+    arms = re.findall(r"PARENT_WATCHDOG (\d+)", menu)
+    assert len(arms) >= 6 and set(arms) == {"30"}, arms
+    assert "PARENT_WATCHDOG 0" not in log[:log.index("HANDBACK_ANSWER")], "the loader disarmed the watchdog"
+    last = re.findall(r"PARENT_WATCHDOG (\d+)", log[:log.index("HANDBACK_ANSWER")])[-1]
+    assert last == "30", last
+    seq, r, _ = d.record()
+    assert (r["unmarked"], r["started_why"], r["drew"]) == ("1", "default", ""), r
+    golden("menu-timeout", crcs(log))
+
+
+@case("x86_64", "aarch64")
+def menu_without_a_tap_source():
+    """004 Scenario 5, FR-001: firmware with no tap source (no absolute pointer of a
+    device's own; the console splitter's doesn't count): no menu. On request: logged
+    MENU_NO_INPUT, the request cleared, the default at once, counted, the splash of 003.
+    After an unmarked start: the same without a draw (003 draws only at unmarked 0)."""
+    d = menu_disk("menu-noinput", extra="parent.nopointer=1", **MENU_REC)
+    log, boot, ans = menu_run("menu-noinput", d)
+    assert "MENU_NO_INPUT why=request" in log and "MENU_OPEN" not in log, log[-800:]
+    assert ans.startswith(f"format=1 boot=set:{SET_A} ") and " why=default " in ans, ans
+    assert menu_rects(log) == [FULL] and crcs(log) == [EPD_GOLDEN_SPLASH], refreshes(log)
+    seq, r, _ = d.record()
+    assert (seq, r["request"], r["unmarked"], r["drew"], r["started_why"]) == (3, "", "1", "", "default"), (seq, r)
+    log, boot, ans = menu_run("menu-noinput-2", d)
+    assert "MENU_NO_INPUT why=unmarked" in log and "MENU_OPEN" not in log, log[-800:]
+    assert "EPD_FW_SKIPPED" in log and menu_rects(log) == [], refreshes(log)
+    seq, r, _ = d.record()
+    assert (r["unmarked"], r["display_failed"] if "display_failed" in r else "") == ("2", ""), r
+
+
+@case("x86_64", "aarch64")
+def menu_hang_is_counted_then_skipped():
+    """004 Scenario 7: a refresh in the menu that never returns: the menu write (the
+    request cleared, counted, drew=1) came first, the parent's watchdog resets; the next
+    start draws nothing and sets display_failed."""
+    d = hb_disk("menu-hang", hb_record(display="epd-fw", request="menu"), cfg="parent.fakefw=hang",
+                images={"splash": mksplash.encode(portrait_px(600, 800, 0, 0xC0C0C0), 600, 800, PORTRAIT, 0xFFFFFF)})
+    vm = VM("menu-hang", d)
+    vm.finish(timeout=200)
+    log = vm.log()
+    assert "PARENT_FAKEFW_HANG" in log and "MENU_OPEN" in log and "PARENT_RETURNED" not in log, log[-600:]
+    assert log.index("WRITE slot=") < log.index("PARENT_FAKEFW_REFRESH_START")
+    r = d.record()[1]
+    assert (r["request"], r["unmarked"], r["drew"]) == ("", "1", "1"), r
+    log, boot, _, _ = parent_run("menu-hang-2", d)
+    assert boot == "baseline" and "MENU_OPEN" not in log, log[-600:]
+    assert "EPD_FW_SKIPPED the previous start drew and wasn't marked healthy: display_failed=1" in log, log[-600:]
+    assert d.record()[1]["display_failed"] == "1"
 
 
 @case("x86_64", "aarch64")
