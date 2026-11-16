@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glassine-loader-core",
  "uefi",
@@ -79,14 +79,14 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "glassine-test-kernel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glassine-loader-core",
  "sha2",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-test-parent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glassine-loader-core",
  "uefi",

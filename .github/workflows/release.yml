@@ -1,7 +1,8 @@
 # A release of the loader, on a tag v<version> (the workspace's version in Cargo.toml):
 # glassine-loader.efi for x86_64 and aarch64, each built twice on separate runners from a
 # clean checkout and compared byte for byte (the PE files carry no timestamp:
-# .cargo/config.toml), the first build run through the QEMU cases (make test) and
+# .cargo/config.toml), the first build run through the QEMU cases (make test; on
+# x86_64 also make test-fw2, a second EDK2 release) and
 # released, with SHA256SUMS and the notices of what it has compiled in
 # (scripts/notices.sh). A 0.x version or one with a suffix is a prerelease. An existing
 # release is never replaced: other repositories pin its files by SHA-256.
@@ -42,6 +43,9 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.arch }}-unknown-uefi/release/glassine-loader.efi dist/glassine-loader-${{ matrix.arch }}.efi
       - run: make test ARCH=${{ matrix.arch }}
+      - name: the x86_64 cases with a second firmware (Alpine's OVMF)
+        if: matrix.arch == 'x86_64'
+        run: make test-fw2
       - name: the tests ran the same binary
         run: cmp target/${{ matrix.arch }}-unknown-uefi/release/glassine-loader.efi dist/glassine-loader-${{ matrix.arch }}.efi
       - run: make notices ARCH=${{ matrix.arch }} && cp out/release/NOTICES-${{ matrix.arch }}.txt dist/
@@ -124,7 +128,7 @@ jobs:
           - \`glassine-loader-aarch64.efi\`: arm64 UEFI.
           - \`SHA256SUMS\`, and \`NOTICES-<arch>.txt\`: the licenses of what each binary has compiled in (LVGL, TLSF, printf, the Montserrat and Font Awesome fonts under the SIL OFL 1.1, the Rust crates).
 
-          Each binary was built twice on separate machines and both builds matched byte for byte; the released one passed the repository's QEMU cases (OVMF on x86-64; AAVMF on arm64). It is not signed: Secure Boot must be off.
+          Each binary was built twice on separate machines and both builds matched byte for byte; the released one passed the repository's QEMU cases (two OVMF builds on x86-64: Debian's and Alpine's; AAVMF on arm64). It is not signed: Secure Boot must be off.
 
           **Not reviewed, and never run on a real PC.** GlassineOS is a hobby project, written largely with AI coding agents and not reviewed by subsystem experts. This loader has been tested only in QEMU with OVMF/AAVMF. Running it on real hardware is at your own risk.
           EOF

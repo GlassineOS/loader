@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 use glassine_loader_core::plan::{Loaded, Starter};
 use uefi::boot::{self, LoadImageSource};
+use uefi::proto::device_path::DevicePath;
+use uefi::proto::device_path::build::{DevicePathBuilder, media::FilePath};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::{Guid, Handle, Status, guid};
 use uefi_raw::protocol::device_path::DevicePathProtocol;
@@ -104,6 +106,22 @@ impl Drop for Initrd {
     }
 }
 
+/// The device path of `file` on the partition the loader was started from: that
+/// partition's path, then a file path node.
+fn kernel_device_path<'a>(file: &str, buf: &'a mut Vec<u8>) -> Option<&'a DevicePath> {
+    let dev = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?.device()?;
+    // shared, not exclusive: the partition's drivers stay as they are
+    let params = boot::OpenProtocolParams { handle: dev, agent: boot::image_handle(), controller: None };
+    let part = unsafe { boot::open_protocol::<DevicePath>(params, boot::OpenProtocolAttributes::GetProtocol) }.ok()?;
+    let mut wide: Vec<u16> = file.encode_utf16().chain(Some(0)).collect();
+    let name = uefi::CStr16::from_u16_with_nul(&mut wide).ok()?;
+    let mut b = DevicePathBuilder::with_vec(buf);
+    for node in part.node_iter() {
+        b = b.push(&node).ok()?;
+    }
+    b.push(&FilePath { path_name: name }).ok()?.finalize().ok()
+}
+
 pub struct Firmware;
 
 impl Starter for Firmware {
@@ -120,7 +138,16 @@ impl Starter for Firmware {
         };
         // UCS-2, NUL-terminated, its size in bytes.
         let opts: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
-        let child = match boot::load_image(boot::image_handle(), LoadImageSource::FromBuffer { buffer: &set.kernel, file_path: None }) {
+        // The checked buffer, with the kernel's file path on this partition: some firmware
+        // refuses an image from a buffer without one (edk2-stable202605's image
+        // verification handler: EFI_INVALID_PARAMETER for a NULL file path, Secure Boot
+        // on or off). The firmware doesn't read the file; the path names the image.
+        let mut dp = Vec::new();
+        let path = kernel_device_path(&set.kernel_path, &mut dp);
+        if path.is_none() {
+            crate::log!("no device path for {}: loading without one", set.kernel_path);
+        }
+        let child = match boot::load_image(boot::image_handle(), LoadImageSource::FromBuffer { buffer: &set.kernel, file_path: path }) {
             Ok(h) => h,
             Err(e) => {
                 crate::log!("LoadImage: {:?}", e.status());
