@@ -34,3 +34,25 @@ jobs:
             out/test/*/serial.log
             out/test/results-*.json
           retention-days: 14
+  qemu-fw2:
+    # the x86_64 cases with another EDK2 release than the build image's (Alpine's ovmf)
+    name: QEMU x86_64 (Alpine OVMF)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM for the runner's user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: make test-fw2
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-x86_64-fw2
+          path: |
+            out/test/*/*.png
+            out/test/*/serial.log
+            out/test/results-*.json
+            .tmp/fw2/version
+          retention-days: 14
