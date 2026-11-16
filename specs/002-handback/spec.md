@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`563d585fa7f06918ade868d9e37c3e3df9d8b84e`. Where the documents and
+`843fd2c2f45b1cff3772567cf0cd142721c8eba0`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -29,7 +29,8 @@ this spec differ, the documents win and this spec is corrected.
 
 A parent starts the loader with the hand-back load option. The loader reads its record
 from the partition it was started from, decides, counts the start, and exits with the
-answer. It draws nothing and waits for no key.
+answer. It draws nothing and waits for no key (unless the record asks for the display of
+spec 003 and the firmware has it: then it draws the splash once and waits for no key).
 
 **Acceptance**: in QEMU, a stand-in parent (`tests/parent`) starts the loader from the
 partition and reads `boot=baseline` from the exit data; the record's count went up by
@@ -85,7 +86,8 @@ counts no refresh, no `SetMode`, no `Blt` and no `QueryMode` of a GOP whose Mode
   image is replaced by the region write (head zeroed, rest, head, read back) and refused
   when larger than its region; the override is removed by zeroing its head, flushed and
   read back, before it is drawn. In hand-back mode the loader doesn't call it: a
-  headless start leaves the store as it is (012 FR-015a).
+  headless start leaves the store as it is (012 FR-015a). The exception is the display
+  of spec 003, which uses the store as on a PC.
 - **FR-004**: The decisions are 012's (FR-008 to FR-013): no record, nothing written,
   `baseline`; `default` empty, `baseline`; else the set named; at the limit the previous
   set or the recovery; a recovery start is not counted; a request only with both slots
