@@ -1,0 +1,15 @@
+# A test tool, not part of the loader: writes a boot partition with the installer's
+# own code (GlassineOS/installer core, pinned), so the QEMU tests boot the bytes the
+# installer writes.
+[package]
+name = "glassine-test-mkboot"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+[workspace]
+
+[dependencies]
+glassine-installer = { git = "https://github.com/GlassineOS/installer", rev = "e44e0e2bcf73c922686aece45d92e636d0801e52" }
+sha2 = "0.10"

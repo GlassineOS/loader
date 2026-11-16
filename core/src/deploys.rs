@@ -49,7 +49,6 @@ pub enum Action {
     More,
     PreviousKernel,
     Recovery,
-    FirmwareSetup,
     /// Back to the first list.
     Back,
 }
@@ -69,9 +68,10 @@ fn name(d: &Deployment) -> String {
 }
 
 /// The first list (010 FR-039): GlassineOS, the previous deployment, "More", the
-/// previous kernel, the recovery, the firmware's set-up. An entry with nothing behind
-/// it is left out. `rec` is the record in use, if any.
-pub fn main_list(rec: Option<&Record>, firmware_setup: bool) -> Vec<Entry> {
+/// previous kernel, the recovery. An entry with nothing behind it is left out. `rec` is
+/// the record in use, if any. The firmware's set-up of FR-039 is not offered: it needs
+/// a firmware variable written at a start, which 010 FR-031 rules out.
+pub fn main_list(rec: Option<&Record>) -> Vec<Entry> {
     let mut out = Vec::new();
     if let Some(r) = rec {
         out.push(e("GlassineOS".into(), Action::Continue));
@@ -87,9 +87,6 @@ pub fn main_list(rec: Option<&Record>, firmware_setup: bool) -> Vec<Entry> {
         }
     }
     out.push(e("Recovery".into(), Action::Recovery));
-    if firmware_setup {
-        out.push(e("Firmware set-up".into(), Action::FirmwareSetup));
-    }
     out
 }
 
@@ -130,9 +127,9 @@ mod tests {
         assert_eq!(l.len(), 3);
         assert_eq!(l[0].label, "3.24.1 2026-11-01");
         assert_eq!(l[2], Deployment { id: "d4".into(), state: "kept".into(), label: "".into() });
-        let m = main_list(Some(&r), true);
+        let m = main_list(Some(&r));
         let acts: Vec<&Action> = m.iter().map(|x| &x.action).collect();
-        assert_eq!(acts, [&Action::Continue, &Action::Deploy("d1".into()), &Action::More, &Action::PreviousKernel, &Action::Recovery, &Action::FirmwareSetup]);
+        assert_eq!(acts, [&Action::Continue, &Action::Deploy("d1".into()), &Action::More, &Action::PreviousKernel, &Action::Recovery]);
         assert_eq!(m[1].label, "Previous deployment: 3.24.1 2026-11-01");
         let more = more_list(&r);
         assert_eq!(more.len(), 3);
@@ -147,9 +144,9 @@ mod tests {
         let r = rec(&format!("deploys=40\ndeploy1=d1 staged x\ndeploy2=d2 kept {label65}\ndeploy3=d3 kept caf\u{e9}\ndeploy4=d 4 kept\ndeploy33=d33 kept x\n"));
         assert!(list(&r).is_empty(), "{:?}", list(&r));
         assert!(list(&rec("deploys=x\ndeploy1=d1 kept x\n")).is_empty());
-        let m = main_list(Some(&rec("previous=\ndeploys=0\n")), false);
+        let m = main_list(Some(&rec("previous=\ndeploys=0\n")));
         assert_eq!(m.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["GlassineOS", "Recovery"]);
-        let m = main_list(None, false);
+        let m = main_list(None);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].action, Action::Recovery);
     }
