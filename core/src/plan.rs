@@ -57,7 +57,7 @@ pub trait Platform {
 }
 
 /// Where the loader record's two slots are: the slot files on the loader's FAT volume
-/// (a PC; every [`Platform`] is one), or raw on a hand-back partition
+/// (a PC; every [`Platform`] is one), or the region `record` of a raw boot partition
 /// ([`crate::raw::Raw`]).
 pub trait RecordStore {
     /// The whole slot (`0` a, `1` b).

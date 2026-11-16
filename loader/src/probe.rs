@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The probe report (GlassineOS/boot `docs/handback.md`, "The probe area"): what the
+//! The probe report (GlassineOS/boot `docs/handback.md`, "The probe report"): what the
 //! firmware offers, read without changing anything. The only firmware calls are listing
 //! handles and their protocols, opening protocols with `GetProtocol` (never exclusively)
 //! and the graphics output's `QueryMode`; the console's mode is read from its fields.
