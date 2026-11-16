@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`24b20725d86b99277a08ef750a25d10a018eb946`. Where the documents and
+`563d585fa7f06918ade868d9e37c3e3df9d8b84e`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -58,7 +58,11 @@ With `probe=1` in the record, the loader writes a report of the firmware to the 
 area before it answers; without it, it never writes there.
 
 **Acceptance**: in QEMU the report is valid, names the GOP and lists the mode QEMU's
-display is in; the answer and the count are as without the probe.
+display is in; the answer and the count are as without the probe. With the stand-in
+firmware of `tests/parent` (`parent.fakefw=1`: an extended GOP, its console splitter's,
+and GOPs with a NULL, a nonsense and an unmapped Mode), the report names each layout,
+gives the extended GOP's framebuffer from one `GetFrameBuffer` call, and the stand-in
+counts no refresh, no `SetMode`, no `Blt` and no `QueryMode` of a GOP whose Mode failed.
 
 ## Requirements
 
@@ -94,12 +98,32 @@ display is in; the answer and the count are as without the probe.
   loader writes to no console. The log is also kept in memory (24 KiB at most) for the
   probe report.
 - **FR-008**: The probe report (with `probe=1` only) is built from enumeration and
-  queries only: handles, protocols per handle, GOP modes through `QueryMode`, console
-  handles and text modes, and the file systems: `boot_fs` (one on the boot partition),
-  `fs_handles` and one `fs<n>` line per handle with one. No `SetMode`, no `Blt`, no
-  register access. It is written to the region `probe` (region write) or to
+  queries only: handles, protocols per handle, the memory map, the loaded images, the
+  graphics outputs read raw (FR-008a), console handles and text modes, the file
+  systems (`boot_fs`, `fs_handles`, one `fs<n>` line per handle with one), and four
+  display variables read with `GetVariable` under `gQcomTokenSpaceGuid`
+  (`882f8c2b-9646-435f-8de5-f208ff80c1bd`, `QcomModulePkg.dec`):
+  `DisplaySplashBufferInfo` and `UEFIDisplayInfo` with their bytes (64 at most), and
+  whether `DISABLEDISPLAY` and `DisplayPanelOverride` exist. No `SetMode`, no `Blt`, no
+  refresh, no register access. It is written to the region `probe` (region write) or to
   `\glassine\probe.txt`, padded with newlines to 64 KiB, with its `check=` line, before
   the decision. A failed probe write changes neither the record nor the answer.
+- **FR-008a**: A graphics output is never read through a standard GOP type, whose Mode
+  is the word at +0x18: on the extended interface of boot's `docs/handback.md`
+  ("Graphics outputs read raw") that word is code, on its console splitter it is NULL.
+  For each GOP the report gives the interface's six words and the loaded image each one
+  points into, and its device path and protocol GUIDs, all printed as found (no vendor
+  GUID is built in). A word is read only when the memory map says its bytes are RAM. A
+  Mode pointer, tried at +0x18 then +0x28, is taken only when it is non-zero, 8-byte
+  aligned, its 40 bytes in RAM, `SizeOfInfo` is 0x24, `MaxMode` is at most 256 and its
+  `Info`'s 0x24 bytes are in RAM; the report gives each check's result and the layout:
+  `standard` (Mode at +0x18), `extended` (Mode only at +0x28, and +0x18 and +0x20
+  pointing into the loaded image of QueryMode, SetMode and Blt), `extended-no-slots`
+  (Mode only at +0x28, without those) or `unknown`. `QueryMode` is called through the
+  word at +0x00 only for a Mode that passed and for that word in a loaded image, up to
+  that `MaxMode`; `GetFrameBuffer` (+0x20) only on an `extended` GOP. The refresh
+  (+0x18), `SetMode` and `Blt` are never called. The PC path (001) draws only on a
+  `standard` GOP.
 - **FR-009**: Truncation, when the report doesn't fit: kept log lines first, then the
   extra GOP modes, then the protocol lines; the report says `truncated=1`.
 

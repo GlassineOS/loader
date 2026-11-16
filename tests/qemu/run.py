@@ -1357,6 +1357,74 @@ def handback_probe_reports_the_firmware():
     assert "PROBE_WRITTEN ok=1" in log
 
 
+GOP_GUID = "9042a9de-23dc-4a38-96fb-7aded080516a"
+
+
+def fakefw_calls(log):
+    m = re.findall(r"PARENT_FAKEFW calls ([^\r\n]*)", log)
+    assert m, "the stand-in firmware reported no calls"
+    return dict(kv.split("=") for kv in m[-1].split())
+
+
+def probe_gops(p):
+    """The probe's GOP lines, per GOP: {"gop": ..., "layout": ..., ...}."""
+    keys = dict(p)
+    out = []
+    for n in range(1, int(keys["gops"]) + 1):
+        g = {k[len(f"gop{n}."):]: v for k, v in p if k.startswith(f"gop{n}.")}
+        g["gop"] = keys[f"gop{n}"]
+        out.append(g)
+    return out
+
+
+@case("x86_64", "aarch64")
+def handback_probe_reads_an_extended_gop_raw():
+    """The probe on firmware with an extended GOP (Mode at +0x28, a refresh at +0x18,
+    GetFrameBuffer at +0x20), its console splitter's (NULL at +0x18 and +0x20) and three
+    GOPs whose Mode a standard reader must not trust: each is read raw, the layout named,
+    GetFrameBuffer called once on the extended one; the refresh, SetMode and Blt never,
+    nor any QueryMode of a GOP whose Mode failed its checks."""
+    d = hb_disk("hb-probe-ext", hb_record(probe="1"), cfg="parent.fakefw=1")
+    log, boot, floor, _ = parent_run("hb-probe-ext", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    assert "parent.fakefw" not in re.search(r'PARENT_START options="([^"]*)"', log).group(1), "a parent word was passed"
+    p = d.probe()
+    assert p, "no valid probe report"
+    with open(os.path.join(OUT, "hb-probe-ext", "probe.txt"), "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in p))
+    gops = probe_gops(p)
+    by = {}
+    for g in gops:
+        by.setdefault(g["layout"], []).append(g)
+    ext = by.get("extended", [])
+    assert len(ext) == 1, [g["layout"] for g in gops]
+    e = ext[0]
+    assert e["path"] == f"VenHw({GOP_GUID})", e["path"]
+    assert e["mode_at_0x28"] == "ok 1872x1404 bgr stride=1872", e["mode_at_0x28"]
+    assert not e["mode_at_0x18"].startswith("ok"), e["mode_at_0x18"]
+    fb = re.search(r"PARENT_FAKEFW installed ext=0x([0-9a-f]+) fb=0x([0-9a-f]+)", log)
+    assert e["iface"] == "0x" + fb.group(1), (e["iface"], fb.group(1))
+    assert e["framebuffer"] == f"status=SUCCESS fb=0x{fb.group(2)} w=1872 h=1404", e["framebuffer"]
+    assert e["mode0"] == "1872x1404 bgr stride=1872", e.get("mode0")
+    assert e["in"].split()[3] == e["in"].split()[0] and e["in"].startswith("image"), e["in"]
+    assert e["gop"].startswith("handle=") and "modes=1 current=0" in e["gop"], e["gop"]
+    assert GOP_GUID in e["guids"] and "09576e91-6d3f-11d2-8e39-00a0c969723b" in e["guids"], e["guids"]
+    split = by.get("extended-no-slots", [])
+    assert len(split) == 1 and split[0]["path"] == "none" and split[0]["mode_at_0x18"] == "null", split
+    assert "framebuffer" not in split[0], "GetFrameBuffer called on a GOP with no slots"
+    unk = sorted(g["mode_at_0x18"] for g in by.get("unknown", []))
+    assert unk == sorted(["null", "size_of_info=0x9999", "not-ram"]), unk
+    assert all("mode0" not in g for g in by["unknown"]), "QueryMode on a GOP with no valid Mode"
+    assert by.get("standard"), "the firmware's own GOP isn't standard"
+    keys = dict(p)
+    assert keys["var.DisplaySplashBufferInfo"] == "absent" and keys["var.DISABLEDISPLAY"] == "absent", keys
+    assert any(k.startswith("image") and "base=0x" in v for k, v in p), "no image lines"
+    c = fakefw_calls(log)
+    assert c == {"query": "2", "set_mode": "0", "blt": "0", "get_fb": "1", "garbage_query": "0", "refresh": "0"}, c
+    assert "PARENT_FAKEFW_REFRESH" not in log, "the probe refreshed the panel"
+    assert "PROBE_WRITTEN ok=1" in log
+
+
 @case("x86_64", "aarch64")
 def handback_fat_form():
     """012 FR-008, boot-partition.md "Two forms": on a FAT32 boot partition the firmware

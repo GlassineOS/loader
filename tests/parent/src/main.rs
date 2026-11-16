@@ -11,11 +11,14 @@
 //! The partition is the one whose GPT unique identity is [`PARTUUID`]. Extra load
 //! options for a case come from `\parent.cfg` on the parent's own partition: one line,
 //! the words to add (`glassine.log=serial` is always added, so the tests see the
-//! loader's log).
+//! loader's log). Words that start with `parent.` are the parent's own and not passed:
+//! `parent.fakefw=1` installs the stand-in extended graphics output of [`fakefw`].
 #![no_std]
 #![no_main]
 
 extern crate alloc;
+
+mod fakefw;
 
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::format;
@@ -172,7 +175,9 @@ fn hand_back() -> Result<Boot, String> {
     let child_h = unsafe { Handle::from_ptr(child) }.ok_or("no image handle")?;
 
     // DeviceHandle and the load options.
-    let words = format!("glassine.handback=1 glassine.log=serial {}", extra_options());
+    let cfg = extra_options();
+    let mine: Vec<&str> = cfg.split(' ').filter(|w| !w.is_empty() && !w.starts_with("parent.")).collect();
+    let words = format!("glassine.handback=1 glassine.log=serial {}", mine.join(" "));
     let words = words.trim_end();
     let mut opts: Vec<u16> = words.encode_utf16().chain([0u16]).collect();
     {
@@ -206,7 +211,17 @@ fn hand_back() -> Result<Boot, String> {
 #[entry]
 fn main() -> Status {
     say("PARENT_START_PARENT");
-    match hand_back() {
+    let fake = extra_options().split(' ').any(|w| w == "parent.fakefw=1");
+    if fake {
+        say(&fakefw::install_all());
+    }
+    let r = hand_back();
+    if fake {
+        for l in fakefw::report() {
+            say(&l);
+        }
+    }
+    match r {
         Ok(Boot::Baseline) => say("PARENT_BOOT baseline"),
         Ok(Boot::Recovery) => say("PARENT_BOOT recovery"),
         Ok(Boot::Set { id, rec }) => {

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The probe report (GlassineOS/boot `docs/handback.md`, "The probe report"): what the
-//! firmware offers, read without changing anything. The only firmware calls are listing
-//! handles and their protocols, opening protocols with `GetProtocol` (never exclusively)
-//! and the graphics output's `QueryMode`; the console's mode is read from its fields.
-//! No mode is set, nothing is drawn, no hardware is touched.
+//! firmware offers, read without changing anything. The firmware calls are listing
+//! handles and their protocols, opening protocols with `GetProtocol` (never exclusively),
+//! the memory map, `GetVariable`, each graphics output's `QueryMode` through its raw
+//! word (capped at a checked `MaxMode`) and, on an extended graphics output only, its
+//! `GetFrameBuffer`. The console's mode is read from its fields. No mode is set, nothing
+//! is drawn or refreshed, no hardware is touched.
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -11,12 +13,13 @@ use alloc::vec::Vec;
 use glassine_loader_core::raw::PROBE_BYTES;
 use glassine_loader_core::sha256_hex;
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::console::gop::GraphicsOutput;
 use uefi::proto::device_path::media::PartitionSignature;
 use uefi::proto::device_path::{DevicePath, DevicePathNodeEnum};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::{Guid, Handle, Identify, guid};
-use uefi_raw::protocol::console::{GraphicsOutputProtocol, SimpleTextOutputProtocol};
+use uefi::runtime::{self, VariableVendor};
+use uefi::{Guid, Handle, Identify, Status, cstr16, guid};
+use uefi_raw::protocol::console::SimpleTextOutputProtocol;
 
 /// Names the report gives: protocols of the UEFI specification, and the protocol GUIDs
 /// of Qualcomm's public bootloader source (`QcomModulePkg/QcomModulePkg.dec`, ABL tag
@@ -75,12 +78,14 @@ fn names() -> Vec<(Guid, &'static str)> {
     ]
 }
 
-fn pixel_format(f: PixelFormat) -> &'static str {
+/// A mode's pixel format (UEFI `EFI_GRAPHICS_PIXEL_FORMAT`).
+fn fmt_name(f: u32) -> String {
     match f {
-        PixelFormat::Rgb => "rgb",
-        PixelFormat::Bgr => "bgr",
-        PixelFormat::Bitmask => "bitmask",
-        PixelFormat::BltOnly => "blt-only",
+        0 => "rgb".into(),
+        1 => "bgr".into(),
+        2 => "bitmask".into(),
+        3 => "blt-only".into(),
+        n => format!("format{n}"),
     }
 }
 
@@ -167,6 +172,42 @@ fn partition_of(h: Handle) -> (String, String) {
     ("-".into(), "-".into())
 }
 
+/// The vendor GUID of Qualcomm's display variables (`gQcomTokenSpaceGuid`,
+/// `QcomModulePkg.dec`; ABL reads `DisplaySplashBufferInfo` and
+/// `DisplayPanelConfiguration` under it).
+const QCOM_TOKEN_SPACE: Guid = guid!("882f8c2b-9646-435f-8de5-f208ff80c1bd");
+/// The most bytes of a variable the report shows.
+const VAR_SHOWN: usize = 64;
+
+/// Display variables under [`QCOM_TOKEN_SPACE`], by `GetVariable` (read only): two with
+/// their content, two only whether they exist. A firmware without them says `absent`.
+fn qcom_variables() -> Vec<String> {
+    let vendor = VariableVendor(QCOM_TOKEN_SPACE);
+    let mut out = Vec::new();
+    for (name, content) in [
+        (cstr16!("DisplaySplashBufferInfo"), true),
+        (cstr16!("UEFIDisplayInfo"), true),
+        (cstr16!("DISABLEDISPLAY"), false),
+        (cstr16!("DisplayPanelOverride"), false),
+    ] {
+        let mut buf = [0u8; 256];
+        let v = match runtime::get_variable(name, &vendor, &mut buf) {
+            Ok((d, attr)) if content => {
+                let hex: String = d.iter().take(VAR_SHOWN).map(|b| format!("{b:02x}")).collect();
+                format!("present size={} attr=0x{:x} hex={hex}", d.len(), attr.bits())
+            }
+            Ok((d, _)) => format!("present size={}", d.len()),
+            Err(e) if e.status() == Status::BUFFER_TOO_SMALL => {
+                format!("present size={}", (*e.data()).map_or("-".into(), |n: usize| format!("{n}")))
+            }
+            Err(e) if e.status() == Status::NOT_FOUND => "absent".into(),
+            Err(e) => format!("error {:?}", e.status()),
+        };
+        out.push(format!("var.{name}={v}"));
+    }
+    out
+}
+
 /// The report, as the bytes of the probe report. `boot`: the boot partition's handle
 /// (our `DeviceHandle`), when there is one.
 pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
@@ -206,35 +247,80 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
     let protos: Vec<String> =
         counts.iter().enumerate().map(|(i, (s, (g, n)))| format!("proto{}={} {} {}", i + 1, s, n, name(g))).collect();
 
-    // The graphics output: modes by QueryMode, the current mode from its fields.
+    // The graphics output, read raw (crate::fwgop): never through uefi-rs's GOP type,
+    // whose Mode is the word at +0x18, which on an extended GOP is code and on its
+    // console splitter NULL. Only QueryMode (capped at a checked MaxMode) and, on an
+    // extended GOP, GetFrameBuffer are called; never SetMode, Blt or the refresh.
     let mut gop = Vec::new();
     let mut extra_modes = Vec::new();
-    let gops: Vec<Handle> =
+    let ram = crate::fwgop::Ram::read();
+    let images = crate::fwgop::Images::read(&ram);
+    let gops = crate::fwgop::all(&ram, &images);
+    let handles: Vec<Handle> =
         boot::locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID)).map(|b| b.iter().copied().collect()).unwrap_or_default();
-    gop.push(format!("gops={}", gops.len()));
-    for (i, &h) in gops.iter().enumerate() {
+    gop.push(format!("gops={}", handles.len()));
+    gop.push(format!("ram_ranges={} images={}", ram.ranges(), images.list.len()));
+    let mut named: Vec<usize> = Vec::new();
+    for (i, &h) in handles.iter().enumerate() {
         let n = i + 1;
-        let params = OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None };
-        let Ok(g) = (unsafe { boot::open_protocol::<GraphicsOutput>(params, OpenProtocolAttributes::GetProtocol) }) else {
-            gop.push(format!("gop{n}=handle={} unopened", index(h).map_or("-".into(), |x| format!("{x}"))));
+        let hi = index(h).map_or("-".into(), |x| format!("{x}"));
+        let Some(g) = gops.iter().find(|g| g.handle == h) else {
+            gop.push(format!("gop{n}=handle={hi} unopened"));
             continue;
         };
-        let raw = unsafe { &*(&*g as *const GraphicsOutput as *const GraphicsOutputProtocol) };
-        let m = unsafe { &*raw.mode };
-        gop.push(format!(
-            "gop{n}=handle={} modes={} current={} fb=0x{:x} size={}",
-            index(h).map_or("-".into(), |x| format!("{x}")),
-            m.max_mode,
-            m.mode,
-            m.frame_buffer_base,
-            m.frame_buffer_size
-        ));
-        for (j, mode) in g.modes().enumerate() {
-            let info = mode.info();
-            let (w, hh) = info.resolution();
-            let line = format!("gop{n}.mode{j}={w}x{hh} {} stride={}", pixel_format(info.pixel_format()), info.stride());
-            if j as u32 <= m.mode { gop.push(line) } else { extra_modes.push(line) }
+        match g.mode() {
+            Some(m) => gop.push(format!(
+                "gop{n}=handle={hi} modes={} current={} fb=0x{:x} size={}",
+                m.max_mode, m.mode, m.fb_base, m.fb_size
+            )),
+            None => gop.push(format!("gop{n}=handle={hi} modes=- current=- fb=- size=-")),
         }
+        gop.push(format!("gop{n}.iface=0x{:x}", g.iface));
+        match g.words {
+            Some(w) => {
+                gop.push(format!("gop{n}.words={}", w.iter().map(|x| format!("0x{x:x}")).collect::<Vec<_>>().join(" ")));
+                let wh: Vec<String> = w
+                    .iter()
+                    .map(|&a| match images.of(a) {
+                        Some(img) => {
+                            if !named.contains(&img.index) {
+                                named.push(img.index);
+                            }
+                            format!("image{}", img.index)
+                        }
+                        None if a == 0 => "0".into(),
+                        None => "-".into(),
+                    })
+                    .collect();
+                gop.push(format!("gop{n}.in={}", wh.join(" ")));
+            }
+            None => gop.push(format!("gop{n}.words=not-ram")),
+        }
+        for (k, c) in g.checks.iter().enumerate() {
+            let at = crate::fwgop::MODE_AT[k];
+            gop.push(match c {
+                Ok(m) => format!("gop{n}.mode_at_0x{at:x}=ok {}x{} {} stride={}", m.width, m.height, fmt_name(m.format), m.stride),
+                Err(why) => format!("gop{n}.mode_at_0x{at:x}={why}"),
+            });
+        }
+        gop.push(format!("gop{n}.layout={}", g.layout.name()));
+        gop.push(format!("gop{n}.path={}", crate::fwgop::handle_path(&ram, h)));
+        gop.push(format!("gop{n}.guids={}", guids_of(h).iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(" ")));
+        if let Some((st, fb, w, hh)) = crate::fwgop::get_frame_buffer(g) {
+            gop.push(format!("gop{n}.framebuffer=status={st:?} fb=0x{fb:x} w={w} h={hh}"));
+        }
+        if let Some(m) = g.mode() {
+            for j in 0..m.max_mode {
+                let line = match crate::fwgop::query_mode(g, &images, &ram, j) {
+                    Some((w, hh, f, s)) => format!("gop{n}.mode{j}={w}x{hh} {} stride={s}", fmt_name(f)),
+                    None => format!("gop{n}.mode{j}=unread"),
+                };
+                if j <= m.mode { gop.push(line) } else { extra_modes.push(line) }
+            }
+        }
+    }
+    for img in images.list.iter().filter(|i| named.contains(&i.index)) {
+        gop.push(format!("image{}=base=0x{:x} size=0x{:x} path={}", img.index, img.base, img.size, img.path));
     }
 
     // The console handles of the system table.
@@ -259,9 +345,10 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
             }
         }
     }
+    tail.extend(qcom_variables());
     let log: Vec<String> = crate::log::kept().into_iter().enumerate().map(|(i, l)| format!("log{}={}", i + 1, l)).collect();
     let r = Report { head, protos, gop, extra_modes, tail, log };
     let b = r.bytes();
-    crate::log!("PROBE done: {} handles, {} protocols, {} displays", all.len(), counts.len(), gops.len());
+    crate::log!("PROBE done: {} handles, {} protocols, {} graphics outputs", all.len(), counts.len(), handles.len());
     b
 }

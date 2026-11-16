@@ -10,6 +10,7 @@ extern crate alloc;
 mod arch;
 mod display;
 mod fs;
+mod fwgop;
 mod handback;
 mod kernel;
 mod log;
