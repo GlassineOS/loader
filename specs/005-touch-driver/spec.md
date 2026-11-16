@@ -105,7 +105,7 @@ controller is powered down before the answer.
   level set, configured as an output, its level set again); reset low, at least 1 ms,
   high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); read the
   input register until it is empty (length 0 or 2); the bootloader's launch-app command
-  (its failure logged, not fatal); the HID descriptor (register 0x0001; 30 bytes,
+  (its failure logged, not fatal); the HID descriptor (register 0x0001; 32 bytes,
   version 0x0100, `touch.hid`, `touch.desc`); `GET_SYSINFO` (asked up to 5 times while
   the answer is an error, empty or shorter than 49 bytes, `touch.sysinfo`,
   `touch.res`); close the bus.

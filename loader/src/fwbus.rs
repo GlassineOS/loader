@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! The firmware's I2C and GPIO protocols (`docs/firmware-i2c-gpio.md`; spec 005): found,
+//! read as raw words and checked before any of their functions is called (FR-001). The
+//! only function called is the GPIO pin read, which configures nothing. Every call is
+//! logged (`TOUCH_GPIO`).
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use uefi::boot::{self, SearchType};
+use uefi::{Guid, Handle, Status, guid};
+
+use crate::fwgop::{Images, Ram, interface_of, rd64};
+use crate::log;
+
+pub const I2C_GUID: Guid = guid!("b27ae8b1-3e10-4d07-ab5c-eb9a6dc6fa8f");
+pub const GPIO_GUID: Guid = guid!("ad9aec18-7bf0-4809-9e96-3012309f3df7");
+
+/// What the loader knows of each protocol: its interface's length in words and the
+/// revision in its first word.
+#[derive(Clone, Copy)]
+pub struct Kind {
+    pub key: &'static str,
+    pub guid: Guid,
+    pub words: usize,
+    pub revision: u64,
+}
+
+pub const I2C: Kind = Kind { key: "i2c", guid: I2C_GUID, words: 6, revision: 0x10000 };
+pub const GPIO: Kind = Kind { key: "gpio", guid: GPIO_GUID, words: 8, revision: 1 };
+
+/// One protocol as found.
+pub struct Found {
+    pub handle: Handle,
+    pub iface: Option<u64>,
+    pub words: Option<Vec<u64>>,
+    /// `Ok` when it may be called (FR-001), else the first check that failed.
+    pub check: Result<(), String>,
+}
+
+/// The first handle with the protocol, its interface read and checked. `None`: no handle
+/// has it.
+pub fn find(k: Kind, ram: &Ram, images: &Images) -> Option<Found> {
+    let hs = boot::locate_handle_buffer(SearchType::ByProtocol(&k.guid)).ok()?;
+    let handle = *hs.first()?;
+    let Some(iface) = interface_of(handle, &k.guid) else {
+        return Some(Found { handle, iface: None, words: None, check: Err("unopened".into()) });
+    };
+    if !ram.holds(iface, 8 * k.words as u64) {
+        return Some(Found { handle, iface: Some(iface), words: None, check: Err("not-ram".into()) });
+    }
+    let w: Vec<u64> = (0..k.words).map(|i| unsafe { rd64(iface + 8 * i as u64) }).collect();
+    let check = if w[0] != k.revision {
+        Err(format!("revision=0x{:x}", w[0]))
+    } else {
+        let img = images.of(w[1]).map(|i| i.index);
+        if img.is_some() && w[1..].iter().all(|&a| images.of(a).map(|i| i.index) == img) { Ok(()) } else { Err("outside".into()) }
+    };
+    Some(Found { handle, iface: Some(iface), words: Some(w), check })
+}
+
+/// The probe report's lines for one protocol (boot `docs/handback.md`, "The probe
+/// report"): read from memory only.
+pub fn report_lines(k: Kind, f: Option<&Found>, index: &dyn Fn(Handle) -> Option<usize>, images: &Images) -> Vec<String> {
+    let key = k.key;
+    let Some(f) = f else { return alloc::vec![format!("{key}=none")] };
+    let hi = index(f.handle).map_or("-".into(), |x| format!("{x}"));
+    let mut out = Vec::new();
+    match f.iface {
+        None => out.push(format!("{key}=handle={hi} unopened")),
+        Some(i) => out.push(format!("{key}=handle={hi} iface=0x{i:x}")),
+    }
+    match &f.words {
+        Some(w) => {
+            out.push(format!("{key}.words={}", w.iter().map(|x| format!("0x{x:x}")).collect::<Vec<_>>().join(" ")));
+            let wh: Vec<String> = w[1..]
+                .iter()
+                .map(|&a| match images.of(a) {
+                    Some(img) => format!("image{}", img.index),
+                    None if a == 0 => "0".into(),
+                    None => "-".into(),
+                })
+                .collect();
+            out.push(format!("{key}.in={}", wh.join(" ")));
+        }
+        None if f.iface.is_some() => out.push(format!("{key}.words=not-ram")),
+        None => {}
+    }
+    out.push(format!("{key}.check={}", match &f.check {
+        Ok(()) => "ok".into(),
+        Err(e) => e.clone(),
+    }));
+    out
+}
+
+// ---- the GPIO protocol ------------------------------------------------------------------
+
+/// The touch controller's pins (spec 005); no other pin is ever configured, read or set.
+pub const TOUCH_PINS: [u32; 4] = [61, 62, 66, 67];
+
+/// The pin word: plain GPIO, no pull, the lowest drive; bit 29 marks the layout.
+pub fn pin_cfg(n: u32, output: bool) -> u32 {
+    0x2000_0000 | ((n & 0x3ff) << 4) | ((output as u32) << 14)
+}
+
+/// A GPIO protocol that passed its checks.
+pub struct Gpio {
+    iface: u64,
+}
+
+impl Gpio {
+    pub fn new(f: &Found) -> Option<Gpio> {
+        f.check.is_ok().then_some(())?;
+        Some(Gpio { iface: f.iface? })
+    }
+
+    fn word(&self, i: u64) -> u64 {
+        unsafe { rd64(self.iface + 8 * i) }
+    }
+
+    fn allowed(n: u32) -> bool {
+        TOUCH_PINS.contains(&n)
+    }
+
+    /// The pin's level (read only).
+    pub fn read(&self, n: u32) -> Result<u32, Status> {
+        if !Self::allowed(n) {
+            return Err(Status::ACCESS_DENIED);
+        }
+        type Read = unsafe extern "efiapi" fn(u32, *mut u32) -> Status;
+        let f: Read = unsafe { core::mem::transmute(self.word(3) as usize) };
+        let mut level = 0u32;
+        let st = unsafe { f(pin_cfg(n, false), &mut level) };
+        log!("TOUCH_GPIO read {} -> {:?} level={}", n, st, level);
+        if st == Status::SUCCESS { Ok(level) } else { Err(st) }
+    }
+}

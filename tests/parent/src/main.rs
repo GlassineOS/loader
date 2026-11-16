@@ -16,12 +16,15 @@
 //! `parent.fakefw=hang` the same with a refresh that never returns, and
 //! `parent.fakefw=device[-<var>]` the same in the shape a Note Air reports (a Mode smaller
 //! than the panel, and the variable `DisplaySplashBufferInfo`; see [`fakefw::Var`]).
+//! `parent.faketouch=<mode>` installs the stand-in I2C and GPIO protocols and touch
+//! controller of [`faketouch`].
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
 mod fakefw;
+mod faketouch;
 
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::format;
@@ -252,8 +255,17 @@ fn main() -> Status {
         fakefw::set_taps(cfg.split(' ').find_map(|w| w.strip_prefix("parent.taps=")).unwrap_or(""));
         fakefw::set_fbdump(cfg.split(' ').any(|w| w == "parent.fbdump=1"));
     }
+    let touch = cfg.split(' ').find_map(|w| w.strip_prefix("parent.faketouch="));
+    if let Some(w) = touch {
+        say(&faketouch::install(faketouch::Mode::parse(w).expect("parent.faketouch")));
+    }
     hook_watchdog();
     let r = hand_back();
+    if touch.is_some() {
+        for l in faketouch::report() {
+            say(&l);
+        }
+    }
     if fake {
         for l in fakefw::report() {
             say(&l);

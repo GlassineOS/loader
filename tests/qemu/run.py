@@ -1358,6 +1358,47 @@ def handback_probe_reports_the_firmware():
     assert "PROBE_WRITTEN ok=1" in log
 
 
+def faketouch_calls(log):
+    m = re.findall(r"PARENT_FAKETOUCH calls ([^\r\n]*)", log)
+    assert m, "the stand-in touch protocols reported no calls"
+    return dict(kv.split("=") for kv in m[-1].split())
+
+
+def faketouch_seq(log):
+    m = re.findall(r"PARENT_FAKETOUCH seq ?([^\r\n]*)", log)
+    assert m, "the stand-in touch protocols reported no sequence"
+    return m[-1].split()
+
+
+@case("x86_64", "aarch64")
+def handback_probe_reads_the_i2c_and_gpio_protocols():
+    """005 Scenario 1, FR-001 to FR-003: without the firmware's I2C and GPIO protocols the
+    report says none; with the stand-in, their words, check=ok and the four touch pins'
+    levels, from the pin read alone: no bus opened, no pin configured or set."""
+    d = hb_disk("hb-probe-noi2c", hb_record(probe="1"))
+    log, boot, floor, _ = parent_run("hb-probe-noi2c", d)
+    keys = dict(d.probe())
+    assert (keys["i2c"], keys["gpio"]) == ("none", "none"), keys
+    d = hb_disk("hb-probe-i2c", hb_record(probe="1"), cfg="parent.faketouch=1")
+    log, boot, floor, _ = parent_run("hb-probe-i2c", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    keys = dict(d.probe())
+    with open(os.path.join(OUT, "hb-probe-i2c", "probe.txt"), "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in d.probe()))
+    for k, n in (("i2c", 6), ("gpio", 8)):
+        assert keys[k].startswith("handle=") and "iface=0x" in keys[k], keys[k]
+        assert len(keys[f"{k}.words"].split()) == n, keys[f"{k}.words"]
+        assert keys[f"{k}.check"] == "ok", (k, keys[f"{k}.check"])
+        ins = keys[f"{k}.in"].split()
+        assert len(ins) == n - 1 and len(set(ins)) == 1 and ins[0].startswith("image"), ins
+    assert keys["i2c.words"].split()[0] == "0x10000" and keys["gpio.words"].split()[0] == "0x1"
+    assert [keys[f"gpio.pin{n}"] for n in (61, 62, 66, 67)] == ["0", "0", "0", "1"], keys
+    c = faketouch_calls(log)
+    assert c["pin_read"] == "4", c
+    assert all(c[k] == "0" for k in ("configure", "group", "set", "other", "open", "read", "write")), c
+    assert faketouch_seq(log) == ["rd61=0", "rd62=0", "rd66=0", "rd67=1"], faketouch_seq(log)
+
+
 GOP_GUID = "9042a9de-23dc-4a38-96fb-7aded080516a"
 POINTER_PATH = "5c8a3f1e-7b2d-4e9a-8c6f-1d3e5a7b9c0f"  # tests/parent/src/fakefw.rs
 
