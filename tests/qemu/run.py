@@ -1399,6 +1399,107 @@ def handback_probe_reads_the_i2c_and_gpio_protocols():
     assert faketouch_seq(log) == ["rd61=0", "rd62=0", "rd66=0", "rd67=1"], faketouch_seq(log)
 
 
+def pin_ops(seq):
+    """The stand-in's output changes per pin, in order: (pin, level)."""
+    out = []
+    for op in seq:
+        m = re.fullmatch(r"set(\d+)=(\d)", op)
+        if m and (not out or out[-1] != (int(m[1]), int(m[2]))):
+            out.append((int(m[1]), int(m[2])))
+    return out
+
+
+def touch_run(name, mode, record=None, want="ok"):
+    d = hb_disk(name, record or hb_record(touch="probe"), cfg=f"parent.faketouch={mode}")
+    log, boot, floor, _ = parent_run(name, d)
+    assert (boot, floor) == ("baseline", None), (name, boot, floor)
+    keys = dict(d.probe() or [])
+    r = d.record()[1]
+    assert r.get("touch", "") == "" and r["unmarked"] == "1", (name, r)
+    assert log.index("WRITE slot=") < log.index("TOUCH_GPIO"), f"{name}: drove a pin before the clearing write"
+    assert keys.get("touch.result", "").startswith(want), (name, keys.get("touch.result"), log[-1500:])
+    ms = int(re.search(r" in (\d+) ms", keys["touch.result"])[1])
+    assert ms <= 3200, f"{name}: the bring-up took {ms} ms"
+    c = faketouch_calls(log)
+    assert c["open_now"] == "0", f"{name}: the bus left open: {c}"
+    return d, log, keys, c, faketouch_seq(log)
+
+
+@case("x86_64", "aarch64")
+def touch_probe_brings_up_reports_and_powers_down():
+    """005 Scenario 2, FR-004 to FR-010: touch=probe without probe=1: the key cleared in
+    its own write first; the pins read, the power-up order, reset, the bus opened, the
+    descriptor and system information in the report, the power-down; counted and
+    answered as without the key."""
+    d, log, keys, c, seq = touch_run("touch-probe", "1")
+    assert seq[:4] == ["rd61=0", "rd62=0", "rd66=0", "rd67=1"], seq
+    assert pin_ops(seq) == [(61, 1), (62, 1), (66, 0), (66, 1), (66, 0), (62, 0), (61, 0)], pin_ops(seq)
+    assert "cfg67i" in seq and seq.index("cfg67i") < seq.index("open3") < seq.index("close"), seq
+    assert c["powered"] == "0" and c["group"] == "0" and c["other"] == "0", c
+    assert "wr0001:" in seq and "wr0004:05002f0002" in seq, seq
+    assert keys["touch.found"] == "61=0 62=0 66=0 67=1", keys
+    assert keys["touch.power"] == "on: 61, 62" and keys["touch.down"] == "off: 66, 62, 61", keys
+    assert keys["touch.open"] == "instance=3 address=0x24 khz=100", keys
+    assert keys["touch.hid"].startswith("vendor=0x04b4 product=0xc101"), keys
+    assert keys["touch.res"] == "1872x1404 max_tch=10 ask=1", keys
+    assert keys["gpio.check"] == "ok" and "gops" in keys, "a full probe report"
+    # The next start: touch empty, nothing touched.
+    log, boot, floor, _ = parent_run("touch-probe-2", d)
+    c = faketouch_calls(log)
+    assert c["set"] == c["configure"] == c["open"] == c["pin_read"] == "0", c
+    assert d.record()[1]["unmarked"] == "2"
+
+
+@case("x86_64", "aarch64")
+def touch_probe_found_powered_is_left_powered():
+    """005 FR-005, FR-008: 61 and 62 read high: the power pins left alone, reset high."""
+    d, log, keys, c, seq = touch_run("touch-powered", "powered")
+    assert pin_ops(seq) == [(66, 0), (66, 1)], pin_ops(seq)
+    assert c["powered"] == "1" and keys["touch.power"] == "found on: left as found", (c, keys)
+    assert keys["touch.down"] == "left powered", keys
+
+
+@case("x86_64", "aarch64")
+def touch_probe_fails_at_each_step_and_powers_down():
+    """005 Scenario 3, FR-007, FR-008: a failure at each step ends the bring-up there,
+    logged, the controller powered down, inside the deadline; the start goes on."""
+    for mode, why in (("fail-open", "failed open"), ("fail-write", "failed hid: write"),
+                      ("nodesc", "failed hid: no answer"), ("baddesc", "failed hid: not the descriptor"),
+                      ("nosysinfo", "failed sysinfo"), ("fail-gpio", "failed power")):
+        d, log, keys, c, seq = touch_run(f"touch-{mode}", mode, want=why)
+        assert c["powered"] == "0", (mode, c)
+        if mode != "fail-gpio":
+            assert pin_ops(seq)[-3:] == [(66, 0), (62, 0), (61, 0)], (mode, pin_ops(seq))
+    d, log, keys, c, seq = touch_run("touch-sysinfo-retry", "sysinfo-retry")
+    assert keys["touch.res"].endswith("ask=3"), keys
+
+
+@case("x86_64", "aarch64")
+def touch_probe_a_hang_is_not_repeated():
+    """005 Scenario 3, FR-004: an I2C read that never returns: the machine is reset; the
+    next start finds touch cleared, makes no GPIO or I2C call and answers. A record
+    write that fails: the controller isn't touched."""
+    d = hb_disk("touch-hang", hb_record(touch="probe"), cfg="parent.faketouch=hang-read")
+    vm = VM("touch-hang", d)
+    vm.finish(timeout=150)
+    log = vm.log()
+    assert "PARENT_FAKETOUCH_HANG" in log and "PARENT_POWEROFF" not in log, log[-800:]
+    assert d.record()[1].get("touch", "") == "", d.record()
+    log, boot, floor, _ = parent_run("touch-hang-2", d)
+    assert boot == "baseline", boot
+    c = faketouch_calls(log)
+    assert c["set"] == c["configure"] == c["open"] == c["read"] == "0", c
+    assert "TOUCH_GPIO" not in log and "TOUCH_I2C" not in log
+    d = hb_disk("touch-ro", hb_record(touch="probe"), cfg="parent.faketouch=1")
+    vm = VM("touch-ro", d, readonly=True)
+    vm.wait("PARENT_POWEROFF")
+    vm.finish()
+    log = vm.log()
+    assert "TOUCH_SKIPPED not-written" in log and "TOUCH_GPIO set" not in log and "TOUCH_GPIO configure" not in log, log[-800:]
+    c = faketouch_calls(log)
+    assert c["set"] == c["configure"] == c["open"] == "0", c
+
+
 GOP_GUID = "9042a9de-23dc-4a38-96fb-7aded080516a"
 POINTER_PATH = "5c8a3f1e-7b2d-4e9a-8c6f-1d3e5a7b9c0f"  # tests/parent/src/fakefw.rs
 
