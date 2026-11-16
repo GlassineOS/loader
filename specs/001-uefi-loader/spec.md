@@ -91,8 +91,7 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
   reads no `.new` file and removes nothing under `\glassine\sets\` or
   `\glassine\recovery\`. (010 FR-004, boot-partition "Layout")
 - **FR-002** Its only writes are: a slot of the loader record, and the removal of
-  `\glassine\splash\override.gspl`. It writes no firmware variable at a start; the one
-  exception is the person picking the firmware's set-up in the list (FR-033).
+  `\glassine\splash\override.gspl`. It writes no firmware variable. (010 FR-031)
   (010 FR-031, 011 FR-012)
 
 ### The loader record
@@ -213,8 +212,8 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
   leave-screen override) the line is not shown; the key works all the same. (010 FR-017,
   FR-039, FR-048, 011 FR-016a)
 - **FR-029** The key opens a list over the picture: GlassineOS, the previous deployment,
-  "More" for the other deployments, the previous kernel, the recovery and the firmware's
-  set-up. An entry with nothing behind it is not shown. The list works by arrow keys and
+  "More" for the other deployments, the previous kernel and the recovery (not the
+  firmware's set-up: FR-033). An entry with nothing behind it is not shown. The list works by arrow keys and
   Enter, and Escape goes back. When the list closes, the picture under it is restored.
   (010 FR-039, FR-040, 011 FR-016a)
 - **FR-030** The deployments come from `deploys` and `deploy1` … `deploy<n>` of the
@@ -229,8 +228,10 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
 - **FR-032** Picking the previous kernel starts the previous set (`started_why=choice`,
   counted); picking the recovery starts the recovery (not counted). A pending request is
   left as it is, unless the person picked the recovery and the request is `recovery`.
-- **FR-033** Picking the firmware's set-up asks the firmware to open its set-up at the
-  next start and restarts the PC; it is offered only when the firmware says it can.
+- **FR-033** The list does not offer the firmware's set-up that 010 FR-039 names:
+  opening it from the loader means writing a firmware variable at a start, which 010
+  FR-031 rules out. [NEEDS CLARIFICATION: whether a person's explicit pick of the
+  firmware's set-up may write the one firmware variable that asks for it.]
 - **FR-034** No keyboard, or no display, never stops a start: without a display, a key
   pressed in the wait is logged and the loader starts what it would have started
   without it.
@@ -264,7 +265,7 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
 
 - **Writes:** one slot of the loader record per start, and the override's removal, both
   on the boot partition GlassineOS owns. Nothing on any other partition; no firmware
-  variable except at the person's explicit pick of the firmware's set-up.
+  variable.
 - **Failure mode:** a loader that can't start a set returns to the firmware, which goes
   on to its next entry (another system, or its own menu). A broken loader binary leaves
   the firmware's boot menu and the install medium.
@@ -283,7 +284,8 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
   request; a recovery request; a damaged slot b; a kernel whose sha256 doesn't match;
   the override drawn once then gone, from captured frames; the key line, the list and a
   one-shot pick reaching the kernel's command line; Secure Boot enforcing.
-- **QEMU with AAVMF (arm64):** the default start reaches the test kernel.
+- **QEMU with AAVMF (arm64):** the default start reaches the test kernel, and the key
+  line, the list and a one-shot pick work.
 - **Product level:** none here; 010 SC-001 to SC-017 belong to the images repository.
 
 ## Out of scope
@@ -300,6 +302,6 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
 - **SC-002** A cut at every byte of a slot write is read back as the old or the new record
   (host test).
 - **SC-003** No path of the loader waits without an end: each failure ends in a start, a
-  message and a return to the firmware, or the firmware's set-up.
+  message and a return to the firmware.
 - **SC-004** The frame drawn by the loader is unchanged from the end of its wait to the
   kernel's start, apart from the list or a failure message when they are shown.
