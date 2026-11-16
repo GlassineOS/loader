@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The loader under a parent bootloader (GlassineOS/boot spec 012, `docs/handback.md`):
-//! headless, its record raw on the partition of `DeviceHandle`, its answer in the UEFI
-//! exit data. Everything is opened with `GetProtocol`, never exclusively, so no driver
+//! headless, its record on the boot partition of `DeviceHandle` (FAT or raw), its
+//! answer in the UEFI exit data. Everything is opened with `GetProtocol`, never exclusively, so no driver
 //! of the firmware is disconnected for the parent's later use.
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::string::String;
 use alloc::vec::Vec;
 use glassine_loader_core::answer::{Answer, Boot};
-use glassine_loader_core::plan::{self, Log, ReadErr, RecordStore};
-use glassine_loader_core::raw::{self, Blocks, Raw};
+use glassine_loader_core::plan::{self, Log, Platform, ReadErr, RecordStore};
+use glassine_loader_core::raw::{Blocks, Raw};
 use uefi::boot::{self, MemoryType, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::block::BlockIO;
+use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{Handle, Status};
 
 use crate::log;
@@ -95,6 +96,9 @@ impl Blocks for FwBlocks {
         }
         r.is_ok()
     }
+    fn now_ms(&mut self) -> u64 {
+        crate::arch::now_ms()
+    }
     fn flush(&mut self) -> bool {
         match self.io.flush_blocks() {
             Ok(()) => true,
@@ -125,9 +129,22 @@ impl Log for Disk {
     }
 }
 
-/// Opens the record partition: the block I/O of our `DeviceHandle`.
-fn open() -> Result<Disk, &'static str> {
+/// The boot partition in the form the loader found it in (boot `docs/boot-partition.md`,
+/// "Two forms"): FAT when the firmware offers a file system on it, raw otherwise.
+enum Store {
+    Fat(crate::fs::Volume),
+    Raw(Disk),
+}
+
+/// Opens the boot partition: the partition of our `DeviceHandle`.
+fn open() -> Result<(Store, Handle), &'static str> {
     let dev = get::<LoadedImage>(boot::image_handle()).ok().and_then(|li| li.device()).ok_or("no DeviceHandle")?;
+    if let Ok(mut fs) = get::<SimpleFileSystem>(dev) {
+        if let Ok(root) = fs.open_volume() {
+            log!("HANDBACK form=fat");
+            return Ok((Store::Fat(crate::fs::Volume { root }), dev));
+        }
+    }
     let io = get::<BlockIO>(dev).map_err(|_| "no block I/O on DeviceHandle")?;
     if !io.media().is_media_present() {
         return Err("no medium");
@@ -136,11 +153,19 @@ fn open() -> Result<Disk, &'static str> {
         crate::log!("the partition can't be used: {:?}", e);
         "unusable partition"
     })?;
-    Ok(Disk { raw })
+    match &raw.regions {
+        Some((copy, regs)) => log!("HANDBACK form=raw table={:?} regions={}", copy, regs.len()),
+        None => log!("HANDBACK form=raw no table: the partition holds nothing"),
+    }
+    Ok((Store::Raw(Disk { raw }), dev))
 }
 
+/// The probe report's place in the FAT form (`docs/handback.md`, "The probe report").
+const PROBE_FILE: &str = "\\glassine\\probe.txt";
+
 /// Decides, writes what the decision writes, and returns to the parent. Never
-/// returns.
+/// returns. The splash store is left as it is: a headless start draws nothing, so it
+/// uses up no override (boot spec 012 FR-015a).
 pub fn run(opts: Opts) -> ! {
     log!("HANDBACK start serial={} pick_recovery={}", opts.serial as u8, opts.pick_recovery as u8);
     let answer = match open() {
@@ -148,15 +173,23 @@ pub fn run(opts: Opts) -> ! {
             log!("HANDBACK {}: the baseline", why);
             Answer::new(Boot::Baseline, "no-record")
         }
-        Ok(mut d) => {
+        Ok((Store::Raw(mut d), dev)) => {
             let rec = plan::read_record(&mut d);
             if rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1") {
-                let report = crate::probe::report();
+                let report = crate::probe::report(Some(dev));
                 let ok = d.raw.write_probe(&report);
-                log!("PROBE_WRITTEN ok={} bytes={}", ok as u8, raw::PROBE_BYTES);
+                log!("PROBE_WRITTEN ok={} bytes={} form=raw", ok as u8, report.len());
             }
             plan::handback(&mut d, rec, opts.pick_recovery)
-            // `d` and its block I/O are closed here, before the exit.
+        }
+        Ok((Store::Fat(mut v), dev)) => {
+            let rec = plan::read_record(&mut v);
+            if rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1") {
+                let report = crate::probe::report(Some(dev));
+                let ok = Platform::write_file(&mut v, PROBE_FILE, &report);
+                log!("PROBE_WRITTEN ok={} bytes={} form=fat", ok as u8, report.len());
+            }
+            plan::handback(&mut v, rec, opts.pick_recovery)
         }
     };
     let data = answer.exit_data();

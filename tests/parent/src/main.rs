@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! A stand-in parent bootloader for the QEMU tests (GlassineOS/boot `docs/handback.md`,
 //! "Starting the loader"). It does what the Note Air's ABL does: finds the hand-back
-//! partition, checks the loader image header and the image, starts the image from memory
+//! boot partition, reads the loader (the file in the FAT form; the region `loader`
+//! through the region table, header and image checked, in the raw form), starts it from memory
 //! with no device path, `DeviceHandle` set to the partition and the hand-back load
 //! option, under a 30 s watchdog, and reads the answer from the exit data. It prints, on
 //! the firmware's serial line, what it would boot (`PARENT_BOOT baseline|recovery|set:<id>`)
@@ -30,6 +31,7 @@ use uefi::proto::device_path::media::PartitionSignature;
 use uefi::proto::device_path::{DevicePath, DevicePathNodeEnum};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::block::BlockIO;
+use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 use uefi::runtime::{self, ResetType};
 use uefi::{CString16, Guid, Handle, Identify, Status, entry, guid};
@@ -100,18 +102,55 @@ fn extra_options() -> String {
     String::from_utf8_lossy(&b[..n]).trim().into()
 }
 
-/// The parent's path, as the ABL patch does it. `Err`: why it boots its baseline.
-fn hand_back() -> Result<Boot, String> {
-    let part = partition().ok_or("no hand-back partition")?;
+/// The loader's bytes from the boot partition: in the FAT form the file
+/// `\EFI\glassine\loader.efi`, in the raw form the region `loader` through the region
+/// table (the primary, else the backup), as the ABL does it.
+fn loader_bytes(part: Handle) -> Result<Vec<u8>, String> {
+    if let Ok(mut fs) = get::<SimpleFileSystem>(part) {
+        say("PARENT_FORM fat");
+        let mut root = fs.open_volume().map_err(|_| "no volume")?;
+        let h = root
+            .open(&CString16::try_from("\\EFI\\glassine\\loader.efi").unwrap(), FileMode::Read, FileAttribute::empty())
+            .map_err(|_| "no loader.efi")?;
+        let mut f = h.into_regular_file().ok_or("loader.efi is no file")?;
+        let size = f.get_boxed_info::<FileInfo>().map_err(|_| "no file info")?.file_size();
+        if size == 0 || size > raw::LOADER_MAX {
+            return Err(format!("loader.efi size {size}"));
+        }
+        let mut b = alloc::vec![0u8; size as usize];
+        let n = f.read(&mut b).map_err(|_| "loader.efi read")?;
+        if n as u64 != size {
+            return Err("loader.efi short read".into());
+        }
+        return Ok(b);
+    }
+    say("PARENT_FORM raw");
     let mut io = get::<BlockIO>(part).map_err(|_| "no block I/O")?;
     let size = (io.media().last_block() + 1) * io.media().block_size() as u64;
-    let h = read(&mut io, raw::LOADER_HEADER_OFFSET, 4096).ok_or("header read")?;
-    let (len, want) = raw::check_header(&h, size).map_err(|e| format!("header {e:?}"))?;
-    let img = read(&mut io, raw::LOADER_IMAGE_OFFSET, len as usize).ok_or("image read")?;
+    let mut regions = None;
+    for off in [0, size.saturating_sub(raw::TABLE_BYTES as u64)] {
+        let t = read(&mut io, off, raw::TABLE_BYTES).ok_or("table read")?;
+        if let Ok(r) = raw::parse_table(&t, size) {
+            say(&format!("PARENT_TABLE at={off}"));
+            regions = Some(r);
+            break;
+        }
+    }
+    let regions = regions.ok_or("no region table")?;
+    let r = regions.iter().find(|r| r.name == raw::LOADER && r.flags == 0).ok_or("no loader region")?;
+    let h = read(&mut io, r.off, raw::LOADER_HEADER).ok_or("header read")?;
+    let (len, want) = raw::check_header(&h, r.size).map_err(|e| format!("header {e:?}"))?;
+    let img = read(&mut io, r.off + raw::LOADER_HEADER as u64, len as usize).ok_or("image read")?;
     if crc32(&img) != want {
         return Err("image crc".into());
     }
-    drop(io);
+    Ok(img)
+}
+
+/// The parent's path, as the ABL patch does it. `Err`: why it boots its baseline.
+fn hand_back() -> Result<Boot, String> {
+    let part = partition().ok_or("no boot partition")?;
+    let img = loader_bytes(part)?;
     let bt = unsafe { uefi::table::system_table_raw().unwrap().as_ref().boot_services.as_ref().unwrap() };
 
     // LoadImage from memory, no device path.
