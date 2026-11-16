@@ -958,6 +958,200 @@ def linux_kernel_gets_its_command_line():
     assert "/etc/glassine-boot/board.conf: " + BOARD.decode().strip() in vm.log(), "board archive not in the initramfs"
 
 
+# ---------------------------------------------------------------- under a parent (boot spec 012)
+#
+# The disk: an ESP with the stand-in parent (tests/parent) as the removable-media path,
+# and the hand-back partition, raw (boot docs/handback.md). The parent starts the loader
+# from that partition as the Note Air's ABL does; its serial lines say what it would boot.
+
+HB_PARTUUID = "8a1f3c5e-2b4d-4e6f-9a0b-1c2d3e4f5a6b"
+ESP_OFF, ESP_SIZE = 1 << 20, 32 << 20
+HB_OFF, HB_SIZE = ESP_OFF + ESP_SIZE, 8 << 20
+HB_HEADER, HB_IMAGE, HB_PROBE = 1 << 20, (1 << 20) + 4096, 32768
+SET_A, SET_B = "0123456789abcdef", "fedcba9876543210"
+
+
+def crc32(b):
+    import zlib
+    return zlib.crc32(b) & 0xFFFFFFFF
+
+
+def loader_header(img):
+    import struct
+    h = b"GLLOADER" + struct.pack("<IIQI", 1, 0, len(img), crc32(img))
+    h += struct.pack("<I", crc32(h))
+    return h + b"\0" * (4096 - len(h))
+
+
+def hb_record(**keys):
+    base = [("format", "1"), ("seq", "1")] + [(k, "") for k in (
+        "default", "default_rec", "previous", "previous_rec", "trial", "trial_rec", "recovery", "recovery_rec",
+        "request")] + [("unmarked", "0"), ("started", ""), ("started_why", ""), ("deploys", "0")]
+    return set_record(base, keys)
+
+
+class HandbackDisk:
+    def __init__(self, path, loader=None, header=None, slots=None, cfg=""):
+        self.path = path
+        if os.path.exists(path):
+            os.remove(path)
+        with open(path, "wb") as f:
+            f.truncate(HB_OFF + HB_SIZE + (1 << 20))
+        run("sgdisk", "-o", "-n", f"1:{ESP_OFF // SECTOR}:+{ESP_SIZE // SECTOR}", "-t", "1:ef00", "-c", "1:esp",
+            "-n", f"2:{HB_OFF // SECTOR}:+{HB_SIZE // SECTOR}", "-t", "2:8300", "-c", "2:glassine-handback",
+            "-u", f"2:{HB_PARTUUID}", path)
+        esp = f"{path}@@{ESP_OFF}"
+        run("mformat", "-i", esp, "-T", str(ESP_SIZE // SECTOR), "::")  # FAT16: 32 MiB is too few clusters for FAT32
+        run("mmd", "-i", esp, "::/EFI", "::/EFI/BOOT")
+        boot = "BOOTAA64.EFI" if A["target"].startswith("aarch64") else "BOOTX64.EFI"
+        run("mcopy", "-i", esp, efi("glassine-test-parent"), f"::/EFI/BOOT/{boot}")
+        if cfg:
+            tmp = path + ".cfg"
+            with open(tmp, "w") as f:
+                f.write(cfg + "\n")
+            run("mcopy", "-i", esp, tmp, "::/parent.cfg")
+            os.remove(tmp)
+        img = open(efi("glassine-loader"), "rb").read() if loader is None else loader
+        if img is not False:
+            self.put(HB_IMAGE, img)
+            self.put(HB_HEADER, loader_header(img) if header is None else header)
+        for i, s in enumerate(slots or []):
+            self.put(i * 16384, s)
+
+    def put(self, off, data):
+        with open(self.path, "r+b") as f:
+            f.seek(HB_OFF + off)
+            f.write(data)
+
+    def at(self, off, n):
+        with open(self.path, "rb") as f:
+            f.seek(HB_OFF + off)
+            return f.read(n)
+
+    def record(self):
+        a, b = read_slot(self.at(0, 16384)), read_slot(self.at(16384, 16384))
+        if a and b:
+            return (b[0], dict(b[1]), True) if b[0] > a[0] else (a[0], dict(a[1]), True)
+        s = a or b
+        return (s[0], dict(s[1]), False) if s else None
+
+    def probe(self):
+        b = self.at(HB_PROBE, 65536)
+        return parse_record(b.rstrip(b"\n") + b"\n") if b.strip(b"\0") else None
+
+
+def hb_disk(name, record=None, **kw):
+    slots = [slot_bytes(record)] * 2 if record is not None else None
+    return HandbackDisk(disk_path(name), slots=slots, **kw)
+
+
+def parent_run(name, d):
+    vm = VM(name, d)
+    vm.wait("PARENT_POWEROFF")
+    vm.finish()
+    log = vm.log()
+    boot = re.findall(r"PARENT_BOOT ([^\r\n]*)", log)[-1]
+    floor = re.findall(r"PARENT_FLOOR ([^\r\n]*)", log)
+    ans = re.findall(r"PARENT_ANSWER ([^\r\n]*)", log)
+    return log, boot, (floor[-1] if floor else None), (ans[-1] if ans else None)
+
+
+@case("x86_64", "aarch64")
+def handback_ordinary_start_counts_and_answers_the_baseline():
+    """012 Scenario 1, FR-008 to FR-011: started from memory by a parent, headless; the
+    start is counted in the raw record; no probe without probe=1."""
+    d = hb_disk("hb-ordinary", hb_record())
+    log, boot, floor, _ = parent_run("hb-ordinary", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    assert "HANDBACK_ANSWER format=1 boot=baseline why=default" in log, "no answer logged"
+    assert "DISPLAY" not in log and "HINT_SHOWN" not in log, "a headless loader opened a display"
+    seq, r, both = d.record()
+    assert (seq, r["unmarked"], r["started_why"], both) == (2, "1", "default", True), (seq, r)
+    assert d.at(HB_PROBE, 65536) == b"\0" * 65536, "probe area written without probe=1"
+
+
+@case("x86_64", "aarch64")
+def handback_requests_and_the_limit():
+    """012 Scenarios 2 to 4: a recovery request once, a trial by id, the limit."""
+    d = hb_disk("hb-recovery", hb_record(request="recovery"))
+    _, boot, floor, _ = parent_run("hb-recovery", d)
+    assert (boot, floor) == ("recovery", None), (boot, floor)
+    seq, r, _ = d.record()
+    assert (seq, r["request"], r["unmarked"]) == (2, "", "0"), (seq, r)
+    _, boot, _, _ = parent_run("hb-recovery-2", d)
+    assert boot == "baseline", "the request was taken twice"
+
+    d = hb_disk("hb-trial", hb_record(request="trial", trial=SET_B, trial_rec="ab" * 32))
+    _, boot, floor, ans = parent_run("hb-trial", d)
+    assert ans == f"set:{SET_B} rec={'ab' * 32}" and floor is None, (ans, floor)
+    seq, r, _ = d.record()
+    assert (r["request"], r["started"], r["started_why"], r["unmarked"]) == ("", SET_B, "request", "0"), r
+
+    d = hb_disk("hb-limit", hb_record(unmarked="3"))
+    _, boot, _, _ = parent_run("hb-limit", d)
+    assert boot == "recovery", boot
+    assert d.record()[0] == 1, "a start of the recovery is counted"
+
+
+@case("x86_64", "aarch64")
+def handback_floor_cases():
+    """012 Scenario 5, FR-003: every way the loader can't help ends in the baseline."""
+    rec = hb_record(request="recovery")
+    img = open(efi("glassine-loader"), "rb").read()
+    stub_img = open(efi("glassine-test-kernel"), "rb").read()
+    cases = [
+        ("hb-missing", dict(loader=False), "header Magic"),
+        ("hb-badheader", dict(header=loader_header(img)[:28] + b"\0\0\0\0" + b"\0" * 4064), "header HeaderCrc"),
+        ("hb-imagecrc", dict(), "image crc"),
+        ("hb-notpe", dict(loader=b"this is not a PE image" * 100), "LoadImage"),
+        ("hb-garbage", dict(loader=stub_img, cfg="stub.answer=garbage"), "answer Prefix"),
+        ("hb-badcrc", dict(loader=stub_img, cfg="stub.answer=badcrc"), "answer Crc"),
+        ("hb-unknown", dict(loader=stub_img, cfg="stub.answer=unknown"), "answer UnknownBoot"),
+        ("hb-returns", dict(loader=stub_img, cfg="stub.return"), "answer NoData"),
+    ]
+    for name, kw, want in cases:
+        d = hb_disk(name, rec, **kw)
+        if name == "hb-imagecrc":
+            d.put(HB_IMAGE + len(img) // 2, bytes([img[len(img) // 2] ^ 0xFF]))
+        _, boot, floor, _ = parent_run(name, d)
+        assert boot == "baseline" and floor is not None and floor.startswith(want), (name, boot, floor)
+        assert d.record()[1]["request"] == "recovery", f"{name}: the record changed"
+    # A partition never written: the loader runs, finds no record and writes nothing.
+    d = hb_disk("hb-norecord")
+    log, boot, floor, _ = parent_run("hb-norecord", d)
+    assert (boot, floor) == ("baseline", None) and "why=no-record" in log, (boot, floor)
+    assert d.at(0, 98304) == b"\0" * 98304, "a loader with no record wrote"
+
+
+@case("x86_64", "aarch64")
+def handback_probe_reports_the_firmware():
+    """012 Scenario 6, FR-016 to FR-019: probe=1 writes a checked report with the GOP
+    modes QEMU offers; the answer is unchanged; probe stays set."""
+    d = hb_disk("hb-probe", hb_record(probe="1"))
+    log, boot, floor, _ = parent_run("hb-probe", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    p = d.probe()
+    assert p, "no valid probe report"
+    keys = dict(p)
+    with open(os.path.join(OUT, "hb-probe", "probe.txt"), "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in p))
+    assert int(keys["handles"]) > 0 and int(keys["protocols"]) > 0, keys
+    assert int(keys["gops"]) >= 1, keys
+    gop = keys["gop1"]
+    cur = re.search(r"current=(\d+)", gop).group(1)
+    assert f"{W}x{H}" in keys[f"gop1.mode{cur}"], (gop, keys.get(f"gop1.mode{cur}"))
+    n = int(re.search(r"modes=(\d+)", gop).group(1))
+    listed = [k for k in keys if re.fullmatch(r"gop1\.mode\d+", k)]
+    assert n > 1 and (len(listed) == n or keys.get("truncated") == "1"), (n, len(listed))
+    assert any(v.endswith(" graphics-output") for k, v in p if k.startswith("proto")), "GOP not named"
+    assert any(k.startswith("log") and "HANDBACK start" in v for k, v in p), "no log lines"
+    assert "conout" in keys and "conin" in keys
+    seq, r, _ = d.record()
+    assert (r["probe"], r["unmarked"]) == ("1", "1"), r
+    assert "PROBE_WRITTEN ok=1" in log
+
+
+
 def main():
     global A
     ap = argparse.ArgumentParser()

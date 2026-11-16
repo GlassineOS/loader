@@ -6,7 +6,8 @@
 //!
 //! Words of its command line it reads: `stub.hold=<ms>` waits before the power-off (for
 //! frame captures); `stub.return` returns to the loader instead, as a kernel that
-//! fails to start would.
+//! fails to start would; `stub.answer=garbage|badcrc|unknown`, started as a loader by
+//! a parent (`glassine.handback=1`), exits with exit data that a parent must refuse.
 #![no_std]
 #![no_main]
 
@@ -61,6 +62,34 @@ fn initrd() -> String {
     }
 }
 
+/// Exits as a broken loader would, with exit data a parent must not act on.
+fn bad_answer(kind: &str) -> ! {
+    use glassine_loader_core::answer::{Answer, Boot};
+    use glassine_loader_core::gspl::crc32;
+    let good = Answer::new(Boot::Recovery, "limit").exit_data();
+    let data: alloc::vec::Vec<u8> = match kind {
+        "garbage" => b"\x13\x37not an answer at all, long enough to pass the size check of a parent".to_vec(),
+        "badcrc" => {
+            let mut d = good.clone();
+            let i = d.iter().rposition(|c| *c == b'=').unwrap() + 1;
+            d[i] = if d[i] == b'0' { b'1' } else { b'0' };
+            d
+        }
+        _ => {
+            let body = "format=1\nboot=reboot\n";
+            let mut d = good[..glassine_loader_core::answer::PREFIX_BYTES].to_vec();
+            d.extend_from_slice(format!("{body}crc32={:08x}\n", crc32(body.as_bytes())).as_bytes());
+            d
+        }
+    };
+    let p = boot::allocate_pool(boot::MemoryType::LOADER_DATA, data.len()).unwrap();
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), p.as_ptr(), data.len());
+        let _ = boot::exit(boot::image_handle(), Status::ABORTED, data.len(), p.as_ptr() as *mut uefi::Char16);
+    }
+    loop {}
+}
+
 #[entry]
 fn main() -> Status {
     let cmdline: String = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
@@ -70,6 +99,10 @@ fn main() -> Status {
     say("STUB_START");
     say(&format!("STUB_CMDLINE: {cmdline}"));
     say(&format!("STUB_INITRD: {}", initrd()));
+    if let Some(kind) = cmdline.split(' ').find_map(|w| w.strip_prefix("stub.answer=")) {
+        say(&format!("STUB_ANSWER {kind}"));
+        bad_answer(kind);
+    }
     if cmdline.split(' ').any(|w| w == "stub.return") {
         say("STUB_RETURN");
         return Status::LOAD_ERROR;

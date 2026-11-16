@@ -10,8 +10,10 @@ extern crate alloc;
 mod arch;
 mod display;
 mod fs;
+mod handback;
 mod kernel;
 mod log;
+mod probe;
 mod ui;
 
 use alloc::boxed::Box;
@@ -211,6 +213,13 @@ fn run_list(rec: Option<&InUse>) -> Choice {
 #[entry]
 fn main() -> Status {
     arch::init_clock();
+    // Under a parent bootloader (boot spec 012): headless, before any display is opened.
+    if let Some(o) = handback::options() {
+        log::set_serial(o.serial);
+        log::keep();
+        log!("LOADER_START {} {} handback", arch::NAME, env!("CARGO_PKG_VERSION"));
+        handback::run(o);
+    }
     log!("LOADER_START {} {}", arch::NAME, env!("CARGO_PKG_VERSION"));
     let mut screen = Screen { displays: display::all() };
     for (i, d) in screen.displays.iter().enumerate() {
