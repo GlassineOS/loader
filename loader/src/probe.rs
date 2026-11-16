@@ -4,8 +4,10 @@
 //! handles and their protocols, opening protocols with `GetProtocol` (never exclusively),
 //! the memory map, `GetVariable`, each graphics output's `QueryMode` through its raw
 //! word (capped at a checked `MaxMode`) and, on an extended graphics output only, its
-//! `GetFrameBuffer`. The console's mode is read from its fields. No mode is set, nothing
-//! is drawn or refreshed, no hardware is touched.
+//! `GetFrameBuffer`. The console's mode is read from its fields, and the input devices'
+//! (absolute and simple pointers, text inputs) Modes and identities from memory: none of
+//! their functions (`Reset`, `GetState`, `ReadKeyStroke`) is called. No mode is set,
+//! nothing is drawn or refreshed, no hardware is touched.
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -204,6 +206,122 @@ fn qcom_variables() -> Vec<String> {
     out
 }
 
+/// The input devices (`docs/handback.md`, "The probe report"): every handle with an
+/// absolute pointer, a simple pointer or a simple text input, its identity (index, the
+/// console-in handle or not, device path, protocols), and a pointer's Mode read from
+/// memory where the memory map says it is RAM. No function of these protocols is called:
+/// not `Reset`, `GetState` or `ReadKeyStroke`. `named`: the loaded images the `.in`
+/// lines name, for the `image<k>` lines.
+fn input_devices(
+    ram: &crate::fwgop::Ram,
+    images: &crate::fwgop::Images,
+    index: &dyn Fn(Handle) -> Option<usize>,
+    conin: Option<Handle>,
+    named: &mut Vec<usize>,
+) -> Vec<String> {
+    use crate::fwgop::{interface_of, rd32, rd64};
+    use uefi::proto::console::{pointer::Pointer, text::Input};
+    use uefi_raw::protocol::console::AbsolutePointerProtocol;
+    let ex = guid!("dd9e7534-7762-4698-8c14-f58517a625aa");
+    let mut out = Vec::new();
+    let handles = |g: &Guid| -> Vec<Handle> {
+        boot::locate_handle_buffer(SearchType::ByProtocol(g)).map(|b| b.iter().copied().collect()).unwrap_or_default()
+    };
+    let ident = |out: &mut Vec<String>, key: &str, h: Handle| {
+        out.push(format!("{key}.path={}", crate::fwgop::handle_path(ram, h)));
+        out.push(format!("{key}.guids={}", guids_of(h).iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(" ")));
+    };
+    // Both pointers: Reset, GetState, WaitForInput, then the Mode pointer at +0x18.
+    let pointer = |out: &mut Vec<String>, named: &mut Vec<usize>, key: &str, h: Handle, g: &Guid, mode_len: u64| -> Option<u64> {
+        let hi = index(h).map_or("-".into(), |x| format!("{x}"));
+        let is_conin = (Some(h) == conin) as u8;
+        let Some(iface) = interface_of(h, g) else {
+            out.push(format!("{key}=handle={hi} conin={is_conin} unopened"));
+            return None;
+        };
+        out.push(format!("{key}=handle={hi} conin={is_conin} iface=0x{iface:x}"));
+        if !ram.holds(iface, 32) {
+            out.push(format!("{key}.mode=not-ram"));
+            return None;
+        }
+        let w: [u64; 4] = core::array::from_fn(|i| unsafe { rd64(iface + 8 * i as u64) });
+        let wh: Vec<String> = w[..2]
+            .iter()
+            .map(|&a| match images.of(a) {
+                Some(img) => {
+                    if !named.contains(&img.index) {
+                        named.push(img.index);
+                    }
+                    format!("image{}", img.index)
+                }
+                None if a == 0 => "0".into(),
+                None => "-".into(),
+            })
+            .collect();
+        out.push(format!("{key}.in={}", wh.join(" ")));
+        let m = w[3];
+        if m == 0 {
+            out.push(format!("{key}.mode=null"));
+            None
+        } else if m % 8 != 0 {
+            out.push(format!("{key}.mode=unaligned"));
+            None
+        } else if !ram.holds(m, mode_len) {
+            out.push(format!("{key}.mode=not-ram"));
+            None
+        } else {
+            Some(m)
+        }
+    };
+
+    let abs = handles(&AbsolutePointerProtocol::GUID);
+    out.push(format!("apointers={}", abs.len()));
+    for (i, &h) in abs.iter().enumerate() {
+        let key = format!("apointer{}", i + 1);
+        if let Some(m) = pointer(&mut out, named, &key, h, &AbsolutePointerProtocol::GUID, 52) {
+            let r = |o: u64| unsafe { rd64(m + o) };
+            out.push(format!(
+                "{key}.mode=min_x={} max_x={} min_y={} max_y={} min_z={} max_z={} attr=0x{:x}",
+                r(0),
+                r(24),
+                r(8),
+                r(32),
+                r(16),
+                r(40),
+                unsafe { rd32(m + 48) }
+            ));
+        }
+        ident(&mut out, &key, h);
+    }
+    let simple = handles(&Pointer::GUID);
+    out.push(format!("spointers={}", simple.len()));
+    for (i, &h) in simple.iter().enumerate() {
+        let key = format!("spointer{}", i + 1);
+        if let Some(m) = pointer(&mut out, named, &key, h, &Pointer::GUID, 26) {
+            let b = |o: u64| unsafe { core::ptr::read_volatile((m + o) as *const u8) };
+            out.push(format!(
+                "{key}.mode=res_x={} res_y={} res_z={} left={} right={}",
+                unsafe { rd64(m) },
+                unsafe { rd64(m + 8) },
+                unsafe { rd64(m + 16) },
+                b(24),
+                b(25)
+            ));
+        }
+        ident(&mut out, &key, h);
+    }
+    let text = handles(&Input::GUID);
+    out.push(format!("textins={}", text.len()));
+    for (i, &h) in text.iter().enumerate() {
+        let key = format!("textin{}", i + 1);
+        let hi = index(h).map_or("-".into(), |x| format!("{x}"));
+        let has_ex = guids_of(h).contains(&ex) as u8;
+        out.push(format!("{key}=handle={hi} conin={} ex={has_ex}", (Some(h) == conin) as u8));
+        ident(&mut out, &key, h);
+    }
+    out
+}
+
 /// The report, as the bytes of the probe report. `boot`: the boot partition's handle
 /// (our `DeviceHandle`), when there is one.
 pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
@@ -315,6 +433,8 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
             }
         }
     }
+    let conin = st.and_then(|t| unsafe { Handle::from_ptr(t.as_ref().stdin_handle) });
+    let input = input_devices(&ram, &images, &index, conin, &mut named);
     for img in images.list.iter().filter(|i| named.contains(&i.index)) {
         gop.push(format!("image{}=base=0x{:x} size=0x{:x} path={}", img.index, img.base, img.size, img.path));
     }
@@ -341,6 +461,7 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
             }
         }
     }
+    tail.extend(input);
     tail.extend(qcom_variables());
     let log: Vec<String> = crate::log::kept().into_iter().enumerate().map(|(i, l)| format!("log{}={}", i + 1, l)).collect();
     let r = Report { head, protos, gop, extra_modes, tail, log };
