@@ -629,7 +629,7 @@ def bad_kernel_sha_falls_back():
     d.rm(f"glassine/recovery/{d.info['recovery']}/vmlinuz")
     vm = VM("bad-sha-3-nothing", d)
     vm.wait("NOTHING_STARTED")
-    m = vm.wait(r"MESSAGE ([^\r\n]*)").group(1)
+    m = vm.wait(r"MESSAGE ([^\r\n]*)\r?\n").group(1)
     assert PARTUUID in m and "GLASSINE" in m, m
     f = wait_frame(vm, "message", lambda g: diff(g, WANT_DEFAULT)[0] > 0)
     assert_centred_box(f, WANT_DEFAULT, "the message")
@@ -952,7 +952,7 @@ def linux_kernel_gets_its_command_line():
         raise AssertionError("no payload: run make payload")
     d = installed("linux", kernel=open(vmlinuz, "rb").read(), initramfs=open(os.path.join(PAYLOAD, "initrd"), "rb").read())
     vm = VM("linux", d)
-    m = vm.wait(r"INIT_CMDLINE: ([^\r\n]*)", timeout=300)
+    m = vm.wait(r"INIT_CMDLINE: ([^\r\n]*)\r?\n", timeout=300)
     vm.finish(300)
     assert m.group(1).strip() == d.info["cmdline"], m.group(1)
     assert "/etc/glassine-boot/board.conf: " + BOARD.decode().strip() in vm.log(), "board archive not in the initramfs"
