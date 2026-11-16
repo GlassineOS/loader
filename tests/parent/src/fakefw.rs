@@ -15,6 +15,14 @@
 //! With `parent.fakefw=hang` the refresh never returns, as a refresh that hangs inside
 //! the firmware would; the parent's watchdog then resets the machine.
 //!
+//! With `parent.fakefw=device` the extended GOP has the shape a Note Air's probe report
+//! shows: `GetFrameBuffer` gives the 1872x1404 panel, but the Mode names a 325x1423
+//! framebuffer (stride 325, 1,849,900 bytes) at the same base, too small for the
+//! panel's RGB565 picture; the volatile variable `DisplaySplashBufferInfo` (version 1,
+//! the base, 0x02300000 bytes; attributes 0x6) names the region that holds it. The
+//! framebuffer is that whole region, below 4 GiB (the variable's words are 32 bits).
+//! `device-<var>` changes the variable, see [`Var`].
+//!
 //! Every function counts its calls. After the loader returns, [`report`] prints the counts
 //! and each refresh: its rectangle and the CRC-32 of the framebuffer's packed RGB565
 //! rows at the time of the call.
@@ -26,7 +34,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use glassine_loader_core::gspl::crc32;
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::proto::device_path::DevicePath;
-use uefi::{Guid, Identify, Status, guid};
+use uefi::runtime::{self, VariableAttributes, VariableVendor};
+use uefi::{Guid, Identify, Status, cstr16, guid};
 
 pub const GOP_GUID: Guid = guid!("9042a9de-23dc-4a38-96fb-7aded080516a");
 pub const W: u32 = 1872;
@@ -42,6 +51,58 @@ static EXT: AtomicU64 = AtomicU64::new(0);
 static FB: AtomicU64 = AtomicU64::new(0);
 /// `parent.fakefw=hang`: the refresh never returns (the parent's watchdog resets).
 static HANG: AtomicU32 = AtomicU32::new(0);
+/// The Mode's picture: width, height, stride.
+static MODE_W: AtomicU32 = AtomicU32::new(W);
+static MODE_H: AtomicU32 = AtomicU32::new(H);
+static MODE_STRIDE: AtomicU32 = AtomicU32::new(W);
+
+/// The device's Mode: 325x1423, stride 325, 325x4x1423 bytes.
+const DEVICE_MODE: (u32, u32, u32) = (325, 1423, 325);
+const DEVICE_MODE_BYTES: usize = 1_849_900;
+/// The size `DisplaySplashBufferInfo` gives on the device.
+const DEVICE_REGION: u32 = 0x0230_0000;
+/// `gQcomTokenSpaceGuid`.
+const QCOM_TOKEN_SPACE: Guid = guid!("882f8c2b-9646-435f-8de5-f208ff80c1bd");
+
+/// `DisplaySplashBufferInfo` in the device shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Var {
+    /// `device`: version 1, the framebuffer's base, 0x02300000 bytes.
+    Good,
+    /// `device-novar`: none.
+    Absent,
+    /// `device-v2`: version 2, else as `Good`.
+    Version2,
+    /// `device-short`: the first 11 bytes of `Good`.
+    Short,
+    /// `device-small`: version 1, the base, one byte less than the panel's picture.
+    Small,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// `1`: the Mode is the panel's.
+    Panel,
+    /// `hang`: as `Panel`, the refresh never returns.
+    Hang,
+    /// `device[-<var>]`.
+    Device(Var),
+}
+
+impl Shape {
+    pub fn parse(w: &str) -> Option<Shape> {
+        Some(match w {
+            "1" => Shape::Panel,
+            "hang" => Shape::Hang,
+            "device" => Shape::Device(Var::Good),
+            "device-novar" => Shape::Device(Var::Absent),
+            "device-v2" => Shape::Device(Var::Version2),
+            "device-short" => Shape::Device(Var::Short),
+            "device-small" => Shape::Device(Var::Small),
+            _ => return None,
+        })
+    }
+}
 /// The refresh calls: `[this_ok, fb, x, y, w, h, stride, mode, crc]`.
 static mut REFRESHES: Vec<[u64; 9]> = Vec::new();
 
@@ -66,7 +127,7 @@ struct Mode {
 }
 
 fn info() -> Info {
-    Info { version: 0, w: W, h: H, format: 1, masks: [0; 4], stride: W }
+    Info { version: 0, w: MODE_W.load(SeqCst), h: MODE_H.load(SeqCst), format: 1, masks: [0; 4], stride: MODE_STRIDE.load(SeqCst) }
 }
 
 unsafe extern "efiapi" fn query_mode(_this: u64, n: u32, size: *mut usize, out: *mut *mut Info) -> Status {
@@ -146,16 +207,32 @@ fn install(words: [u64; 6], path: Option<Guid>) -> u64 {
     iface
 }
 
-/// Installs the five GOPs. Returns a line for the log.
-pub fn install_all(hang: bool) -> String {
-    HANG.store(hang as u32, SeqCst);
-    let bytes = (W * H * 4) as usize;
-    let fb = boot::allocate_pages(AllocateType::AnyPages, MemoryType::BOOT_SERVICES_DATA, bytes.div_ceil(4096)).expect("framebuffer");
+/// Installs the five GOPs (and, in the device shape, the variable). Returns a line for
+/// the log.
+pub fn install_all(shape: Shape) -> String {
+    HANG.store((shape == Shape::Hang) as u32, SeqCst);
+    let pattern = (W * H * 4) as usize;
+    let (bytes, mode_bytes, below_4g) = match shape {
+        Shape::Device(_) => {
+            let (w, h, stride) = DEVICE_MODE;
+            MODE_W.store(w, SeqCst);
+            MODE_H.store(h, SeqCst);
+            MODE_STRIDE.store(stride, SeqCst);
+            (DEVICE_REGION as usize, DEVICE_MODE_BYTES, true)
+        }
+        _ => (pattern, pattern, false),
+    };
+    let at = if below_4g { AllocateType::MaxAddress(0xffff_f000) } else { AllocateType::AnyPages };
+    let fb = boot::allocate_pages(at, MemoryType::BOOT_SERVICES_DATA, bytes.div_ceil(4096)).expect("framebuffer");
     // A pattern the loader must overwrite.
-    unsafe { core::ptr::write_bytes(fb.as_ptr(), 0x5a, bytes) };
+    unsafe { core::ptr::write_bytes(fb.as_ptr(), 0x5a, pattern) };
     FB.store(fb.as_ptr() as u64, SeqCst);
+    let mut var = String::new();
+    if let Shape::Device(v) = shape {
+        var = set_splash_info(v, fb.as_ptr() as u64);
+    }
     let info = leak(info());
-    let mode = leak(Mode { max_mode: 1, mode: 0, info: info as *const Info, size_of_info: INFO_SIZE, fb_base: fb.as_ptr() as u64, fb_size: bytes });
+    let mode = leak(Mode { max_mode: 1, mode: 0, info: info as *const Info, size_of_info: INFO_SIZE, fb_base: fb.as_ptr() as u64, fb_size: mode_bytes });
     let (qm, sm, bl) = (query_mode as *const () as u64, set_mode as *const () as u64, blt as *const () as u64);
     let ext = install([qm, sm, bl, refresh as *const () as u64, get_frame_buffer as *const () as u64, mode], Some(GOP_GUID));
     EXT.store(ext, SeqCst);
@@ -167,7 +244,34 @@ pub fn install_all(hang: bool) -> String {
     let garbage = leak([0x0000_1234_7777_0000_u64, 0x0123_4567_89ab_cdef, 0x9999, 0, 0]);
     install([gq, sm, bl, garbage, 0, 0], None);
     install([gq, sm, bl, 0x0000_7ead_0000_0000, 0, 0], None);
-    alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}", fb.as_ptr() as u64)
+    alloc::format!("PARENT_FAKEFW installed ext=0x{ext:x} fb=0x{:x}{var}", fb.as_ptr() as u64)
+}
+
+/// Sets `DisplaySplashBufferInfo` as `v` says, volatile (attributes 0x6: it leaves no
+/// trace in the variable store). Returns the words for the log line.
+fn set_splash_info(v: Var, base: u64) -> String {
+    if v == Var::Absent {
+        return " var=absent".into();
+    }
+    let base = u32::try_from(base).expect("framebuffer below 4 GiB");
+    let size = match v {
+        Var::Small => W * H * 2 - 1,
+        _ => DEVICE_REGION,
+    };
+    let version: u32 = if v == Var::Version2 { 2 } else { 1 };
+    let mut b: Vec<u8> = Vec::new();
+    for x in [version, base, size] {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    if v == Var::Short {
+        b.truncate(11);
+    }
+    let name = cstr16!("DisplaySplashBufferInfo");
+    let vendor = VariableVendor(QCOM_TOKEN_SPACE);
+    let attrs = VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
+    runtime::set_variable(name, &vendor, attrs, &b).expect("set DisplaySplashBufferInfo");
+    let hex: String = b.iter().map(|x| alloc::format!("{x:02x}")).collect();
+    alloc::format!(" var={hex}")
 }
 
 /// The counts and the refresh calls.

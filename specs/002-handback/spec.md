@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`bc3388520018ae6187f2be641abb9370a2b56c8a`. Where the documents and
+`bcd248cb2197e73db7d336100739df4f5479a0ee`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios

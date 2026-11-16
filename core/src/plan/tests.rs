@@ -533,3 +533,41 @@ fn epd_plan_draws_counted_after_healthy_and_sticks_after_a_drawn_unmarked_start(
     assert!(!p.draw && epd_draws(&p, &a("default")).is_err(), "{p:?}");
     assert!(epd_plan(None).skip.is_some());
 }
+
+#[test]
+fn epd_bound_mode_or_splash_buffer_info() {
+    // The Note Air's shape: GetFrameBuffer 1872x1404, a Mode of 325x1423x4 bytes, the
+    // variable version 1 with a 0x02300000-byte region at the same base.
+    let fb = 0x9d40_0000_u64;
+    let small = Some((fb, 1_849_900));
+    let var = |v: u32, base: u32, size: u32| {
+        let mut b = alloc::vec::Vec::new();
+        for x in [v, base, size] {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b
+    };
+    let good = var(1, fb as u32, 0x0230_0000);
+    // The probe's hex of the device's variable.
+    assert_eq!(crate::hex(&good), "010000000000409d00003002");
+    assert_eq!(splash_buffer_region(&good), Some((fb, 0x0230_0000)));
+    assert_eq!(epd_bound(fb, 1872, 1404, small, Some(&good)), Ok(EpdBound::SplashBufferInfo));
+    // A Mode big enough wins, the variable unread or not.
+    assert_eq!(epd_bound(fb, 1872, 1404, Some((fb, 1872 * 1404 * 2)), None), Ok(EpdBound::Mode));
+    assert_eq!(epd_bound(fb, 1872, 1404, Some((fb, 1872 * 1404 * 2)), Some(&good)), Ok(EpdBound::Mode));
+    // No region: the variable missing, of another version or size.
+    assert!(epd_bound(fb, 1872, 1404, small, None).is_err());
+    assert!(epd_bound(fb, 1872, 1404, small, Some(&var(2, fb as u32, 0x0230_0000))).is_err());
+    assert!(epd_bound(fb, 1872, 1404, small, Some(&good[..8])).is_err());
+    let mut long = good.clone();
+    long.push(0);
+    assert!(epd_bound(fb, 1872, 1404, small, Some(&long)).is_err());
+    assert_eq!(splash_buffer_region(&[]), None);
+    // A well-formed region that doesn't hold the picture: too small, or elsewhere.
+    assert!(epd_bound(fb, 1872, 1404, small, Some(&var(1, fb as u32, 5_256_575))).is_err());
+    assert_eq!(epd_bound(fb, 1872, 1404, small, Some(&var(1, fb as u32, 5_256_576))), Ok(EpdBound::SplashBufferInfo));
+    assert!(epd_bound(fb, 1872, 1404, small, Some(&var(1, fb as u32 + 8, 0x0230_0000))).is_err());
+    // No Mode and an overflowing region.
+    assert!(epd_bound(fb, 1872, 1404, None, Some(&var(1, 0xffff_ff00, 0xffff_ffff))).is_err());
+    assert!(epd_bound(u64::MAX - 4, 8, 1, Some((0, u64::MAX)), None).is_err());
+}
