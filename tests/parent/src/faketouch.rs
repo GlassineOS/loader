@@ -20,6 +20,11 @@
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
+//! `parent.touchtaps=n:x:y,...` scripts taps in the controller's coordinates, as
+//! `parent.taps` does for the stand-in pointer: tap k once the loader has made n
+//! refreshes and 60 reads of the input register passed since the last one; five touch
+//! reports with the contact down, then one with it lifted off, one per read.
+//!
 //! After the loader returns, [`report`] prints the counts and the call sequence.
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -81,6 +86,10 @@ struct State {
     seq: Vec<String>,
     counts: [u32; 8],
     open_handles: u32,
+    taps: Vec<(u32, u16, u16)>,
+    tap_next: usize,
+    tap_read: u32,
+    tap_quiet: u32,
 }
 
 static mut ST: Option<State> = None;
@@ -226,6 +235,9 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
     if !s.up {
         return 0x8001; // no answer: a NACK
     }
+    if len == 2 && s.queue.is_empty() {
+        next_tap(s);
+    }
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
     out.fill(0);
     let mut take = false;
@@ -340,6 +352,10 @@ pub fn install(mode: Mode) -> String {
         seq: Vec::new(),
         counts: [0; 8],
         open_handles: 0,
+        taps: Vec::new(),
+        tap_next: 0,
+        tap_read: 0,
+        tap_quiet: 1000,
     };
     if mode == Mode::Powered {
         s.out[61] = Some(true);
@@ -371,6 +387,47 @@ pub fn install(mode: Mode) -> String {
         boot::install_protocol_interface(None, &I2C_GUID, leak(i2c) as *const c_void).expect("install i2c");
     }
     String::from("PARENT_FAKETOUCH installed")
+}
+
+pub fn set_taps(words: &str) {
+    let s = st();
+    for t in words.split(',').filter(|t| !t.is_empty()) {
+        let p: Vec<u32> = t.split(':').map(|x| x.parse().expect("parent.touchtaps")).collect();
+        assert!(p.len() == 3, "parent.touchtaps: n:x:y");
+        s.taps.push((p[0], p[1] as u16, p[2] as u16));
+    }
+}
+
+/// A touch report with one contact (`down`) or the contact lifting off.
+fn touch_report(x: u16, y: u16, down: bool) -> Vec<u8> {
+    let mut f = alloc::vec![0u8; 17];
+    f[0] = 17;
+    f[2] = 0x01;
+    f[5] = 1;
+    f[8] = if down { 0x20 } else { 0x60 }; // contact 0, event touch / lift-off
+    f[9..11].copy_from_slice(&x.to_le_bytes());
+    f[11..13].copy_from_slice(&y.to_le_bytes());
+    f
+}
+
+/// The next scripted report, at a read of the length while nothing waits.
+fn next_tap(s: &mut State) {
+    let Some(&(after, x, y)) = s.taps.get(s.tap_next) else { return };
+    if s.tap_read == 0 {
+        s.tap_quiet += 1;
+        if crate::fakefw::refresh_count() < after || s.tap_quiet < 60 {
+            return;
+        }
+        crate::say(&format!("PARENT_FAKETOUCH_TAP {} at={x},{y} after_refresh={}", s.tap_next, crate::fakefw::refresh_count()));
+    }
+    let down = s.tap_read < 5;
+    s.queue.push_back(touch_report(x, y, down));
+    s.tap_read += 1;
+    if !down {
+        s.tap_read = 0;
+        s.tap_quiet = 0;
+        s.tap_next += 1;
+    }
 }
 
 pub fn report() -> Vec<String> {

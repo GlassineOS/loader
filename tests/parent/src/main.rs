@@ -258,6 +258,7 @@ fn main() -> Status {
     let touch = cfg.split(' ').find_map(|w| w.strip_prefix("parent.faketouch="));
     if let Some(w) = touch {
         say(&faketouch::install(faketouch::Mode::parse(w).expect("parent.faketouch")));
+        faketouch::set_taps(cfg.split(' ').find_map(|w| w.strip_prefix("parent.touchtaps=")).unwrap_or(""));
     }
     hook_watchdog();
     let r = hand_back();

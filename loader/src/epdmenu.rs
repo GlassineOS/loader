@@ -70,8 +70,12 @@ struct FirmwarePointer {
 /// The tap source for a native `w`×`h` panel, if the firmware has one: an absolute
 /// pointer of a device's own whose Mode (where the memory map says RAM) has usable
 /// ranges. The console splitter's on the console-in handle is not one: with no touch
-/// driver bound under it, it never reports (spec 004 FR-010).
+/// driver bound under it, it never reports (spec 004 FR-010). With `touch=on` the
+/// loader's own touch driver comes first (spec 005 FR-011).
 pub fn tap_source(w: u32, h: u32) -> Option<Box<dyn TapSource>> {
+    if let Some(s) = crate::touch::source(w, h) {
+        return Some(s);
+    }
     let handles: Vec<Handle> = boot::locate_handle_buffer(SearchType::ByProtocol(&AbsolutePointerProtocol::GUID))
         .map(|b| b.iter().copied().collect())
         .unwrap_or_default();

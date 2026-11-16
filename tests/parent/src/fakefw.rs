@@ -254,6 +254,11 @@ pub fn set_taps(words: &str) {
     unsafe { *core::ptr::addr_of_mut!(TAPS) = v };
 }
 
+/// The refreshes made so far (the touch stand-in's taps wait for them).
+pub fn refresh_count() -> u32 {
+    unsafe { (*core::ptr::addr_of!(REFRESHES)).len() as u32 }
+}
+
 pub fn set_nopointer(on: bool) {
     NOPOINTER.store(on as u32, SeqCst);
 }

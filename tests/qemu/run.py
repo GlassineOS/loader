@@ -1955,6 +1955,71 @@ def menu_on_request_each_entry_by_tap():
             assert fakefw_calls(log)["ptr_reset"] == "0", "Reset called on the pointer"
 
 
+TOUCH_RES = (1872, 1404)  # the touch stand-in's system information
+
+
+def touch_tap(i, after):
+    """A tap of the touch stand-in in the middle of menu row i: the inverse of the loader's
+    mapping (src/touch.rs ORIENT: native y flipped) at the controller's resolution."""
+    u, v = PORTRAIT[0] // 2, ROW_H * (i + 2) + ROW_H // 2
+    nw, nh = PANEL
+    nx, ny = nw - 1 - v, nh - 1 - u
+    up = lambda n, span, out: min((n * span + out - 2) // (out - 1), span)
+    return f"{after}:{up(nx, TOUCH_RES[0] - 1, nw)}:{up(ny, TOUCH_RES[1] - 1, nh)}"
+
+
+def touch_menu(name, taps, mode="1", **keys):
+    extra = f"parent.nopointer=1 parent.faketouch={mode} parent.touchtaps={','.join(taps)}"
+    d = menu_disk(name, extra=extra, touch="on", **MENU_REC, **keys)
+    log, boot, ans = menu_run(name, d)
+    return d, log, boot, ans
+
+
+@case("x86_64", "aarch64")
+def touch_on_each_entry_by_tap():
+    """005 Scenario 4, FR-011 to FR-015: touch=on and no firmware pointer: the loader's
+    driver is the menu's tap source, brought up after the menu write; a tap on each entry
+    gives its answer and write; More and Back work; the controller is powered down before
+    the answer."""
+    want = {
+        "glassineos": ([touch_tap(0, 1)], f"boot=set:{SET_A}", None),
+        "prevdeploy": ([touch_tap(1, 1)], f"boot=set:{SET_A}", f"glassine.deploy.once={D1}"),
+        "more": ([touch_tap(2, 1), touch_tap(0, 3)], f"boot=set:{SET_A}", f"glassine.deploy.once={D2}"),
+        "moreback": ([touch_tap(2, 1), touch_tap(1, 3), touch_tap(4, 4)], "boot=recovery", None),
+        "prevkernel": ([touch_tap(3, 1)], f"boot=set:{SET_B}", None),
+        "recovery": ([touch_tap(4, 1)], "boot=recovery", None),
+    }
+    for n, (taps, ans, add) in want.items():
+        name = f"touch-menu-{n}"
+        d, log, boot, got = touch_menu(name, taps)
+        assert got and got.startswith(f"format=1 {ans}"), (name, got, log[-1500:])
+        assert ("PARENT_CMDLINE_ADD " + add in log) if add else "PARENT_CMDLINE_ADD" not in log, (name, add)
+        assert "MENU_INPUT loader-cyttsp5" in log, name
+        assert len(re.findall(r"PARENT_FAKETOUCH_TAP", log)) == len(taps), (name, "not every tap was read")
+        assert len(re.findall(r"TOUCH press raw=", log)) == len(taps), name
+        w1 = log.index("WRITE slot=")
+        assert w1 < log.index("TOUCH_GPIO set"), f"{name}: the controller touched before the menu write"
+        assert log.index("TOUCH_DOWN off: 66, 62, 61") < log.index("HANDBACK_ANSWER"), f"{name}: not powered down first"
+        c = faketouch_calls(log)
+        assert c["powered"] == "0" and c["open_now"] == "0", (name, c)
+        assert d.record()[1].get("touch") == "on", "touch=on stays"
+
+
+@case("x86_64", "aarch64")
+def touch_on_without_the_protocols_or_with_a_failed_bring_up():
+    """005 FR-011, FR-014: touch=on without the firmware's protocols: no tap source, no
+    menu (MENU_NO_INPUT). With a bring-up that fails: the menu without taps, the
+    controller powered down, the default after the timeout."""
+    d = menu_disk("touch-menu-none", extra="parent.nopointer=1", touch="on", **MENU_REC)
+    log, boot, ans = menu_run("touch-menu-none", d)
+    assert "TOUCH_SKIPPED gpio none" in log and "MENU_NO_INPUT why=request" in log, log[-800:]
+    d, log, boot, ans = touch_menu("touch-menu-fail", [touch_tap(4, 1)], mode="nodesc")
+    assert "TOUCH bring-up failed: no taps" in log and "MENU_TIMEOUT" in log, log[-1500:]
+    assert ans.startswith(f"format=1 boot=set:{SET_A} "), ans
+    c = faketouch_calls(log)
+    assert c["powered"] == "0" and c["open_now"] == "0", c
+
+
 @case("x86_64", "aarch64")
 def menu_full_refreshes_with_display_partial_0():
     """004 Scenario 6: display_partial=0: every refresh is the whole panel, and the frames
