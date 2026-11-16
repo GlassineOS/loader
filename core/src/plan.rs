@@ -677,5 +677,54 @@ pub fn epd_draws(plan: &EpdPlan, answer: &Answer) -> Result<(), String> {
     }
 }
 
+/// The region the firmware variable `DisplaySplashBufferInfo` names (boot
+/// `docs/handback.md`, "A display through the firmware's refresh"): exactly 12 bytes,
+/// three little-endian u32 words, version 1, then the base and the size in bytes. Any
+/// other shape names no region.
+pub fn splash_buffer_region(var: &[u8]) -> Option<(u64, u64)> {
+    let w: &[u8; 12] = var.try_into().ok()?;
+    let word = |i: usize| u32::from_le_bytes([w[i], w[i + 1], w[i + 2], w[i + 3]]) as u64;
+    (word(0) == 1).then(|| (word(4), word(8)))
+}
+
+/// Which region bounds the `epd-fw` picture.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum EpdBound {
+    /// The framebuffer the GOP's Mode names.
+    Mode,
+    /// The region `DisplaySplashBufferInfo` names.
+    SplashBufferInfo,
+}
+
+/// Whether `len` bytes from `at` lie inside `base`+`size`.
+fn inside(at: u64, len: u64, base: u64, size: u64) -> bool {
+    match (at.checked_add(len), base.checked_add(size)) {
+        (Some(end), Some(lim)) => at >= base && end <= lim,
+        _ => false,
+    }
+}
+
+/// The bound of the `epd-fw` picture (spec 003 FR-002): the `w`×`h`×2 bytes from `fb`
+/// inside the Mode's framebuffer (`mode`: base, size), else inside the region of
+/// `DisplaySplashBufferInfo` (`var`: its bytes, if the firmware has it). The caller has
+/// checked the status, a non-zero `fb`, `w` and `h`, and `w` a multiple of 8.
+pub fn epd_bound(fb: u64, w: u32, h: u32, mode: Option<(u64, u64)>, var: Option<&[u8]>) -> Result<EpdBound, String> {
+    let bytes = (w as u64) * (h as u64) * 2;
+    if mode.is_some_and(|(base, size)| inside(fb, bytes, base, size)) {
+        return Ok(EpdBound::Mode);
+    }
+    let region = var.and_then(splash_buffer_region);
+    if region.is_some_and(|(base, size)| inside(fb, bytes, base, size)) {
+        return Ok(EpdBound::SplashBufferInfo);
+    }
+    let m = mode.map_or("no Mode".into(), |(b, s)| format!("the Mode's 0x{b:x}+{s}"));
+    let v = match (var, region) {
+        (None, _) => "no DisplaySplashBufferInfo".into(),
+        (Some(d), None) => format!("a DisplaySplashBufferInfo of {} bytes that names no region", d.len()),
+        (Some(_), Some((b, s))) => format!("DisplaySplashBufferInfo's 0x{b:x}+{s}"),
+    };
+    Err(format!("framebuffer 0x{fb:x}+{bytes} outside {m} and {v}"))
+}
+
 #[cfg(test)]
 mod tests;

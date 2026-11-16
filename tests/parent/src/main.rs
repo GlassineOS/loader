@@ -13,7 +13,9 @@
 //! the words to add (`glassine.log=serial` is always added, so the tests see the
 //! loader's log). Words that start with `parent.` are the parent's own and not passed:
 //! `parent.fakefw=1` installs the stand-in extended graphics output of [`fakefw`],
-//! `parent.fakefw=hang` the same with a refresh that never returns.
+//! `parent.fakefw=hang` the same with a refresh that never returns, and
+//! `parent.fakefw=device[-<var>]` the same in the shape a Note Air reports (a Mode smaller
+//! than the panel, and the variable `DisplaySplashBufferInfo`; see [`fakefw::Var`]).
 #![no_std]
 #![no_main]
 
@@ -213,10 +215,10 @@ fn hand_back() -> Result<Boot, String> {
 fn main() -> Status {
     say("PARENT_START_PARENT");
     let cfg = extra_options();
-    let hang = cfg.split(' ').any(|w| w == "parent.fakefw=hang");
-    let fake = hang || cfg.split(' ').any(|w| w == "parent.fakefw=1");
-    if fake {
-        say(&fakefw::install_all(hang));
+    let word = cfg.split(' ').find_map(|w| w.strip_prefix("parent.fakefw="));
+    let fake = word.is_some();
+    if let Some(w) = word {
+        say(&fakefw::install_all(fakefw::Shape::parse(w).expect("parent.fakefw")));
     }
     let r = hand_back();
     if fake {

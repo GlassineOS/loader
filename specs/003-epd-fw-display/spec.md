@@ -35,6 +35,20 @@ once, then decides and answers as in 002.
 equals the one the test computes from the splash; no `SetMode`, no `Blt`; the answer and
 the count are as without the display.
 
+### Scenario 1a – A Mode smaller than the panel (Priority: P1)
+
+The firmware's Mode describes a smaller picture than the panel, as a Note Air's does
+(`GetFrameBuffer` 1872×1404; the Mode 325×1423, stride 325, 1,849,900 bytes at the same
+base), and `DisplaySplashBufferInfo` names a region that holds the panel's picture. The
+loader draws as in Scenario 1.
+
+**Acceptance**: QEMU case with the stand-in in that shape (`parent.fakefw=device`: the
+variable volatile, version 1, the framebuffer's base, 0x02300000 bytes): one refresh with
+the CRC of Scenario 1, `bound=DisplaySplashBufferInfo` logged. With the variable missing,
+of version 2, 11 bytes long, or naming a region one byte smaller than the picture: no
+refresh, `EPD_FW_NONE` with the reason, the override left in place. The probe reports
+the variable as `present size=12 attr=0x6 hex=…` and refreshes nothing.
+
 ### Scenario 2 – The override (Priority: P1)
 
 An override made for the panel's portrait mode is removed durably, then drawn with the
@@ -74,8 +88,16 @@ no `GetFrameBuffer`, no refresh, the splash store left as it is.
   loader is headless.
 - **FR-002**: It calls `GetFrameBuffer(This, &Fb, &W, &H)` (+0x20) once. It refuses (and
   stays headless) a status other than success, a zero `Fb`, `W` or `H`, a `W` that isn't
-  a multiple of 8, or `W`×`H`×2 bytes from `Fb` that don't lie inside the framebuffer
-  the Mode names.
+  a multiple of 8, or `W`×`H`×2 bytes from `Fb` that lie inside neither of two regions:
+  - the framebuffer the Mode names (`FrameBufferBase`, `FrameBufferSize`);
+  - the region the firmware variable `DisplaySplashBufferInfo` names (under
+    `gQcomTokenSpaceGuid`, read with `GetVariable` only when the Mode's is too small):
+    exactly 12 bytes, three little-endian u32 words, version 1, then the base and the
+    size in bytes. A variable of another size or version, or none, names no region.
+
+  The `EPD_FW` line names the region that accepted the picture (`bound=mode` or
+  `bound=DisplaySplashBufferInfo`); `EPD_FW_NONE` says why neither did. The rule is
+  `core::plan::epd_bound`.
 - **FR-003**: The picture is picked by `core::plan::pick_picture` for the portrait mode
   `H`×`W` (one display): the override removed durably before it is drawn and drawn only
   when made for that mode; a leave-screen override, or no picture, draws nothing. It is
@@ -126,7 +148,7 @@ the answer.
 
 ## Success criteria
 
-- **SC-001**: The QEMU cases of Scenarios 1 to 3 (and 2a) pass on x86-64 and aarch64, and with
+- **SC-001**: The QEMU cases of Scenarios 1 to 3 (and 1a, 2a) pass on x86-64 and aarch64, and with
   the second OVMF.
 - **SC-002**: The 002 cases are unchanged: a start without `display=epd-fw` draws nothing
   and leaves the splash store byte for byte.

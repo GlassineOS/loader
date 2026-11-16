@@ -24,6 +24,10 @@ use uefi::{Guid, Handle, Identify, Status};
 
 /// The GOP GUID (UEFI specification).
 pub const GOP_GUID: Guid = uefi::guid!("9042a9de-23dc-4a38-96fb-7aded080516a");
+/// The vendor GUID of Qualcomm's display variables (`gQcomTokenSpaceGuid`,
+/// `QcomModulePkg.dec`; ABL reads `DisplaySplashBufferInfo` and
+/// `DisplayPanelConfiguration` under it).
+pub const QCOM_TOKEN_SPACE: Guid = uefi::guid!("882f8c2b-9646-435f-8de5-f208ff80c1bd");
 /// The size of the mode information structure (UEFI specification).
 pub const INFO_SIZE: usize = 0x24;
 /// The largest `MaxMode` taken for real. QEMU's own GOP has 30 modes and PCs have
