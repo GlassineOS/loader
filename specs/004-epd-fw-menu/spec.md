@@ -176,8 +176,9 @@ writes `display_failed=1`.
   waits, `SetWatchdogTimer(30, …)`; 30 s again before the answer. Never disabled.
 - **FR-013**: The timeout: 60 s after the menu opened or after the last input, the
   GlassineOS pick, logged as `MENU_TIMEOUT`.
-- **FR-014**: With `probe=1` the probe report is written again after the menu closed,
-  so its log holds the menu's lines (refreshes, keys, taps, the pick).
+- **FR-014**: With `probe=1` the probe report is written again after a start that
+  opened the menu or would have but for a tap source, so its log holds the menu's lines
+  (refreshes, keys, taps, the pick, or `MENU_NO_INPUT`).
 - **FR-015**: The PC path (001) is unchanged: its theme, list, key line and frames.
 
 ## Device scope and risk
