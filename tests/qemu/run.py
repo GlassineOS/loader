@@ -981,13 +981,18 @@ def linux_kernel_with_a_large_initramfs():
 # ---------------------------------------------------------------- under a parent (boot spec 012)
 #
 # The disk: an ESP with the stand-in parent (tests/parent) as the removable-media path,
-# and the hand-back partition, raw (boot docs/handback.md). The parent starts the loader
-# from that partition as the Note Air's ABL does; its serial lines say what it would boot.
+# and the boot partition `glassine-boot` in its raw form (a region table, boot
+# docs/boot-partition.md, "The raw form") or its FAT form. The parent starts the loader
+# from it as the Note Air's ABL does; its serial lines say what it would boot.
 
 HB_PARTUUID = "8a1f3c5e-2b4d-4e6f-9a0b-1c2d3e4f5a6b"
 ESP_OFF, ESP_SIZE = 1 << 20, 32 << 20
-HB_OFF, HB_SIZE = ESP_OFF + ESP_SIZE, 8 << 20
-HB_HEADER, HB_IMAGE, HB_PROBE = 1 << 20, (1 << 20) + 4096, 32768
+HB_OFF, HB_SIZE = ESP_OFF + ESP_SIZE, 16 << 20
+HB_FAT_SIZE = 40 << 20  # FAT32 with 512-byte sectors needs about 33 MiB
+K, M = 1024, 1 << 20
+# boot-partition.md, "Sizes": the 16 MiB table.
+REGIONS = {"record": (64 * K, 32 * K), "probe": (128 * K, 64 * K), "loader": (M, 3 * M),
+           "splash-default": (4 * M, 3 * M), "splash": (7 * M, 3 * M), "override": (10 * M, 3 * M)}
 SET_A, SET_B = "0123456789abcdef", "fedcba9876543210"
 
 
@@ -1003,6 +1008,19 @@ def loader_header(img):
     return h + b"\0" * (4096 - len(h))
 
 
+def region_table(part, regions):
+    """The region table (boot-partition.md, "The region table"), as the installer writes it."""
+    import struct
+    t = bytearray(4096)
+    t[0:24] = b"GLREGION" + struct.pack("<IIQ", 1, len(regions), part)
+    for i, (name, (off, size)) in enumerate(regions.items()):
+        e = name.encode().ljust(32, b"\0") + struct.pack("<QQI", off, size, 0)
+        e += struct.pack("<I", crc32(e)) + b"\0" * 8
+        t[64 + 64 * i:128 + 64 * i] = e
+    t[4092:] = struct.pack("<I", crc32(bytes(t[:4092])))
+    return bytes(t)
+
+
 def hb_record(**keys):
     base = [("format", "1"), ("seq", "1")] + [(k, "") for k in (
         "default", "default_rec", "previous", "previous_rec", "trial", "trial_rec", "recovery", "recovery_rec",
@@ -1011,14 +1029,19 @@ def hb_record(**keys):
 
 
 class HandbackDisk:
-    def __init__(self, path, loader=None, header=None, slots=None, cfg=""):
-        self.path = path
+    """`fat`: the FAT form; else raw. `table`: None for the installer's table, False for
+    none, or bytes for the primary copy (the backup stays the installer's)."""
+
+    def __init__(self, path, loader=None, header=None, slots=None, cfg="", fat=False, table=None, images=None):
+        self.path, self.fat = path, fat
+        size = HB_FAT_SIZE if fat else HB_SIZE
+        self.size = size
         if os.path.exists(path):
             os.remove(path)
         with open(path, "wb") as f:
-            f.truncate(HB_OFF + HB_SIZE + (1 << 20))
+            f.truncate(HB_OFF + size + (1 << 20))
         run("sgdisk", "-o", "-n", f"1:{ESP_OFF // SECTOR}:+{ESP_SIZE // SECTOR}", "-t", "1:ef00", "-c", "1:esp",
-            "-n", f"2:{HB_OFF // SECTOR}:+{HB_SIZE // SECTOR}", "-t", "2:8300", "-c", "2:glassine-handback",
+            "-n", f"2:{HB_OFF // SECTOR}:+{size // SECTOR}", "-t", "2:8300", "-c", "2:glassine-boot",
             "-u", f"2:{HB_PARTUUID}", path)
         esp = f"{path}@@{ESP_OFF}"
         run("mformat", "-i", esp, "-T", str(ESP_SIZE // SECTOR), "::")  # FAT16: 32 MiB is too few clusters for FAT32
@@ -1026,17 +1049,41 @@ class HandbackDisk:
         boot = "BOOTAA64.EFI" if A["target"].startswith("aarch64") else "BOOTX64.EFI"
         run("mcopy", "-i", esp, efi("glassine-test-parent"), f"::/EFI/BOOT/{boot}")
         if cfg:
-            tmp = path + ".cfg"
-            with open(tmp, "w") as f:
-                f.write(cfg + "\n")
-            run("mcopy", "-i", esp, tmp, "::/parent.cfg")
-            os.remove(tmp)
+            self.mput(esp, "parent.cfg", (cfg + "\n").encode())
         img = open(efi("glassine-loader"), "rb").read() if loader is None else loader
+        if fat:
+            part = self.img()
+            run("mformat", "-i", part, "-F", "-T", str(size // SECTOR), "-v", "GLASSINE", "::")
+            run("mmd", "-i", part, "::/EFI", "::/EFI/glassine", "::/glassine")
+            if img is not False:
+                self.mput(part, "EFI/glassine/loader.efi", img)
+            for i, s in enumerate(slots or []):
+                self.mput(part, f"glassine/loader.{'ab'[i]}", s)
+            return
+        if table is not False:
+            self.put(0, region_table(size, REGIONS) if table is None else table)
+            self.put(size - 4096, region_table(size, REGIONS))
         if img is not False:
-            self.put(HB_IMAGE, img)
-            self.put(HB_HEADER, loader_header(img) if header is None else header)
+            self.put(REGIONS["loader"][0] + 4096, img)
+            self.put(REGIONS["loader"][0], loader_header(img) if header is None else header)
         for i, s in enumerate(slots or []):
-            self.put(i * 16384, s)
+            self.put(REGIONS["record"][0] + i * 16384, s)
+        for name, data in (images or {}).items():
+            self.put(REGIONS[name][0], data)
+
+    def img(self):
+        return f"{self.path}@@{HB_OFF}"
+
+    def mput(self, image, name, data):
+        tmp = self.path + ".put"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        run("mcopy", "-o", "-i", image, tmp, "::/" + name)
+        os.remove(tmp)
+
+    def mget(self, name):
+        r = subprocess.run(["mtype", "-i", self.img(), "::/" + name], capture_output=True)
+        return r.stdout if r.returncode == 0 else None
 
     def put(self, off, data):
         with open(self.path, "r+b") as f:
@@ -1048,16 +1095,26 @@ class HandbackDisk:
             f.seek(HB_OFF + off)
             return f.read(n)
 
+    def region(self, name):
+        off, size = REGIONS[name]
+        return self.at(off, size)
+
+    def slots(self):
+        if self.fat:
+            return self.mget("glassine/loader.a"), self.mget("glassine/loader.b")
+        r = REGIONS["record"][0]
+        return self.at(r, 16384), self.at(r + 16384, 16384)
+
     def record(self):
-        a, b = read_slot(self.at(0, 16384)), read_slot(self.at(16384, 16384))
+        a, b = (read_slot(x) for x in self.slots())
         if a and b:
             return (b[0], dict(b[1]), True) if b[0] > a[0] else (a[0], dict(a[1]), True)
         s = a or b
         return (s[0], dict(s[1]), False) if s else None
 
     def probe(self):
-        b = self.at(HB_PROBE, 65536)
-        return parse_record(b.rstrip(b"\n") + b"\n") if b.strip(b"\0") else None
+        b = self.mget("glassine/probe.txt") if self.fat else self.region("probe")
+        return parse_record(b.rstrip(b"\n") + b"\n") if b and b.strip(b"\0") else None
 
 
 def hb_disk(name, record=None, **kw):
@@ -1076,18 +1133,33 @@ def parent_run(name, d):
     return log, boot, (floor[-1] if floor else None), (ans[-1] if ans else None)
 
 
+def gspl(w, h, fill):
+    """A raw picture of the image format (boot-partition.md, "The image format")."""
+    import struct
+    payload = bytes([fill]) * (w * h * 4)
+    hd = b"GLSPLASH" + struct.pack("<HHIIIIIIIQI", 1, 0, w, h, w, h, 1, 0, 0, len(payload), crc32(payload))
+    hd += struct.pack("<I", crc32(hd)) + b"\0" * 8
+    return hd + payload
+
+
 @case("x86_64", "aarch64")
 def handback_ordinary_start_counts_and_answers_the_baseline():
-    """012 Scenario 1, FR-008 to FR-011: started from memory by a parent, headless; the
-    start is counted in the raw record; no probe without probe=1."""
-    d = hb_disk("hb-ordinary", hb_record())
+    """012 Scenario 1, FR-008 to FR-011, FR-015a: started from memory by a parent from the
+    raw form, headless; the start is counted in the region `record`; no probe without
+    probe=1; the splash store's regions are left byte for byte."""
+    images = {"splash": gspl(16, 8, 0x55), "override": gspl(16, 8, 0x44)}
+    d = hb_disk("hb-ordinary", hb_record(), images=images)
+    store = {n: d.region(n) for n in ("splash-default", "splash", "override", "probe")}
     log, boot, floor, _ = parent_run("hb-ordinary", d)
     assert (boot, floor) == ("baseline", None), (boot, floor)
+    assert "PARENT_FORM raw" in log and "PARENT_TABLE at=0" in log
+    assert "HANDBACK form=raw table=Primary regions=6" in log, "the loader didn't read the table"
     assert "HANDBACK_ANSWER format=1 boot=baseline why=default" in log, "no answer logged"
     assert "DISPLAY" not in log and "HINT_SHOWN" not in log, "a headless loader opened a display"
     seq, r, both = d.record()
     assert (seq, r["unmarked"], r["started_why"], both) == (2, "1", "default", True), (seq, r)
-    assert d.at(HB_PROBE, 65536) == b"\0" * 65536, "probe area written without probe=1"
+    for n, b in store.items():
+        assert d.region(n) == b, f"region {n} changed"
 
 
 @case("x86_64", "aarch64")
@@ -1119,6 +1191,8 @@ def handback_floor_cases():
     rec = hb_record(request="recovery")
     img = open(efi("glassine-loader"), "rb").read()
     stub_img = open(efi("glassine-test-kernel"), "rb").read()
+    bad_primary = bytearray(region_table(HB_SIZE, REGIONS))
+    bad_primary[70] ^= 1
     cases = [
         ("hb-missing", dict(loader=False), "header Magic"),
         ("hb-badheader", dict(header=loader_header(img)[:28] + b"\0\0\0\0" + b"\0" * 4064), "header HeaderCrc"),
@@ -1128,25 +1202,47 @@ def handback_floor_cases():
         ("hb-badcrc", dict(loader=stub_img, cfg="stub.answer=badcrc"), "answer Crc"),
         ("hb-unknown", dict(loader=stub_img, cfg="stub.answer=unknown"), "answer UnknownBoot"),
         ("hb-returns", dict(loader=stub_img, cfg="stub.return"), "answer NoData"),
+        ("hb-noloader-region", dict(table=region_table(HB_SIZE, {k: v for k, v in REGIONS.items() if k != "loader"})),
+         None),
     ]
     for name, kw, want in cases:
         d = hb_disk(name, rec, **kw)
         if name == "hb-imagecrc":
-            d.put(HB_IMAGE + len(img) // 2, bytes([img[len(img) // 2] ^ 0xFF]))
+            o = REGIONS["loader"][0] + 4096 + len(img) // 2
+            d.put(o, bytes([img[len(img) // 2] ^ 0xFF]))
+        if name == "hb-noloader-region":
+            # Only the backup names the loader: break it too, so no copy has a `loader`.
+            d.put(HB_SIZE - 4096, region_table(HB_SIZE, {k: v for k, v in REGIONS.items() if k != "loader"}))
+            want = "no loader region"
         _, boot, floor, _ = parent_run(name, d)
         assert boot == "baseline" and floor is not None and floor.startswith(want), (name, boot, floor)
         assert d.record()[1]["request"] == "recovery", f"{name}: the record changed"
-    # A partition never written: the loader runs, finds no record and writes nothing.
-    d = hb_disk("hb-norecord")
+    # No table at all: the parent's floor, before any loader runs.
+    d = hb_disk("hb-notable", rec, table=False)
+    d.put(HB_SIZE - 4096, b"\0" * 4096)
+    _, boot, floor, _ = parent_run("hb-notable", d)
+    assert (boot, floor) == ("baseline", "no region table"), (boot, floor)
+    # A damaged primary: parent and loader both use the backup.
+    d = hb_disk("hb-backup", rec, table=bytes(bad_primary))
+    log, boot, floor, _ = parent_run("hb-backup", d)
+    assert (boot, floor) == ("recovery", None), (boot, floor)
+    assert f"PARENT_TABLE at={HB_SIZE - 4096}" in log and "table=Backup" in log, "the backup wasn't used"
+    assert d.at(0, 4096) == bytes(bad_primary), "a reader wrote the table"
+    # A table with no record region, the loader present: it runs, finds no record and
+    # writes nothing.
+    t = region_table(HB_SIZE, {"loader": REGIONS["loader"]})
+    d = hb_disk("hb-norecord", table=t)
+    d.put(HB_SIZE - 4096, t)
+    before = d.at(0, HB_SIZE)
     log, boot, floor, _ = parent_run("hb-norecord", d)
     assert (boot, floor) == ("baseline", None) and "why=no-record" in log, (boot, floor)
-    assert d.at(0, 98304) == b"\0" * 98304, "a loader with no record wrote"
+    assert d.at(0, HB_SIZE) == before, "a loader with no record wrote"
 
 
 @case("x86_64", "aarch64")
 def handback_probe_reports_the_firmware():
     """012 Scenario 6, FR-016 to FR-019: probe=1 writes a checked report with the GOP
-    modes QEMU offers; the answer is unchanged; probe stays set."""
+    modes QEMU offers and the file systems; the answer is unchanged; probe stays set."""
     d = hb_disk("hb-probe", hb_record(probe="1"))
     log, boot, floor, _ = parent_run("hb-probe", d)
     assert (boot, floor) == ("baseline", None), (boot, floor)
@@ -1166,9 +1262,27 @@ def handback_probe_reports_the_firmware():
     assert any(v.endswith(" graphics-output") for k, v in p if k.startswith("proto")), "GOP not named"
     assert any(k.startswith("log") and "HANDBACK start" in v for k, v in p), "no log lines"
     assert "conout" in keys and "conin" in keys
+    # Raw form: no file system on the boot partition; the ESP has one.
+    assert keys["boot_fs"] == "0" and int(keys["fs_handles"]) >= 1, keys
     seq, r, _ = d.record()
     assert (r["probe"], r["unmarked"]) == ("1", "1"), r
     assert "PROBE_WRITTEN ok=1" in log
+
+
+@case("x86_64", "aarch64")
+def handback_fat_form():
+    """012 FR-008, boot-partition.md "Two forms": on a FAT32 boot partition the firmware
+    offers a file system; the parent loads loader.efi, the loader keeps its record in the
+    slot files and writes the probe as \\glassine\\probe.txt, saying boot_fs=1."""
+    d = hb_disk("hb-fat", hb_record(request="recovery", probe="1"), fat=True)
+    log, boot, floor, _ = parent_run("hb-fat", d)
+    assert (boot, floor) == ("recovery", None), (boot, floor)
+    assert "PARENT_FORM fat" in log and "HANDBACK form=fat" in log, "not the FAT form"
+    seq, r, _ = d.record()
+    assert (seq, r["request"]) == (2, ""), (seq, r)
+    p = d.probe()
+    assert p and dict(p)["boot_fs"] == "1", p and dict(p).get("boot_fs")
+    assert "PROBE_WRITTEN ok=1" in log and "form=fat" in log
 
 
 

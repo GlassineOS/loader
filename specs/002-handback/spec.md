@@ -11,14 +11,16 @@ headless; a read-only firmware probe."
 
 GlassineOS/boot owns the contract:
 
-- [012 — hand-back to a parent bootloader](https://github.com/GlassineOS/boot/blob/main/specs/012-handback/spec.md)
+- [012 — the boot partition on devices with their own bootloader](https://github.com/GlassineOS/boot/blob/main/specs/012-device-boot-partition/spec.md)
   (when the loader runs under a parent, what it decides, the floor);
 - [`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md)
-  (normative: the partition layout, the raw record, the loader image header, the load
+  and [`docs/boot-partition.md`](https://github.com/GlassineOS/boot/blob/main/docs/boot-partition.md)
+  "Two forms", "The raw form" (normative: the region table, the regions, the region
+  write, the loader region's header, the load
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`ca082bc2ef12e7ef83500fdd2c15a4ffbb7ff307`. Where the documents and
+`24b20725d86b99277a08ef750a25d10a018eb946`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -31,7 +33,8 @@ answer. It draws nothing and waits for no key.
 
 **Acceptance**: in QEMU, a stand-in parent (`tests/parent`) starts the loader from the
 partition and reads `boot=baseline` from the exit data; the record's count went up by
-one, in the other slot, read back; the probe area is untouched.
+one, in the other slot, read back; nothing is written for the probe, and the splash
+store's regions are byte-identical.
 
 ### Scenario 2 – Requests and the limit (Priority: P1)
 
@@ -62,13 +65,22 @@ display is in; the answer and the count are as without the probe.
 - **FR-001**: The loader is in hand-back mode exactly when its load options hold the word
   `glassine.handback=1`. Then it uses no display, no splash, no key line, no list, and
   starts no kernel. Other start paths are unchanged.
-- **FR-002**: It opens the block device of its `LoadedImage.DeviceHandle` and refuses a
-  device whose block size doesn't divide 4096 or that is smaller than 4 MiB: then it
-  answers `baseline` without writing.
-- **FR-003**: The record is the raw record of `docs/handback.md`: two 16 KiB slots at 0
-  and 16 KiB, read whole; the same parsing and choice as the FAT record (one code path in
+- **FR-002**: It opens the boot partition of its `LoadedImage.DeviceHandle`. When the
+  firmware offers a file system on it, it uses the FAT form, with the PC's paths and the
+  existing FAT backend. Else the raw form: it refuses a device whose block size doesn't
+  divide 4096, and reads the region table (the primary, else the backup); with neither
+  copy valid the partition holds nothing, and it answers `baseline` without writing. It
+  has no offset of its own: every region comes from the table.
+- **FR-003**: In the raw form the record is the region `record`: two 16 KiB slots at its
+  start, read whole; the same parsing and choice as the FAT record (one code path in
   `core`, `RecordStore` with a FAT and a raw backend). A slot is written whole, flushed,
   read back; the other slot is never touched in the same start.
+- **FR-003a**: The splash store works on both forms through one `SplashStore` trait and
+  one `pick_picture`: on raw, the regions `splash-default`, `splash`, `override`; an
+  image is replaced by the region write (head zeroed, rest, head, read back) and refused
+  when larger than its region; the override is removed by zeroing its head, flushed and
+  read back, before it is drawn. In hand-back mode the loader doesn't call it: a
+  headless start leaves the store as it is (012 FR-015a).
 - **FR-004**: The decisions are 012's (FR-008 to FR-013): no record, nothing written,
   `baseline`; `default` empty, `baseline`; else the set named; at the limit the previous
   set or the recovery; a recovery start is not counted; a request only with both slots
@@ -83,17 +95,20 @@ display is in; the answer and the count are as without the probe.
   probe report.
 - **FR-008**: The probe report (with `probe=1` only) is built from enumeration and
   queries only: handles, protocols per handle, GOP modes through `QueryMode`, console
-  handles and text modes. No `SetMode`, no `Blt`, no register access. It is written to
-  the probe area at 32 KiB (64 KiB), padded with newlines, with its `check=` line, and
-  read back, before the decision. The probe area is apart from both slots, so a failed
-  probe write changes neither the record nor the answer.
+  handles and text modes, and the file systems: `boot_fs` (one on the boot partition),
+  `fs_handles` and one `fs<n>` line per handle with one. No `SetMode`, no `Blt`, no
+  register access. It is written to the region `probe` (region write) or to
+  `\glassine\probe.txt`, padded with newlines to 64 KiB, with its `check=` line, before
+  the decision. A failed probe write changes neither the record nor the answer.
 - **FR-009**: Truncation, when the report doesn't fit: kept log lines first, then the
   extra GOP modes, then the protocol lines; the report says `truncated=1`.
 
 ## Contracts
 
-`docs/handback.md` at the pinned commit. `tests/parent` is the reference parent; it does
-what the ABL patch does (header, image CRC, `LoadImage` from memory with no path,
+`docs/handback.md` and `docs/boot-partition.md` at the pinned commit. `tests/parent` is
+the reference parent; it does what the ABL patch does in the raw form (the region table,
+primary then backup, the region `loader`'s header and image CRC), and loads
+`\EFI\glassine\loader.efi` in the FAT form; then `LoadImage` from memory with the partition's device path,
 `DeviceHandle`, load options, a 30 s watchdog, `StartImage`, the exit data) and prints
 what it would boot.
 
@@ -112,4 +127,9 @@ the parent's code; a GPT change.
 
 - **SC-001**: `make check` passes, with the raw backend's tests (every byte cut in a slot
   write ends in a record that is the old one or the new one).
-- **SC-002**: The hand-back QEMU cases pass on aarch64 and x86-64.
+- **SC-002**: The hand-back QEMU cases pass on aarch64 and x86-64: the raw form (with a
+  damaged primary table, no table, no `loader` region) and the FAT form.
+- **SC-003**: Host tests: the region table damaged at every byte (the backup is used;
+  both damaged, nothing), bad layouts refused, a region write cut at every byte (the old
+  image, none or the new), the override removed before it is drawn and never drawn
+  without a durable removal.
