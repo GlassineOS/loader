@@ -4,6 +4,7 @@
 #   make test            QEMU cases for ARCH (CASES=... to pick)
 #   make test-fw2        the x86_64 QEMU cases again with Alpine's OVMF (another EDK2 release)
 #   make notices         out/release/NOTICES-ARCH.txt: what the loader has compiled in
+#   make gspl-encode-static  gspl-encode for ARCH-unknown-linux-musl (static), and its notices
 IMG      := glassine-loader:build
 KIMG     := glassine-loader:kernel
 ARCH     ?= x86_64
@@ -12,7 +13,7 @@ KVM      := $(shell [ -w /dev/kvm ] && echo --device /dev/kvm --group-add $$(sta
 RUN      := docker run --rm $(KVM) -e QTEST_FW_CODE -e QTEST_FW_VARS --user $(shell id -u):$(shell id -g) -v $(CURDIR):/work -w /work $(IMG)
 EFI      := target/$(TARGET)/release/glassine-loader.efi
 
-.PHONY: all image loader check mkboot payload test test-fw2 notices clean distclean
+.PHONY: all image loader gspl-encode-static check mkboot payload test test-fw2 notices clean distclean
 all: loader
 
 image: .tmp/image.stamp
@@ -56,6 +57,11 @@ test-fw2: loader mkboot payload
 
 notices: loader
 	$(RUN) scripts/notices.sh $(ARCH)
+
+gspl-encode-static: image
+	$(RUN) cargo build --release --locked -p gspl-encode --target $(ARCH)-unknown-linux-musl
+	$(RUN) scripts/notices.sh --tool $(ARCH)
+	@sha256sum target/$(ARCH)-unknown-linux-musl/release/gspl-encode
 
 clean:
 	rm -rf target tests/mkboot/target out .tmp
