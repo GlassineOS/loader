@@ -11,6 +11,7 @@ mod arch;
 mod display;
 mod epdmenu;
 mod fs;
+mod fwbus;
 mod fwgop;
 mod handback;
 mod kernel;

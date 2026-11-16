@@ -56,7 +56,8 @@ and, when the running system asked for it (`request=menu`) or the last start was
 marked healthy, the start menu, picked by touch (with no tap source, the default)
 ([`specs/004-epd-fw-menu`](specs/004-epd-fw-menu/spec.md)). With `probe=1` in the
 record it first writes a read-only report of the firmware (protocols, GOP modes,
-consoles, input devices, file systems) to the partition. The QEMU cases run it under a stand-in parent
+consoles, input devices, file systems, the I2C and GPIO protocols and the touch pins'
+levels) to the partition. The QEMU cases run it under a stand-in parent
 (`tests/parent`) that starts it as the ABL does.
 
 ## Layout
