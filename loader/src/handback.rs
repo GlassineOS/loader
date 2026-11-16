@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The loader under a parent bootloader (GlassineOS/boot spec 012, `docs/handback.md`):
-//! headless, its record on the boot partition of `DeviceHandle` (FAT or raw), its
-//! answer in the UEFI exit data. Everything is opened with `GetProtocol`, never exclusively, so no driver
+//! headless (unless the record asks for the firmware-refreshed display of spec 003 and
+//! the firmware has one), its record on the boot partition of `DeviceHandle` (FAT or
+//! raw), its answer in the UEFI exit data. Everything is opened with `GetProtocol`, never exclusively, so no driver
 //! of the firmware is disconnected for the parent's later use.
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::string::String;
@@ -123,6 +124,21 @@ impl RecordStore for Disk {
     }
 }
 
+impl glassine_loader_core::plan::SplashStore for Disk {
+    fn read_image(&mut self, which: plan::Image, max: u64, deadline_ms: Option<u64>) -> Result<Vec<u8>, ReadErr> {
+        self.raw.read_image(which, max, deadline_ms)
+    }
+    fn has_override(&mut self) -> bool {
+        self.raw.has_override()
+    }
+    fn remove_override(&mut self) -> bool {
+        self.raw.remove_override()
+    }
+    fn now_ms(&mut self) -> u64 {
+        crate::arch::now_ms()
+    }
+}
+
 impl Log for Disk {
     fn log(&mut self, line: core::fmt::Arguments) {
         log::line(line);
@@ -164,8 +180,9 @@ fn open() -> Result<(Store, Handle), &'static str> {
 const PROBE_FILE: &str = "\\glassine\\probe.txt";
 
 /// Decides, writes what the decision writes, and returns to the parent. Never
-/// returns. The splash store is left as it is: a headless start draws nothing, so it
-/// uses up no override (boot spec 012 FR-015a).
+/// returns. Headless, the splash store is left as it is: such a start draws nothing, so
+/// it uses up no override (boot spec 012 FR-015a); with `display=epd-fw` it is used as
+/// on a PC (spec 003).
 pub fn run(opts: Opts) -> ! {
     log!("HANDBACK start serial={} pick_recovery={}", opts.serial as u8, opts.pick_recovery as u8);
     let answer = match open() {
@@ -180,6 +197,9 @@ pub fn run(opts: Opts) -> ! {
                 let ok = d.raw.write_probe(&report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=raw", ok as u8, report.len());
             }
+            if wants_epd(rec.as_ref()) {
+                epd_splash(&mut d);
+            }
             plan::handback(&mut d, rec, opts.pick_recovery)
         }
         Ok((Store::Fat(mut v), dev)) => {
@@ -189,12 +209,55 @@ pub fn run(opts: Opts) -> ! {
                 let ok = Platform::write_file(&mut v, PROBE_FILE, &report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=fat", ok as u8, report.len());
             }
+            if wants_epd(rec.as_ref()) {
+                epd_splash(&mut v);
+            }
             plan::handback(&mut v, rec, opts.pick_recovery)
         }
     };
     let data = answer.exit_data();
     log!("HANDBACK_ANSWER {}", String::from_utf8_lossy(&answer.text()).replace('\n', " "));
     give_back(&data)
+}
+
+/// Whether the record asks for the firmware-refreshed display (`display=epd-fw`).
+fn wants_epd(rec: Option<&glassine_loader_core::record::InUse>) -> bool {
+    rec.is_some_and(|r| r.rec.get("display") == "epd-fw")
+}
+
+/// The splash through the firmware's panel refresh (boot `docs/handback.md`, "A display
+/// through the firmware's refresh"): the override used up and the picture picked as on
+/// a PC, composed in portrait, written and refreshed once, before the answer. With no
+/// such firmware, headless: the store is left as it is. No key line and no list: which
+/// key a person would press at power-on is not defined on such a machine.
+fn epd_splash<S: plan::SplashStore + Log>(store: &mut S) {
+    let mut epd = match crate::display::epdfw::find() {
+        Ok(e) => e,
+        Err(why) => {
+            log!("EPD_FW_NONE {}: headless", why);
+            return;
+        }
+    };
+    log!("EPD_FW {}", epd.describe());
+    let (w, h) = epd.size();
+    let (pic, what) = match plan::pick_picture(store, &[(w, h)]) {
+        plan::Pick::Override(p) => (p, "override"),
+        plan::Pick::Splash(p, n) => (p, n),
+        plan::Pick::LeaveScreen => {
+            log!("SPLASH_DRAWN leave-screen");
+            return;
+        }
+        plan::Pick::Nothing => {
+            log!("SPLASH_DRAWN none");
+            return;
+        }
+    };
+    let mut buf = alloc::vec![0u32; (w as usize) * (h as usize)];
+    glassine_loader_core::gspl::compose(&pic, w, h, &mut buf);
+    drop(pic);
+    let t0 = crate::arch::now_ms();
+    let st = epd.show(&buf);
+    log!("SPLASH_DRAWN {} refresh={:?} in {} ms", what, st, crate::arch::now_ms() - t0);
 }
 
 /// `Exit` with `data` as the exit data, in a buffer from `AllocatePool` that the parent

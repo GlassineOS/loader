@@ -5,6 +5,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+pub mod epdfw;
 mod gop;
 
 /// One display, in its current mode. Pixels are `0x00RRGGBB`, row by row.

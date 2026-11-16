@@ -68,7 +68,8 @@ counts no refresh, no `SetMode`, no `Blt` and no `QueryMode` of a GOP whose Mode
 
 - **FR-001**: The loader is in hand-back mode exactly when its load options hold the word
   `glassine.handback=1`. Then it uses no display, no splash, no key line, no list, and
-  starts no kernel. Other start paths are unchanged.
+  starts no kernel, except the display of spec 003 (`display=epd-fw` and an extended
+  GOP), which draws the splash once. Other start paths are unchanged.
 - **FR-002**: It opens the boot partition of its `LoadedImage.DeviceHandle`. When the
   firmware offers a file system on it, it uses the FAT form, with the PC's paths and the
   existing FAT backend. Else the raw form: it refuses a device whose block size doesn't
