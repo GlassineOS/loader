@@ -194,10 +194,11 @@ pub fn run(opts: Opts) -> ! {
             Answer::new(Boot::Baseline, "no-record")
         }
         Ok((Store::Raw(mut d), dev)) => {
-            let rec = plan::read_record(&mut d);
-            let probe = rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
+            let mut rec = plan::read_record(&mut d);
+            let touch = touch_probe(&mut d, &mut rec);
+            let probe = touch.is_some() || rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
             let write = |d: &mut Disk| {
-                let report = crate::probe::report(Some(dev));
+                let report = crate::probe::report(Some(dev), touch.as_deref().unwrap_or(&[]));
                 let ok = d.raw.write_probe(&report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=raw", ok as u8, report.len());
             };
@@ -213,10 +214,11 @@ pub fn run(opts: Opts) -> ! {
             a
         }
         Ok((Store::Fat(mut v), dev)) => {
-            let rec = plan::read_record(&mut v);
-            let probe = rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
+            let mut rec = plan::read_record(&mut v);
+            let touch = touch_probe(&mut v, &mut rec);
+            let probe = touch.is_some() || rec.as_ref().is_some_and(|r| r.rec.get("probe") == "1");
             let write = |v: &mut crate::fs::Volume| {
-                let report = crate::probe::report(Some(dev));
+                let report = crate::probe::report(Some(dev), touch.as_deref().unwrap_or(&[]));
                 let ok = Platform::write_file(v, PROBE_FILE, &report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=fat", ok as u8, report.len());
             };
@@ -233,6 +235,19 @@ pub fn run(opts: Opts) -> ! {
     let data = answer.exit_data();
     log!("HANDBACK_ANSWER {}", String::from_utf8_lossy(&answer.text()).replace('\n', " "));
     give_back(&data)
+}
+
+/// `touch=probe` (spec 005 FR-004): the key cleared in its own write first, so a
+/// bring-up that hangs inside the firmware doesn't repeat at the next start; then one
+/// bring-up of the touch controller. Its report lines, or `None` without the key. When
+/// the write fails the controller isn't touched.
+fn touch_probe<S: RecordStore + Log>(store: &mut S, rec: &mut Option<InUse>) -> Option<Vec<String>> {
+    let cur = rec.as_mut().filter(|r| r.rec.get("touch") == "probe")?;
+    if !plan::write_changes(store, cur, &[("touch", "")]) {
+        log!("TOUCH_SKIPPED not-written");
+        return Some(alloc::vec![String::from("touch.result=skipped not-written")]);
+    }
+    Some(crate::touch::probe())
 }
 
 /// Whether the record asks for the firmware-refreshed display (`display=epd-fw`).

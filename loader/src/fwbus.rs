@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The firmware's I2C and GPIO protocols (`docs/firmware-i2c-gpio.md`; spec 005): found,
 //! read as raw words and checked before any of their functions is called (FR-001). The
-//! only function called is the GPIO pin read, which configures nothing. Every call is
-//! logged (`TOUCH_GPIO`).
+//! probe calls only the GPIO pin read, which configures nothing; the touch driver also
+//! the GPIO configure and set and the I2C open, read, write and close (spec 005). Every
+//! call is logged (`TOUCH_GPIO`, `TOUCH_I2C`).
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::ffi::c_void;
 use uefi::boot::{self, SearchType};
 use uefi::{Guid, Handle, Status, guid};
 
@@ -132,5 +134,103 @@ impl Gpio {
         let st = unsafe { f(pin_cfg(n, false), &mut level) };
         log!("TOUCH_GPIO read {} -> {:?} level={}", n, st, level);
         if st == Status::SUCCESS { Ok(level) } else { Err(st) }
+    }
+    /// Sets the pin as an output (latching `level` first) or as an input.
+    pub fn configure(&self, n: u32, output: bool) -> Status {
+        if !Self::allowed(n) {
+            return Status::ACCESS_DENIED;
+        }
+        type Cfg = unsafe extern "efiapi" fn(u32, u32) -> Status;
+        let f: Cfg = unsafe { core::mem::transmute(self.word(1) as usize) };
+        let st = unsafe { f(pin_cfg(n, output), 1) };
+        log!("TOUCH_GPIO configure {} {} -> {:?}", n, if output { "out" } else { "in" }, st);
+        st
+    }
+
+    /// Drives an output pin.
+    pub fn set(&self, n: u32, high: bool) -> Status {
+        if !Self::allowed(n) {
+            return Status::ACCESS_DENIED;
+        }
+        type Set = unsafe extern "efiapi" fn(u32, u32) -> Status;
+        let f: Set = unsafe { core::mem::transmute(self.word(4) as usize) };
+        let st = unsafe { f(pin_cfg(n, true), high as u32) };
+        log!("TOUCH_GPIO set {} {} -> {:?}", n, high as u8, st);
+        st
+    }
+}
+
+// ---- the I2C protocol -------------------------------------------------------------------
+
+/// The bus configuration the I2C calls take: clock in kHz, 7-bit address, the address
+/// kind (0: 7-bit), reserved; then zeros.
+#[repr(C)]
+pub struct BusCfg {
+    pub khz: u32,
+    pub address: u32,
+    pub kind: u32,
+    pub reserved: [u32; 5],
+}
+
+/// An I2C protocol that passed its checks.
+pub struct I2c {
+    iface: u64,
+}
+
+/// An open bus.
+pub struct Bus {
+    iface: u64,
+    handle: *mut c_void,
+    cfg: BusCfg,
+}
+
+impl I2c {
+    pub fn new(f: &Found) -> Option<I2c> {
+        f.check.is_ok().then_some(())?;
+        Some(I2c { iface: f.iface? })
+    }
+
+    pub fn open(&self, instance: u32, khz: u32, address: u32) -> Result<Bus, u32> {
+        type Open = unsafe extern "efiapi" fn(u32, *mut *mut c_void) -> u32;
+        let f: Open = unsafe { core::mem::transmute(rd64_at(self.iface, 1) as usize) };
+        let mut h: *mut c_void = core::ptr::null_mut();
+        let st = unsafe { f(instance, &mut h) };
+        log!("TOUCH_I2C open {} -> {} handle={:p}", instance, st, h);
+        if st != 0 || h.is_null() {
+            return Err(if st == 0 { u32::MAX } else { st });
+        }
+        Ok(Bus { iface: self.iface, handle: h, cfg: BusCfg { khz, address, kind: 0, reserved: [0; 5] } })
+    }
+}
+
+fn rd64_at(iface: u64, i: u64) -> u64 {
+    unsafe { rd64(iface + 8 * i) }
+}
+
+impl Bus {
+    /// Reads `buf.len()` bytes after writing the one-byte `offset`. Returns the bytes read.
+    pub fn read(&mut self, offset: u8, buf: &mut [u8], timeout_ms: u32) -> Result<u32, u32> {
+        type Rd = unsafe extern "efiapi" fn(*mut c_void, *const BusCfg, u16, u16, *mut u8, u16, *mut u32, u32) -> u32;
+        let f: Rd = unsafe { core::mem::transmute(rd64_at(self.iface, 2) as usize) };
+        let mut n = 0u32;
+        let st = unsafe { f(self.handle, &self.cfg, offset as u16, 1, buf.as_mut_ptr(), buf.len() as u16, &mut n, timeout_ms.max(1)) };
+        if st != 0 { Err(st) } else { Ok(n) }
+    }
+
+    /// Writes the one-byte `offset`, then `data` (at least one byte).
+    pub fn write(&mut self, offset: u8, data: &[u8], timeout_ms: u32) -> Result<u32, u32> {
+        type Wr = unsafe extern "efiapi" fn(*mut c_void, *const BusCfg, u16, u16, *const u8, u16, *mut u32, u32) -> u32;
+        let f: Wr = unsafe { core::mem::transmute(rd64_at(self.iface, 3) as usize) };
+        let mut n = 0u32;
+        let st = unsafe { f(self.handle, &self.cfg, offset as u16, 1, data.as_ptr(), data.len() as u16, &mut n, timeout_ms.max(1)) };
+        if st != 0 { Err(st) } else { Ok(n) }
+    }
+
+    pub fn close(self) -> u32 {
+        type Close = unsafe extern "efiapi" fn(*mut c_void) -> u32;
+        let f: Close = unsafe { core::mem::transmute(rd64_at(self.iface, 5) as usize) };
+        let st = unsafe { f(self.handle) };
+        log!("TOUCH_I2C close -> {}", st);
+        st
     }
 }

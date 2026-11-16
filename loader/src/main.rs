@@ -17,6 +17,7 @@ mod handback;
 mod kernel;
 mod log;
 mod probe;
+mod touch;
 mod ui;
 mod watchdog;
 

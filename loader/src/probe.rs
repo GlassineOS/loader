@@ -345,8 +345,9 @@ fn firmware_buses(ram: &crate::fwgop::Ram, images: &crate::fwgop::Images, index:
 }
 
 /// The report, as the bytes of the probe report. `boot`: the boot partition's handle
-/// (our `DeviceHandle`), when there is one.
-pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
+/// (our `DeviceHandle`), when there is one; `touch`: the touch driver's lines of a
+/// `touch=probe` start (spec 005 FR-010).
+pub fn report(boot_part: Option<Handle>, touch: &[String]) -> Vec<u8> {
     crate::log!("PROBE start");
     let names = names();
     let name = |g: &Guid| names.iter().find(|(n, _)| n == g).map(|(_, s)| *s).unwrap_or("-");
@@ -485,6 +486,7 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
     }
     tail.extend(input);
     tail.extend(firmware_buses(&ram, &images, &index));
+    tail.extend(touch.iter().cloned());
     tail.extend(qcom_variables());
     let log: Vec<String> = crate::log::kept().into_iter().enumerate().map(|(i, l)| format!("log{}={}", i + 1, l)).collect();
     let r = Report { head, protos, gop, extra_modes, tail, log };
