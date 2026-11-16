@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! A stand-in parent bootloader for the QEMU tests (GlassineOS/boot `docs/handback.md`,
-//! "Starting the loader"). It does what the Note Air's ABL does: finds the hand-back
+//! "Starting the loader"). It does what the Note Air's ABL does: finds the
 //! boot partition, reads the loader (the file in the FAT form; the region `loader`
 //! through the region table, header and image checked, in the raw form), starts it from memory
-//! with no device path, `DeviceHandle` set to the partition and the hand-back load
+//! with the partition's device path, `DeviceHandle` set to the partition and the hand-back load
 //! option, under a 30 s watchdog, and reads the answer from the exit data. It prints, on
 //! the firmware's serial line, what it would boot (`PARENT_BOOT baseline|recovery|set:<id>`)
 //! and why it fell to the baseline (`PARENT_FLOOR <reason>`), then powers off.
@@ -153,10 +153,15 @@ fn hand_back() -> Result<Boot, String> {
     let img = loader_bytes(part)?;
     let bt = unsafe { uefi::table::system_table_raw().unwrap().as_ref().boot_services.as_ref().unwrap() };
 
-    // LoadImage from memory, no device path.
+    // LoadImage from memory, with the boot partition's device path as the image's path
+    // (docs/handback.md step 2): an EDK2 with image verification refuses a buffer with
+    // none (EFI_INVALID_PARAMETER), Secure Boot off or on. The firmware reads nothing
+    // through it.
+    let dpp = get::<DevicePath>(part).map_err(|_| "no device path")?;
+    let dp_ptr = dpp.as_ffi_ptr() as *const uefi_raw::protocol::device_path::DevicePathProtocol;
     let mut child: uefi_raw::Handle = core::ptr::null_mut();
     let st = unsafe {
-        (bt.load_image)(false.into(), boot::image_handle().as_ptr(), core::ptr::null(), img.as_ptr(), img.len(), &mut child)
+        (bt.load_image)(false.into(), boot::image_handle().as_ptr(), dp_ptr, img.as_ptr(), img.len(), &mut child)
     };
     if st.is_error() {
         if st == Status::SECURITY_VIOLATION && !child.is_null() {

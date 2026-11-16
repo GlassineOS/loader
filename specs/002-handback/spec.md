@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`cc8eaf633f5ff33801aef8501d3e0b724c7e57e6`. Where the documents and
+`24b20725d86b99277a08ef750a25d10a018eb946`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -108,7 +108,7 @@ display is in; the answer and the count are as without the probe.
 `docs/handback.md` and `docs/boot-partition.md` at the pinned commit. `tests/parent` is
 the reference parent; it does what the ABL patch does in the raw form (the region table,
 primary then backup, the region `loader`'s header and image CRC), and loads
-`\EFI\glassine\loader.efi` in the FAT form; then `LoadImage` from memory with no path,
+`\EFI\glassine\loader.efi` in the FAT form; then `LoadImage` from memory with the partition's device path,
 `DeviceHandle`, load options, a 30 s watchdog, `StartImage`, the exit data) and prints
 what it would boot.
 
