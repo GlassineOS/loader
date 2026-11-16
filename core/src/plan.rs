@@ -67,6 +67,50 @@ pub trait RecordStore {
     fn write_slot(&mut self, slot: usize, bytes: &[u8]) -> bool;
 }
 
+/// An image of the splash store (011; `docs/boot-partition.md`, "The splash store").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Image {
+    Default,
+    Splash,
+    Override,
+}
+
+/// Where the splash store is: the files on the loader's FAT volume (every [`Platform`]
+/// is one), or three regions of the raw form ([`crate::raw::Raw`]).
+pub trait SplashStore {
+    /// The whole image file, at most `max` bytes; [`ReadErr::Missing`] when there is
+    /// none.
+    fn read_image(&mut self, which: Image, max: u64, deadline_ms: Option<u64>) -> Result<Vec<u8>, ReadErr>;
+    fn has_override(&mut self) -> bool;
+    /// Removes the override durably. `true` only when it is known to be gone.
+    fn remove_override(&mut self) -> bool;
+    fn now_ms(&mut self) -> u64;
+}
+
+impl<P: Platform> SplashStore for P {
+    fn read_image(&mut self, which: Image, max: u64, deadline_ms: Option<u64>) -> Result<Vec<u8>, ReadErr> {
+        self.read(image_path(which), max, deadline_ms)
+    }
+    fn has_override(&mut self) -> bool {
+        self.exists(OVERRIDE)
+    }
+    fn remove_override(&mut self) -> bool {
+        self.remove(OVERRIDE) && !self.exists(OVERRIDE)
+    }
+    fn now_ms(&mut self) -> u64 {
+        Platform::now_ms(self)
+    }
+}
+
+/// The image's path in the FAT form.
+pub fn image_path(which: Image) -> &'static str {
+    match which {
+        Image::Default => DEFAULT_SPLASH,
+        Image::Splash => SPLASH,
+        Image::Override => OVERRIDE,
+    }
+}
+
 /// Where the loader's log lines go.
 pub trait Log {
     fn log(&mut self, line: fmt::Arguments);
@@ -182,9 +226,10 @@ pub enum Pick {
     Nothing,
 }
 
-fn load_image<P: Platform>(p: &mut P, path: &str) -> Option<Kind> {
-    let t0 = p.now_ms();
-    let b = match p.read(path, gspl::MAX_FILE, Some(t0 + IMAGE_MS)) {
+fn load_image<S: SplashStore + Log>(p: &mut S, which: Image) -> Option<Kind> {
+    let path = image_path(which);
+    let t0 = SplashStore::now_ms(p);
+    let b = match p.read_image(which, gspl::MAX_FILE, Some(t0 + IMAGE_MS)) {
         Ok(b) => b,
         Err(ReadErr::Missing) => return None,
         Err(e) => {
@@ -193,7 +238,7 @@ fn load_image<P: Platform>(p: &mut P, path: &str) -> Option<Kind> {
         }
     };
     let k = gspl::parse(&b);
-    let t = p.now_ms() - t0;
+    let t = SplashStore::now_ms(p) - t0;
     match k {
         Ok(_) if t > IMAGE_MS => {
             plog!(p, "IMAGE_SKIPPED {}: time limit ({} ms)", path, t);
@@ -208,11 +253,12 @@ fn load_image<P: Platform>(p: &mut P, path: &str) -> Option<Kind> {
 }
 
 /// Uses up the override and picks the picture (011 FR-002, FR-008, FR-010, FR-012 to
-/// FR-014). `modes`: the current mode of each display the loader owns.
-pub fn pick_picture<P: Platform>(p: &mut P, modes: &[(u32, u32)]) -> Pick {
-    if p.exists(OVERRIDE) {
-        let k = load_image(p, OVERRIDE);
-        if !p.remove(OVERRIDE) || p.exists(OVERRIDE) {
+/// FR-014). `modes`: the current mode of each display the loader owns. Works on either
+/// form of the boot partition.
+pub fn pick_picture<S: SplashStore + Log>(p: &mut S, modes: &[(u32, u32)]) -> Pick {
+    if p.has_override() {
+        let k = load_image(p, Image::Override);
+        if !p.remove_override() {
             plog!(p, "OVERRIDE_NOT_REMOVED: not drawn");
         } else {
             plog!(p, "OVERRIDE_REMOVED");
@@ -231,10 +277,10 @@ pub fn pick_picture<P: Platform>(p: &mut P, modes: &[(u32, u32)]) -> Pick {
     if modes.is_empty() {
         return Pick::Nothing;
     }
-    for (path, name) in [(SPLASH, "splash"), (DEFAULT_SPLASH, "default")] {
-        match load_image(p, path) {
+    for (which, name) in [(Image::Splash, "splash"), (Image::Default, "default")] {
+        match load_image(p, which) {
             Some(Kind::Picture(pic)) => return Pick::Splash(pic, name),
-            Some(Kind::LeaveScreen) => plog!(p, "IMAGE_SKIPPED {}: leave-screen is no splash", path),
+            Some(Kind::LeaveScreen) => plog!(p, "IMAGE_SKIPPED {}: leave-screen is no splash", image_path(which)),
             None => {}
         }
     }

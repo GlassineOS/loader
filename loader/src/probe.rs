@@ -12,6 +12,9 @@ use glassine_loader_core::raw::PROBE_BYTES;
 use glassine_loader_core::sha256_hex;
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::device_path::media::PartitionSignature;
+use uefi::proto::device_path::{DevicePath, DevicePathNodeEnum};
+use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{Guid, Handle, Identify, guid};
 use uefi_raw::protocol::console::{GraphicsOutputProtocol, SimpleTextOutputProtocol};
 
@@ -147,8 +150,26 @@ impl Report {
     }
 }
 
-/// The report, as the bytes of the probe area.
-pub fn report() -> Vec<u8> {
+/// The partition's GPT identity and number, from a handle's device path.
+fn partition_of(h: Handle) -> (String, String) {
+    let params = OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None };
+    if let Ok(dp) = unsafe { boot::open_protocol::<DevicePath>(params, OpenProtocolAttributes::GetProtocol) } {
+        for node in dp.node_iter() {
+            if let Ok(DevicePathNodeEnum::MediaHardDrive(hd)) = node.as_enum() {
+                let id = match hd.partition_signature() {
+                    PartitionSignature::Guid(g) => format!("{g}"),
+                    _ => "-".into(),
+                };
+                return (id, format!("{}", hd.partition_number()));
+            }
+        }
+    }
+    ("-".into(), "-".into())
+}
+
+/// The report, as the bytes of the probe report. `boot`: the boot partition's handle
+/// (our `DeviceHandle`), when there is one.
+pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
     crate::log!("PROBE start");
     let names = names();
     let name = |g: &Guid| names.iter().find(|(n, _)| n == g).map(|(_, s)| *s).unwrap_or("-");
@@ -170,6 +191,18 @@ pub fn report() -> Vec<u8> {
         format!("handles={}", all.len()),
         format!("protocols={}", counts.len()),
     ];
+    // File systems: on the boot partition (which form the loader uses) and on any handle
+    // (whether the firmware has a file system driver at all).
+    let fss: Vec<Handle> = boot::locate_handle_buffer(SearchType::ByProtocol(&SimpleFileSystem::GUID))
+        .map(|b| b.iter().copied().collect())
+        .unwrap_or_default();
+    let mut head = head;
+    head.push(format!("boot_fs={}", boot_part.is_some_and(|b| fss.contains(&b)) as u8));
+    head.push(format!("fs_handles={}", fss.len()));
+    for (i, &h) in fss.iter().enumerate() {
+        let (id, num) = partition_of(h);
+        head.push(format!("fs{}=handle={} part={} {}", i + 1, index(h).map_or("-".into(), |x| format!("{x}")), id, num));
+    }
     let protos: Vec<String> =
         counts.iter().enumerate().map(|(i, (s, (g, n)))| format!("proto{}={} {} {}", i + 1, s, n, name(g))).collect();
 
