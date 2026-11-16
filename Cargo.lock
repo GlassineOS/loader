@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "glassine-loader-core",
  "uefi",
@@ -79,14 +79,15 @@ dependencies = [
 
 [[package]]
 name = "glassine-loader-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "lz4_flex",
  "sha2",
 ]
 
 [[package]]
 name = "glassine-test-kernel"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "glassine-loader-core",
  "sha2",
@@ -96,11 +97,18 @@ dependencies = [
 
 [[package]]
 name = "glassine-test-parent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "glassine-loader-core",
  "uefi",
  "uefi-raw",
+]
+
+[[package]]
+name = "gspl-encode"
+version = "0.2.0"
+dependencies = [
+ "glassine-loader-core",
 ]
 
 [[package]]
@@ -114,6 +122,12 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
 
 [[package]]
 name = "proc-macro2"

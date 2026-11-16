@@ -29,6 +29,7 @@ from PIL import Image  # noqa: E402
 
 OUT = os.path.join(ROOT, "out", "test")
 MKBOOT = os.path.join(ROOT, "tests", "mkboot", "target", "release", "glassine-test-mkboot")
+GSPL_ENCODE = os.path.join(ROOT, "target", "release", "gspl-encode")
 PAYLOAD = os.path.join(ROOT, "out", "payload")
 W, H = 1280, 800
 SECTOR = 512
@@ -458,6 +459,27 @@ def assert_hint_only(frame, want, what):
 def assert_centred_box(frame, want, what):
     n, box = diff(frame, want)
     assert n > 0 and box[0] > 200 and box[2] < W - 200, f"{what}: nothing drawn in the centre: {box}"
+
+
+def luma(p):
+    """boot-partition.md, "Pixel layouts": a writer's grey of a colour, drawn as grey."""
+    r, g, b = p >> 16, (p >> 8) & 255, p & 255
+    y = (77 * r + 150 * g + 29 * b + 128) >> 8
+    return y * 0x010101
+
+
+def encode2(px, w, h, mode, bg, layout, compression="best", filt=None):
+    """A format 2 image, written by the writers' own tool (tools/gspl-encode)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        src, out = os.path.join(t, "in.ppm"), os.path.join(t, "out.gspl")
+        with open(src, "wb") as f:
+            f.write(b"P6\n%d %d\n255\n" % (w, h))
+            f.write(b"".join(bytes(((p >> 16) & 255, (p >> 8) & 255, p & 255)) for p in px))
+        args = [GSPL_ENCODE, "--layout", layout, "--compression", compression, "--mode", f"{mode[0]}x{mode[1]}",
+                "--bg", f"{bg:06x}"] + (["--filter", filt] if filt else []) + [src, out]
+        run(*args)
+        return open(out, "rb").read()
 
 
 SPL = SPLASH = WANT_SPLASH = OVR = OVERRIDE = WANT_OVERRIDE = DEFAULT = WANT_DEFAULT = None
@@ -976,6 +998,72 @@ def linux_kernel_with_a_large_initramfs():
     vm.finish(300)
     assert m.group(1).strip() == d.info["cmdline"], m.group(1)
     assert "/etc/glassine-boot/board.conf: " + BOARD.decode().strip() in vm.log(), "board archive not in the initramfs"
+
+
+FORMAT2 = [(l, c, f) for l in ("grey8", "rgb888", "bgrx") for c in ("none", "rle", "lz4") for f in ("none", "up")]
+
+
+@case()
+def splash_format_2_every_layout_compression_and_filter():
+    """boot-partition.md, "The image format" (format 2): a splash of every pixel layout,
+    compression and filter is drawn pixel for pixel (grey as grey), through the start."""
+    d = installed("format2")
+    for layout, comp, filt in FORMAT2:
+        name = f"format2-{layout}-{comp}-{filt}"
+        img = encode2(SPL, W, H, (W, H), 0x102040, layout, comp, filt)
+        assert (img[8], img[28], img[36], img[38]) == (2, ("bgrx", "rgb888", "grey8").index(layout) + 1,
+                                                       ("none", "rle", "lz4").index(comp), ("none", "up").index(filt)), name
+        d.put("glassine/splash/splash.gspl", img)
+        want = [luma(p) for p in SPL] if layout == "grey8" else SPL
+        vm = VM(name, d)
+        vm.wait("SPLASH_DRAWN splash")
+        vm.wait("HINT_HIDDEN")
+        assert_exact(vm.shot("splash"), want, name)
+        stub(vm)
+        vm.finish()
+
+
+@case("x86_64", "aarch64")
+def splash_format_2_grey_panel_picture_scaled():
+    """011 FR-007 with format 2: a grey8 picture of the Note Air's 1404x1872 panel (LZ4 and
+    the filter, as the writers' best) on another mode: scaled, centred on its background."""
+    w, h = 1404, 1872
+    px = [0xF4F2EC if (x // 117 + y // 156) % 2 else 0x202020 for y in range(h) for x in range(w)]
+    img = encode2(px, w, h, (w, h), 0x808080, "grey8")
+    assert (img[8], img[28]) == (2, 3)
+    d = installed("format2-scaled")
+    d.put("glassine/splash/splash.gspl", img)
+    vm = VM("format2-scaled", d)
+    vm.wait("SPLASH_DRAWN splash")
+    vm.wait("HINT_HIDDEN")
+    assert_exact(vm.shot("splash"), compose([luma(p) for p in px], w, h, (w, h), 0x808080), "grey8, scaled")
+    stub(vm)
+    vm.finish()
+
+
+@case()
+def splash_format_2_cut_or_unknown_is_skipped():
+    """011 SC-005 with format 2: a cut LZ4 stream (its lengths and CRCs made to match)
+    and an unknown compression are skipped: the default splash is drawn."""
+    import struct
+    good = encode2(SPL, W, H, (W, H), 0x102040, "rgb888", "lz4")
+    cut = bytearray(good[:64 + (len(good) - 64) // 2])
+    cut[40:48] = struct.pack("<Q", len(cut) - 64)
+    cut[48:52] = struct.pack("<I", crc32(bytes(cut[64:])))
+    cut[52:56] = struct.pack("<I", crc32(bytes(cut[:52])))
+    unknown = bytearray(good)
+    unknown[36] = 3
+    unknown[52:56] = struct.pack("<I", crc32(bytes(unknown[:52])))
+    d = installed("format2-bad")
+    for name, img, why in (("cut", cut, "Decode"), ("unknown", unknown, "Encoding")):
+        d.put("glassine/splash/splash.gspl", bytes(img))
+        vm = VM(f"format2-bad-{name}", d)
+        vm.wait("SPLASH_DRAWN default")
+        vm.wait("HINT_HIDDEN")
+        assert_exact(vm.shot("splash"), WANT_DEFAULT, f"the default splash, {name}")
+        stub(vm)
+        vm.finish()
+        assert re.search(r"IMAGE_SKIPPED [^\r\n]*splash\.gspl: " + why, vm.log()), f"{name}: no skip logged"
 
 
 # ---------------------------------------------------------------- under a parent (boot spec 012)
