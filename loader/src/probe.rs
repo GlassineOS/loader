@@ -6,8 +6,10 @@
 //! word (capped at a checked `MaxMode`) and, on an extended graphics output only, its
 //! `GetFrameBuffer`. The console's mode is read from its fields, and the input devices'
 //! (absolute and simple pointers, text inputs) Modes and identities from memory: none of
-//! their functions (`Reset`, `GetState`, `ReadKeyStroke`) is called. No mode is set,
-//! nothing is drawn or refreshed, no hardware is touched.
+//! their functions (`Reset`, `GetState`, `ReadKeyStroke`) is called. The firmware's I2C
+//! and GPIO protocols are read from memory, and the touch controller's four pins through
+//! the GPIO pin read, which configures nothing (spec 005 FR-003). No mode is set,
+//! nothing is drawn or refreshed, no bus is opened and no pin driven.
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -322,6 +324,26 @@ fn input_devices(
     out
 }
 
+/// The firmware's I2C and GPIO protocols (spec 005 FR-003): their interfaces read from
+/// memory and checked; after the GPIO protocol passes, the touch controller's four pins
+/// through its pin read, which configures nothing. No other function of either is called.
+fn firmware_buses(ram: &crate::fwgop::Ram, images: &crate::fwgop::Images, index: &dyn Fn(Handle) -> Option<usize>) -> Vec<String> {
+    use crate::fwbus::{self, GPIO, I2C};
+    let i2c = fwbus::find(I2C, ram, images);
+    let gpio = fwbus::find(GPIO, ram, images);
+    let mut out = fwbus::report_lines(I2C, i2c.as_ref(), index, images);
+    out.extend(fwbus::report_lines(GPIO, gpio.as_ref(), index, images));
+    if let Some(g) = gpio.as_ref().and_then(fwbus::Gpio::new) {
+        for n in fwbus::TOUCH_PINS {
+            out.push(match g.read(n) {
+                Ok(l) => format!("gpio.pin{n}={l}"),
+                Err(st) => format!("gpio.pin{n}=error {st:?}"),
+            });
+        }
+    }
+    out
+}
+
 /// The report, as the bytes of the probe report. `boot`: the boot partition's handle
 /// (our `DeviceHandle`), when there is one.
 pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
@@ -462,6 +484,7 @@ pub fn report(boot_part: Option<Handle>) -> Vec<u8> {
         }
     }
     tail.extend(input);
+    tail.extend(firmware_buses(&ram, &images, &index));
     tail.extend(qcom_variables());
     let log: Vec<String> = crate::log::kept().into_iter().enumerate().map(|(i, l)| format!("log{}={}", i + 1, l)).collect();
     let r = Report { head, protos, gop, extra_modes, tail, log };

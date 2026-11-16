@@ -115,11 +115,14 @@ handle.
   every handle with an absolute pointer, a simple pointer or a simple text input, its
   identity (index, whether it is the console-in handle, device path, protocols) and a
   pointer's Mode (the absolute pointer's `AbsoluteMinX` … `AbsoluteMaxZ` and
-  `Attributes`), read from memory where the memory map says RAM. No `SetMode`, no `Blt`,
-  no refresh, no input device's `Reset`, `GetState` or `ReadKeyStroke`, no register
-  access. It is written to the region `probe` (region write) or to
-  `\glassine\probe.txt`, padded with newlines to 64 KiB, with its `check=` line, before
-  the decision. A failed probe write changes neither the record nor the answer.
+  `Attributes`), read from memory where the memory map says RAM; the firmware's I2C and
+  GPIO protocols' interfaces, read from memory and checked, and the touch controller's
+  four pins through the GPIO protocol's pin read (spec 005 FR-003). No `SetMode`, no
+  `Blt`, no refresh, no input device's `Reset`, `GetState` or `ReadKeyStroke`, no bus
+  opened, no pin configured or set, no other register access. It is written to the
+  region `probe` (region write) or to `\glassine\probe.txt`, padded with newlines to
+  64 KiB, with its `check=` line, before the decision. A failed probe write changes
+  neither the record nor the answer.
 - **FR-008a**: A graphics output is never read through a standard GOP type, whose Mode
   is the word at +0x18: on the extended interface of boot's `docs/handback.md`
   ("Graphics outputs read raw") that word is code, on its console splitter it is NULL.
