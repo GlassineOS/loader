@@ -197,10 +197,7 @@ pub fn run(opts: Opts) -> ! {
                 let ok = d.raw.write_probe(&report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=raw", ok as u8, report.len());
             }
-            if wants_epd(rec.as_ref()) {
-                epd_splash(&mut d);
-            }
-            plan::handback(&mut d, rec, opts.pick_recovery)
+            decide_then_draw(&mut d, rec, opts.pick_recovery)
         }
         Ok((Store::Fat(mut v), dev)) => {
             let rec = plan::read_record(&mut v);
@@ -209,10 +206,7 @@ pub fn run(opts: Opts) -> ! {
                 let ok = Platform::write_file(&mut v, PROBE_FILE, &report);
                 log!("PROBE_WRITTEN ok={} bytes={} form=fat", ok as u8, report.len());
             }
-            if wants_epd(rec.as_ref()) {
-                epd_splash(&mut v);
-            }
-            plan::handback(&mut v, rec, opts.pick_recovery)
+            decide_then_draw(&mut v, rec, opts.pick_recovery)
         }
     };
     let data = answer.exit_data();
@@ -225,9 +219,30 @@ fn wants_epd(rec: Option<&glassine_loader_core::record::InUse>) -> bool {
     rec.is_some_and(|r| r.rec.get("display") == "epd-fw")
 }
 
+/// The decision and its writes, then, with `display=epd-fw`, the draw (spec 003 FR-009):
+/// the count is durable before the refresh runs, and a start after an unmarked one
+/// doesn't draw.
+fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(
+    store: &mut S,
+    rec: Option<glassine_loader_core::record::InUse>,
+    pick_recovery: bool,
+) -> Answer {
+    let want = wants_epd(rec.as_ref());
+    let entry = rec.as_ref().map(plan::unmarked);
+    let answer = plan::handback(store, rec, pick_recovery);
+    if want {
+        match plan::epd_draw_allowed(entry, &answer) {
+            Ok(()) => epd_splash(store),
+            Err(why) => log!("EPD_FW_SKIPPED {}", why),
+        }
+    }
+    answer
+}
+
 /// The splash through the firmware's panel refresh (boot `docs/handback.md`, "A display
 /// through the firmware's refresh"): the override used up and the picture picked as on
-/// a PC, composed in portrait, written and refreshed once, before the answer. With no
+/// a PC, composed in portrait, written and refreshed once, after the record's write and
+/// before the answer. With no
 /// such firmware, headless: the store is left as it is. No key line and no list: which
 /// key a person would press at power-on is not defined on such a machine.
 fn epd_splash<S: plan::SplashStore + Log>(store: &mut S) {
