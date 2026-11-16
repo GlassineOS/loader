@@ -356,7 +356,6 @@ pub fn get_frame_buffer(g: &Gop) -> Option<(Status, u64, u32, u32)> {
 /// The panel refresh (+0x18), for an [`Layout::Extended`] GOP only. Every argument is
 /// passed zero-extended to 64 bits, so a callee that reads 32 bits reads the same.
 /// The probe never calls this.
-#[allow(dead_code)]
 pub fn refresh(g: &Gop, fb: u64, x: u32, y: u32, w: u32, h: u32, stride: u32) -> Option<Status> {
     if g.layout != Layout::Extended {
         return None;
