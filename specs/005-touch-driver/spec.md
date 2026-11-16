@@ -1,0 +1,167 @@
+# Feature Specification: A touch driver of the loader's own for the Note Air
+
+**Feature Branch**: `005-touch-driver`
+**Created**: 2026-11-16
+**Status**: Draft
+**Input**: "Give the loader its own touch driver for the Boox Note Air's touch controller.
+It talks to the controller through the firmware's own I2C and GPIO protocols, so the
+loader's tap menu works on the device."
+
+## Context
+
+GlassineOS/boot owns the contract: `docs/handback.md`, "The loader's touch driver", the
+key `touch` ("The loader record under a parent") and the probe report's `i2c`, `gpio`,
+`gpio.pin<n>` and `touch.*` lines ("The probe report"), at the commit spec 002 pins.
+Where they and this spec differ, they win and this spec is corrected.
+
+The Note Air's firmware binds no touch driver: a probe run listed only the console
+splitter's absolute pointer, so the start menu (spec 004) has no tap source there and
+logs `MENU_NO_INPUT`. The firmware does install the two protocols its own display driver
+uses: an I2C protocol (`b27ae8b1-3e10-4d07-ab5c-eb9a6dc6fa8f`) and a GPIO protocol
+(`ad9aec18-7bf0-4809-9e96-3012309f3df7`), one handle each.
+[`docs/firmware-i2c-gpio.md`](../../docs/firmware-i2c-gpio.md) describes their
+interfaces in this project's own words.
+
+The controller is a Parade/Cypress cyttsp5 (the protocol of Linux's
+`drivers/input/touchscreen/cyttsp5.c`): I2C address 0x24 at 100 kHz on the bus at
+`0xc178000` (the firmware's I2C instance 3; the stock and mainline device trees agree;
+an older note naming `0xc1b5000` is wrong), GPIO 61 its 3.3 V switch, 62 its 1.8 V
+switch, 66 its reset (active low), 67 its interrupt (level, low); coordinates 0–1871 ×
+0–1403, landscape.
+
+## User scenarios
+
+### Scenario 1 – What the firmware offers, read only (Priority: P1)
+
+With `probe=1` the report names both protocols, their interface words, which loaded
+image each function word points into, and whether they pass the loader's checks; after
+the GPIO protocol passes, the levels of the four touch pins from its pin read. Nothing
+is configured: no bus opened, no pin driven.
+
+**Acceptance**: QEMU under the stand-in parent: without the stand-in protocols the
+report says `i2c=none` and `gpio=none`; with them (`parent.faketouch=1`) it gives the
+words, `check=ok` and the four pin levels, and the stand-in counts no call but the pin
+reads (no open, no configure, no set).
+
+### Scenario 2 – One bring-up, reported (Priority: P1)
+
+The person sets `touch=probe`. At the next start the loader clears the key in its own
+write, then powers the controller, resets it, reads its HID descriptor and system
+information, writes them into the probe report, powers the controller down and answers
+as without the key.
+
+**Acceptance**: QEMU with the stand-in protocols and a scripted cyttsp5: the report
+holds the descriptor and the system information; the stand-in's GPIO log shows the
+power-up order, then the power-down; the record after the start has `touch` empty and
+the count and answer of a start without it.
+
+### Scenario 3 – A bring-up that fails or hangs (Priority: P1)
+
+Any step can fail: no protocol, a check that fails, the record write, the bus open, no
+answer from the controller, a wrong descriptor. The bring-up ends there, logged, the
+controller powered down when the loader powered it, and the start goes on. A firmware
+call that never returns is a watchdog reset; the next start finds `touch` already
+cleared and doesn't try again.
+
+**Acceptance**: QEMU cases with the stand-in failing at each step; with a stand-in
+whose I2C read never returns: the machine resets, the next start makes no I2C or GPIO
+call and answers.
+
+### Scenario 4 – Taps in the start menu (Priority: P1)
+
+With `touch=on` and a start that opens the menu (004), the loader's driver is the tap
+source: brought up after the menu write, polled while the menu is open, powered down
+when it closes. A tap at an entry picks it.
+
+**Acceptance**: QEMU with `parent.faketouch=1` and a script of touch reports: a tap at
+each entry's centre gives that entry's answer and record; "More" and "Back" work; the
+controller is powered down before the answer.
+
+## Requirements
+
+### The protocols (all stages)
+
+- **FR-001**: A protocol is used only after its checks pass: its interface's words are
+  RAM (the memory map), the first word is the revision this loader knows (I2C `0x10000`,
+  GPIO `1`) and every function word points into one and the same loaded image. Else the
+  driver doesn't exist at this start, logged.
+- **FR-002**: The pin configuration the loader uses is only the plain GPIO function,
+  no pull, the lowest drive, as an output or an input; no other GPIO than 61, 62, 66, 67
+  is configured, read or set.
+
+### Identification (`probe=1`)
+
+- **FR-003**: The report's `i2c`, `i2c.words`, `i2c.in`, `i2c.check`, `gpio`,
+  `gpio.words`, `gpio.in`, `gpio.check` lines are read from memory; `gpio.pin61`,
+  `gpio.pin62`, `gpio.pin66`, `gpio.pin67` come from the pin read, called only after
+  `gpio.check=ok`. No other function of either protocol is called by the probe.
+
+### The bring-up (`touch=probe`)
+
+- **FR-004**: Before its first GPIO or I2C call the loader writes the record with `touch`
+  cleared; when the write fails the bring-up doesn't run (`TOUCH_SKIPPED not-written`).
+- **FR-005**: The sequence: read the four pins (the state found; `touch.found`); when
+  61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
+  level set, configured as an output, its level set again); reset low, at least 1 ms,
+  high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); read the
+  input register until it is empty (length 0 or 2); the bootloader's launch-app command
+  (its failure logged, not fatal); the HID descriptor (register 0x0001; 30 bytes,
+  version 0x0100, `touch.hid`, `touch.desc`); `GET_SYSINFO` (asked up to 5 times while
+  the answer is an error, empty or shorter than 49 bytes, `touch.sysinfo`,
+  `touch.res`); close the bus.
+- **FR-006**: The wire bytes are mainline's: a command is written as one write whose
+  first byte is the register's low byte and whose data starts with its high byte; a
+  report is read as a read of register 0x03 (one byte), first two bytes (the length),
+  then the length. A length of 0 or 2 is no report. The interrupt pin's level is logged
+  as a hint only.
+- **FR-007**: One deadline: 3 s from the first GPIO call. Every wait and retry ends at
+  it and each I2C call's timeout is at most 100 ms and never past it. Polls every 5 ms.
+- **FR-008**: Power down when the loader powered the controller: reset low, 62 low, 61
+  low; also after a failure. Found powered: the power pins are left alone, reset ends
+  high.
+- **FR-009**: Every GPIO and I2C call is logged with its arguments and status (`TOUCH_GPIO`,
+  `TOUCH_I2C`); the result is one line `touch.result=ok` or `touch.result=failed <step>`.
+- **FR-010**: The probe report is written at a `touch=probe` start (with or without
+  `probe=1`), after the bring-up.
+
+### The tap source (`touch=on`)
+
+- **FR-011**: With `touch=on` and both protocols passing FR-001, the driver is the
+  start menu's tap source (004 FR-010), offered before the menu write without touching
+  hardware; its bring-up (FR-005 without the report, FR-007, FR-008 rules) runs at its
+  first poll, which is after the menu write.
+- **FR-012**: A poll reads one report (FR-006) and gives the touch as pressed when it
+  holds a contact whose event is not lift-off, at the first such contact's position, and
+  released when it holds none; nothing when no report is pending. Polls never wait.
+- **FR-013**: The mapping: the controller's X along the panel's native x, its Y along
+  native y flipped, in one constant (unverified on hardware; the lab's desktop
+  calibration gives it); ranges from the system information's resolution, else 1872 ×
+  1404; then to portrait by 004's mapping.
+- **FR-014**: The source logs presses and releases (raw and portrait), not polls. A
+  failed bring-up or a failed read ends the source (no more taps), logged.
+- **FR-015**: When the menu closes the controller is powered down (FR-008).
+
+## Device scope and risk
+
+Unverified on hardware, each checked by a device run with the person's go:
+
+- whether `open(3)` succeeds after the firmware's start, and the timeout's unit
+  (milliseconds, from how the firmware passes it on);
+- whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
+  runs (the loader makes no PMIC call);
+- whether an output pin reads back its driven level;
+- whether a read of the input register with no report pending gives length 0 or 2;
+- the controller's timing after reset within the deadline;
+- the touch axes relative to the loader's drawing.
+
+## Out of scope
+
+Interrupts; multi-touch, gestures, the pen; any PMIC or clock call; touch on a PC.
+
+## Success criteria
+
+- **SC-001**: QEMU cases of Scenarios 1–4 on aarch64 and x86-64 (the stand-in protocols
+  are installed by the parent on both).
+- **SC-002**: Host tests: the report parser, the mapping, the command bytes.
+- **SC-003**: The PC path and the cases of 001–004 are unchanged.
+- **SC-004**: The loader image stays below the loader region's 3 MiB less 4096 bytes.
