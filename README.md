@@ -78,14 +78,28 @@ make clean                 # target/, out/
 - The Linux case boots Alpine `linux-lts` with a busybox initramfs (`make payload`,
   fetched, never committed).
 
+## Releases
+
+A tag `v<version>` (the workspace's version in `Cargo.toml`) makes a GitHub Release
+(`.github/workflows/release.yml`): `glassine-loader-x86_64.efi` and
+`glassine-loader-aarch64.efi`, `SHA256SUMS`, and `NOTICES-<arch>.txt` with the licenses
+of what each binary has compiled in (`make notices`). Each binary is built twice on
+separate runners and the two must match byte for byte; the released one is the one the
+QEMU cases ran. A 0.x version is a prerelease. A release is never replaced, since
+GlassineOS/images pins its files by SHA-256 (`targets/uefi-pc/release.conf`): a change
+is a new version. The binaries are not signed (Secure Boot off).
+
+To cut one: raise `version` in `Cargo.toml` by pull request, merge, then
+`git tag v<version> <merge commit> && git push origin v<version>`.
+
 ## License
 
 GPL-2.0-or-later (see `LICENSE`).
 
 - LVGL (MIT) is fetched, not committed. Compiled in: LVGL core, its TLSF allocator
   (BSD-3-Clause) and the built-in font `lv_font_montserrat_20`, converted by LVGL from
-  Montserrat and Font Awesome 5 symbols (both SIL OFL 1.1 upstream; a release should
-  carry the OFL notice).
+  Montserrat and Font Awesome 5 symbols (both SIL OFL 1.1 upstream; a release carries
+  the OFL notices in `NOTICES-<arch>.txt`).
 - Crates: `uefi`, `uefi-raw`, `sha2` (MIT OR Apache-2.0).
 - `tests/golden/pc-boot/` is copied from GlassineOS/installer (GPL-2.0-or-later).
 - Test only, never committed or shipped: OVMF and AAVMF (Debian `ovmf`,

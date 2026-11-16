@@ -2,6 +2,7 @@
 #   make                 the loader and the test kernel for ARCH (x86_64 or aarch64)
 #   make check           host tests of the core
 #   make test            QEMU cases for ARCH (CASES=... to pick)
+#   make notices         out/release/NOTICES-ARCH.txt: what the loader has compiled in
 IMG      := glassine-loader:build
 KIMG     := glassine-loader:kernel
 ARCH     ?= x86_64
@@ -10,7 +11,7 @@ KVM      := $(shell [ -w /dev/kvm ] && echo --device /dev/kvm --group-add $$(sta
 RUN      := docker run --rm $(KVM) --user $(shell id -u):$(shell id -g) -v $(CURDIR):/work -w /work $(IMG)
 EFI      := target/$(TARGET)/release/glassine-loader.efi
 
-.PHONY: all image loader check mkboot payload test clean distclean
+.PHONY: all image loader check mkboot payload test notices clean distclean
 all: loader
 
 image: .tmp/image.stamp
@@ -42,6 +43,9 @@ out/payload/vmlinuz: image scripts/kernel-payload.sh initramfs/init
 
 test: loader mkboot $(if $(filter x86_64,$(ARCH)),payload)
 	$(RUN) python3 -I tests/qemu/run.py --arch $(ARCH) $(CASES)
+
+notices: loader
+	$(RUN) scripts/notices.sh $(ARCH)
 
 clean:
 	rm -rf target tests/mkboot/target out .tmp
