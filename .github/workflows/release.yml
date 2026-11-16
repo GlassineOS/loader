@@ -1,0 +1,132 @@
+# A release of the loader, on a tag v<version> (the workspace's version in Cargo.toml):
+# glassine-loader.efi for x86_64 and aarch64, each built twice on separate runners from a
+# clean checkout and compared byte for byte (the PE files carry no timestamp:
+# .cargo/config.toml), the first build run through the QEMU cases (make test) and
+# released, with SHA256SUMS and the notices of what it has compiled in
+# (scripts/notices.sh). A 0.x version or one with a suffix is a prerelease. An existing
+# release is never replaced: other repositories pin its files by SHA-256.
+# Pull requests that touch the build run everything but the release.
+name: release
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: [.github/workflows/release.yml, scripts/**, Makefile, docker/**, Cargo.lock, Cargo.toml, .cargo/**, rust-toolchain.toml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    name: host tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check
+  build:
+    name: build and test ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM for the runner's user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: make loader ARCH=${{ matrix.arch }}
+      - name: the binary as built, before the tests
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.arch }}-unknown-uefi/release/glassine-loader.efi dist/glassine-loader-${{ matrix.arch }}.efi
+      - run: make test ARCH=${{ matrix.arch }}
+      - name: the tests ran the same binary
+        run: cmp target/${{ matrix.arch }}-unknown-uefi/release/glassine-loader.efi dist/glassine-loader-${{ matrix.arch }}.efi
+      - run: make notices ARCH=${{ matrix.arch }} && cp out/release/NOTICES-${{ matrix.arch }}.txt dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loader-${{ matrix.arch }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.arch }}
+          path: |
+            out/test/*/*.png
+            out/test/*/serial.log
+            out/test/results-*.json
+          retention-days: 14
+  rebuild:
+    name: second build ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - run: make loader ARCH=${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebuild-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}-unknown-uefi/release/glassine-loader.efi
+          retention-days: 7
+          if-no-files-found: error
+  reproducible:
+    name: both builds match
+    needs: [build, rebuild]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: a
+      - run: |
+          for arch in x86_64 aarch64; do
+            sha256sum "a/loader-$arch/glassine-loader-$arch.efi" "a/rebuild-$arch/glassine-loader.efi"
+            cmp "a/loader-$arch/glassine-loader-$arch.efi" "a/rebuild-$arch/glassine-loader.efi" \
+              || { echo "::error::$arch: the two builds differ"; exit 1; }
+          done
+  release:
+    needs: [host, reproducible]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: loader-*
+          merge-multiple: true
+          path: dist
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ "$TAG" = "v$ver" ] || { echo "::error::tag $TAG, but Cargo.toml's version is $ver"; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG is released already; it is never replaced (raise the version)"; exit 1
+          fi
+          pre=''
+          case $ver in 0.*|*-*) pre=--prerelease ;; esac
+          cd dist
+          sha256sum glassine-loader-x86_64.efi glassine-loader-aarch64.efi > SHA256SUMS
+          cat SHA256SUMS
+          cat > ../notes.md <<EOF
+          The GlassineOS loader $ver for UEFI PCs, built from $GITHUB_SHA by this repository's release workflow.
+
+          - \`glassine-loader-x86_64.efi\`: x86-64 UEFI (the file a GlassineOS PC release installs as \`\\EFI\\glassine\\loader.efi\`).
+          - \`glassine-loader-aarch64.efi\`: arm64 UEFI.
+          - \`SHA256SUMS\`, and \`NOTICES-<arch>.txt\`: the licenses of what each binary has compiled in (LVGL, TLSF, printf, the Montserrat and Font Awesome fonts under the SIL OFL 1.1, the Rust crates).
+
+          Each binary was built twice on separate machines and both builds matched byte for byte; the released one passed the repository's QEMU cases (OVMF on x86-64; AAVMF on arm64). It is not signed: Secure Boot must be off.
+
+          **Not reviewed, and never run on a real PC.** GlassineOS is a hobby project, written largely with AI coding agents and not reviewed by subsystem experts. This loader has been tested only in QEMU with OVMF/AAVMF. Running it on real hardware is at your own risk.
+          EOF
+          gh release create "$TAG" --verify-tag $pre --title "glassine-loader $ver" --notes-file ../notes.md \
+            glassine-loader-x86_64.efi glassine-loader-aarch64.efi SHA256SUMS NOTICES-x86_64.txt NOTICES-aarch64.txt
