@@ -1,0 +1,19 @@
+[package]
+name = "glassine-loader"
+description = "The GlassineOS loader of UEFI PCs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "glassine-loader"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+glassine-loader-core = { path = "../core" }
+uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
+uefi-raw = "=0.17.0"

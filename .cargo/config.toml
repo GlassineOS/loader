@@ -1,0 +1,6 @@
+# Reproducible PE files: no timestamp in the COFF header.
+[target.x86_64-unknown-uefi]
+rustflags = ["-C", "link-arg=/Brepro"]
+
+[target.aarch64-unknown-uefi]
+rustflags = ["-C", "link-arg=/Brepro"]

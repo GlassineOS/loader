@@ -9,3 +9,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make check
+  qemu:
+    name: QEMU ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM for the runner's user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: make loader ARCH=${{ matrix.arch }}
+      - run: make test ARCH=${{ matrix.arch }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.arch }}
+          path: |
+            out/test/*/*.png
+            out/test/*/serial.log
+            out/test/results-*.json
+          retention-days: 14
