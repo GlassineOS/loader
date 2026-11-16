@@ -8,5 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         mtools dosfstools gdisk python3 python3-pil \
         sbsigntool openssl python3-virt-firmware \
     && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
+RUN rustup target add x86_64-unknown-uefi aarch64-unknown-uefi \
+        x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ENV CARGO_HOME=/work/.cache/cargo

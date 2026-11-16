@@ -4,3 +4,13 @@ rustflags = ["-C", "link-arg=/Brepro"]
 
 [target.aarch64-unknown-uefi]
 rustflags = ["-C", "link-arg=/Brepro"]
+
+# gspl-encode as a static Linux program for the release (make gspl-encode-static): rust-lld
+# and Rust's own musl, so one build host links both architectures.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
