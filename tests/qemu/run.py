@@ -405,8 +405,8 @@ def default_px():
     return px, w, h
 
 
-def compose(px, w, h, mode, bg):
-    """The Python twin of gspl::compose."""
+def compose(px, w, h, mode, bg, W=W, H=H):
+    """The Python twin of gspl::compose, on a W x H screen (QEMU's by default)."""
     screen = [bg] * (W * H)
     native = mode == (W, H)
     if native:
@@ -1423,6 +1423,99 @@ def handback_probe_reads_an_extended_gop_raw():
     assert c == {"query": "2", "set_mode": "0", "blt": "0", "get_fb": "1", "garbage_query": "0", "refresh": "0"}, c
     assert "PARENT_FAKEFW_REFRESH" not in log, "the probe refreshed the panel"
     assert "PROBE_WRITTEN ok=1" in log
+
+
+PANEL = (1872, 1404)  # the stand-in's panel, native landscape
+# The panel's CRC-32 after the two pictures below are drawn: the goldens both the loader
+# and epd_golden must give.
+EPD_GOLDEN_SPLASH, EPD_GOLDEN_OVERRIDE = "39c73611", "33306d02"
+PORTRAIT = (PANEL[1], PANEL[0])
+
+
+def portrait_px(w, h, ink, paper):
+    """An asymmetric picture: a block at the top left and a bar along the bottom, so a
+    wrong rotation or mirror changes the framebuffer."""
+    px = []
+    for y in range(h):
+        for x in range(w):
+            if (x < w // 3 and y < h // 4) or y >= h - h // 10:
+                px.append(ink)
+            else:
+                px.append(paper)
+    return px
+
+
+def epd_golden(px, w, h, bg):
+    """The CRC-32 of the panel's packed RGB565 after the loader draws `px` (made for the
+    portrait mode): composed in portrait, then native (x, y) = (1871 - v, u)."""
+    import array
+    lw, lh = PORTRAIT
+    screen = compose(px, w, h, PORTRAIT, bg, lw, lh)
+    nw, nh = PANEL
+    out = array.array("H", bytes(nw * nh * 2))
+    for y in range(nh):
+        base = y * nw
+        for x in range(nw):
+            p = screen[(nw - 1 - x) * lw + y]
+            out[base + x] = (((p >> 19) & 0x1F) << 11) | (((p >> 10) & 0x3F) << 5) | ((p >> 3) & 0x1F)
+    return f"{crc32(out.tobytes()):08x}"
+
+
+def refreshes(log):
+    return re.findall(r"PARENT_FAKEFW_REFRESH ([^\r\n]*)", log)
+
+
+@case("x86_64", "aarch64")
+def handback_epd_fw_draws_the_splash_once():
+    """display=epd-fw on firmware with an extended GOP: the splash is composed in
+    portrait, written into the framebuffer as packed RGB565 in the panel's landscape and
+    refreshed once for the whole panel; no SetMode, no Blt; the answer is unchanged.
+    Without the key, or without an extended GOP, the loader stays headless."""
+    sw, sh = 600, 800
+    spx = portrait_px(sw, sh, 0x000000, 0xC0C0C0)
+    splash = mksplash.encode(spx, sw, sh, PORTRAIT, 0xFFFFFF)
+    d = hb_disk("hb-epd", hb_record(display="epd-fw"), cfg="parent.fakefw=1", images={"splash": splash})
+    log, boot, floor, _ = parent_run("hb-epd", d)
+    assert (boot, floor) == ("baseline", None), (boot, floor)
+    c = fakefw_calls(log)
+    assert (c["refresh"], c["set_mode"], c["blt"], c["get_fb"]) == ("1", "0", "0", "1"), c
+    want = epd_golden(spx, sw, sh, 0xFFFFFF)
+    assert want == EPD_GOLDEN_SPLASH, f"the Python twin changed: {want}"
+    assert refreshes(log) == [f"this=1 fb=1 rect=0,0,1872,1404 stride=1872 mode=0 crc={want}"], (refreshes(log), want)
+    assert "SPLASH_DRAWN splash" in log and "EPD_FW " in log, "no draw logged"
+    assert "HINT_SHOWN" not in log, "a key line on a backend with no key"
+    seq, r, _ = d.record()
+    assert (seq, r["unmarked"]) == (2, "1"), (seq, r)
+
+    # The key without the firmware: headless.
+    d = hb_disk("hb-epd-nofw", hb_record(display="epd-fw"), images={"splash": splash})
+    log, boot, floor, _ = parent_run("hb-epd-nofw", d)
+    assert (boot, floor) == ("baseline", None) and "EPD_FW_NONE" in log and "SPLASH_DRAWN" not in log, log[-400:]
+    # The firmware without the key: headless, the store untouched.
+    d = hb_disk("hb-epd-nokey", hb_record(), cfg="parent.fakefw=1", images={"splash": splash})
+    log, boot, floor, _ = parent_run("hb-epd-nokey", d)
+    assert fakefw_calls(log)["refresh"] == "0" and fakefw_calls(log)["get_fb"] == "0", fakefw_calls(log)
+
+
+@case("x86_64", "aarch64")
+def handback_epd_fw_override_removed_before_drawn():
+    """The override (made for the portrait mode) is removed durably, then drawn with the
+    one refresh; the next start draws the splash."""
+    sw, sh = 600, 800
+    spx = portrait_px(sw, sh, 0x000000, 0xC0C0C0)
+    opx = portrait_px(400, 300, 0x404040, 0xFFFFFF)
+    images = {"splash": mksplash.encode(spx, sw, sh, PORTRAIT, 0xFFFFFF),
+              "override": mksplash.encode(opx, 400, 300, PORTRAIT, 0x808080)}
+    d = hb_disk("hb-epd-ovr", hb_record(display="epd-fw"), cfg="parent.fakefw=1", images=images)
+    log, _, floor, _ = parent_run("hb-epd-ovr", d)
+    assert floor is None and "OVERRIDE_REMOVED" in log, log[-600:]
+    assert log.index("OVERRIDE_REMOVED") < log.index("SPLASH_DRAWN override"), "drawn before removed"
+    want = epd_golden(opx, 400, 300, 0x808080)
+    assert want == EPD_GOLDEN_OVERRIDE, f"the Python twin changed: {want}"
+    assert [r.split("crc=")[1] for r in refreshes(log)] == [want], (refreshes(log), want)
+    assert d.region("override")[:64] == b"\0" * 64, "the override is still there"
+    log, _, _, _ = parent_run("hb-epd-ovr-2", d)
+    assert [r.split("crc=")[1] for r in refreshes(log)] == [epd_golden(spx, sw, sh, 0xFFFFFF)], refreshes(log)
 
 
 @case("x86_64", "aarch64")
