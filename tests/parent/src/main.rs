@@ -12,7 +12,8 @@
 //! options for a case come from `\parent.cfg` on the parent's own partition: one line,
 //! the words to add (`glassine.log=serial` is always added, so the tests see the
 //! loader's log). Words that start with `parent.` are the parent's own and not passed:
-//! `parent.fakefw=1` installs the stand-in extended graphics output of [`fakefw`].
+//! `parent.fakefw=1` installs the stand-in extended graphics output of [`fakefw`],
+//! `parent.fakefw=hang` the same with a refresh that never returns.
 #![no_std]
 #![no_main]
 
@@ -211,9 +212,11 @@ fn hand_back() -> Result<Boot, String> {
 #[entry]
 fn main() -> Status {
     say("PARENT_START_PARENT");
-    let fake = extra_options().split(' ').any(|w| w == "parent.fakefw=1");
+    let cfg = extra_options();
+    let hang = cfg.split(' ').any(|w| w == "parent.fakefw=hang");
+    let fake = hang || cfg.split(' ').any(|w| w == "parent.fakefw=1");
     if fake {
-        say(&fakefw::install_all());
+        say(&fakefw::install_all(hang));
     }
     let r = hand_back();
     if fake {

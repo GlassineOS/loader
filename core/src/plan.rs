@@ -598,5 +598,20 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
     Answer::new(boot, why)
 }
 
+/// Whether a hand-back start may draw through the firmware's panel refresh (loader spec
+/// 003 FR-009, boot `docs/handback.md`): only a start counted before the draw (the answer
+/// `default`, its record written, so a hang inside the refresh counts like any failed
+/// start), and only when the previous start was marked healthy (`unmarked` 0 at entry,
+/// so a draw that hung once can't hang the next start). `Err`: why not, for the log.
+/// `entry_unmarked`: the record's `unmarked` as read at entry, `None` with no record.
+pub fn epd_draw_allowed(entry_unmarked: Option<u64>, answer: &Answer) -> Result<(), &'static str> {
+    match entry_unmarked {
+        None => Err("no record"),
+        Some(n) if n > 0 => Err("the previous start wasn't marked healthy"),
+        Some(_) if answer.why != "default" => Err("the start isn't counted"),
+        Some(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests;
