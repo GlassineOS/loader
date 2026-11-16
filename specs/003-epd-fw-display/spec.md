@@ -45,16 +45,20 @@ refresh's CRC is the override's, the next start's is the splash's.
 
 ### Scenario 2a – A refresh that hangs (Priority: P1)
 
-The firmware's refresh never returns. The start was already counted, so the parent's
-watchdog reset is a failed start like any other. The next start, with `unmarked` above 0,
-doesn't draw, so it can't hang the same way; the starts count up to the limit as without
-the display, and a start marked healthy draws again.
+The firmware's refresh never returns. The start was already counted (and marked
+`drew=1`), so the parent's watchdog reset is a failed start like any other. The next
+start, with `unmarked` above 0 after a start that drew, doesn't draw and sets the
+sticky `display_failed`; the starts count up to the limit as without the display. A
+healthy mark doesn't bring the draw back; only the running system's
+`glassine-loader-mark display-retry` does, followed by a healthy start.
 
 **Acceptance**: QEMU case with a stand-in refresh that never returns
-(`parent.fakefw=hang`): the record's write comes before the refresh in the log and
-`unmarked` is 1 after the reset; the next three starts log `EPD_FW_SKIPPED`, call no
-refresh, answer `baseline`, `baseline`, then `recovery` at the limit; after the record
-is marked healthy, the next start draws (and hangs) again, counted first.
+(`parent.fakefw=hang`): the record's write comes before the refresh and `unmarked=1`,
+`drew=1` after the reset; the next start logs `EPD_FW_SKIPPED the previous start drew
+and wasn't marked healthy: display_failed=1` and writes `display_failed=1`; the next two
+answer `baseline`, then `recovery` at the limit, with no refresh; after a healthy mark
+the start is still skipped (`display_failed=1`); after display-retry and a healthy mark
+the start draws (and hangs) again, counted first.
 
 ### Scenario 3 – Off (Priority: P1)
 
@@ -89,15 +93,20 @@ no `GetFrameBuffer`, no refresh, the splash store left as it is.
   power-on is not defined on such a machine, and each change of the picture would be one
   more full refresh. The key wait isn't run.
 - **FR-008**: The PC path (001) is unchanged and draws only on a `standard` GOP.
-- **FR-009**: The order and the two guards against a refresh that never returns:
+- **FR-009**: The order and the guards against a refresh that never returns:
   - the decision and its record write (002 FR-004) come first; the draw follows, before
     the answer;
   - the loader draws only on a start counted by that write (the answer `default`, the
     record written with `unmarked` raised): a recovery, a request, a pick or a record it
-    can't write draws nothing;
+    can't write draws nothing; that counting write sets the loader-owned `drew=1`;
   - the loader draws only when the record's `unmarked` was 0 at entry; else it logs
-    `EPD_FW_SKIPPED` and stays headless. A healthy start (the running system setting
-    `unmarked` back to 0) makes the next start draw again.
+    `EPD_FW_SKIPPED` and stays headless.
+- **FR-010**: The sticky key. A start that finds `unmarked` above 0 and `drew=1` sets
+  `display_failed=<unmarked>` in its write (every write of that start) and clears
+  `drew`; any start that doesn't draw clears `drew`. While `display_failed` is set the
+  loader never draws, whatever `unmarked` says. The loader never clears it; a healthy
+  mark leaves it; only the running system's `glassine-loader-mark display-retry`
+  clears it (boot `docs/handback.md`). The rule is `core::plan::epd_plan`.
 
 ## Device scope and risk
 
@@ -105,9 +114,10 @@ QEMU with AAVMF and OVMF only, against the stand-in. The first draw on a real de
 separate test, with the person's go, after a probe report (002 FR-008a) has shown the
 GOP's layout as `extended`. It checks: a full-panel picture; the firmware's own picture
 fully cleared; no ghost of it; the orientation right; and the time the start takes with
-the refresh. A refresh that hangs is covered by FR-009: the escape is the next start,
-which doesn't draw (a power cycle where the parent has no watchdog), with no outside
-rewrite of the record.
+the refresh. A refresh that hangs is covered by FR-009 and FR-010: the escape is the
+next start, which doesn't draw (a power cycle where the parent has no watchdog), with
+no outside rewrite of the record; the draw stays off until a deliberate
+`display-retry`.
 
 ## Out of scope
 

@@ -522,6 +522,27 @@ fn start_recovery<P: Platform, S: Starter>(p: &mut P, s: &mut S, cur: Option<&In
 /// the parent's baseline when the record names none; the recovery is the parent's.
 /// `pick_recovery`: the person asked for the recovery at power-on (`glassine.pick=`).
 pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recovery: bool) -> Answer {
+    handback_with(p, rec, pick_recovery, &[], &[])
+}
+
+/// [`handback`] with loader-owned keys added to its writes: `any` to every write it
+/// makes, `counted` only to the write that counts the start (the default or the
+/// previous set). The decision is the same.
+pub fn handback_with<S: RecordStore + Log>(
+    p: &mut S,
+    rec: Option<InUse>,
+    pick_recovery: bool,
+    any: &[(&str, &str)],
+    counted: &[(&str, &str)],
+) -> Answer {
+    let write = |p: &mut S, cur: &mut InUse, ch: &[(&str, &str)], count: bool| {
+        let mut all: Vec<(&str, &str)> = ch.to_vec();
+        all.extend_from_slice(any);
+        if count {
+            all.extend_from_slice(counted);
+        }
+        write(p, cur, &all)
+    };
     let Some(mut cur) = rec else {
         plog!(p, "no loader record: the baseline");
         return Answer::new(Boot::Baseline, "no-record");
@@ -543,7 +564,7 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
         _ => false,
     };
     if pick_recovery {
-        if take && !write(p, &mut cur, &[("request", "")]) {
+        if take && !write(p, &mut cur, &[("request", "")], false) {
             plog!(p, "the record can't be written; the recovery all the same (it isn't counted)");
         }
         plog!(p, "ANSWER recovery why=choice");
@@ -556,7 +577,7 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
             ch.push(("started", &trial));
             ch.push(("started_why", "request"));
         }
-        if !write(p, &mut cur, &ch) {
+        if !write(p, &mut cur, &ch, false) {
             plog!(p, "REQUEST_NOT_TAKEN {}: the record can't be written; the baseline", request);
             return Answer::new(Boot::Baseline, "not-written");
         }
@@ -588,7 +609,7 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
     if !cur.both_valid {
         ch.push(("request", ""));
     }
-    if !write(p, &mut cur, &ch) {
+    if !write(p, &mut cur, &ch, true) {
         // 010 FR-009: a loader that can't write starts the default set, uncounted.
         let b = set(&cur, "default").unwrap_or(Boot::Baseline);
         plog!(p, "the record can't be written: {:?}, uncounted", b);
@@ -598,18 +619,61 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
     Answer::new(boot, why)
 }
 
-/// Whether a hand-back start may draw through the firmware's panel refresh (loader spec
-/// 003 FR-009, boot `docs/handback.md`): only a start counted before the draw (the answer
-/// `default`, its record written, so a hang inside the refresh counts like any failed
-/// start), and only when the previous start was marked healthy (`unmarked` 0 at entry,
-/// so a draw that hung once can't hang the next start). `Err`: why not, for the log.
-/// `entry_unmarked`: the record's `unmarked` as read at entry, `None` with no record.
-pub fn epd_draw_allowed(entry_unmarked: Option<u64>, answer: &Answer) -> Result<(), &'static str> {
-    match entry_unmarked {
-        None => Err("no record"),
-        Some(n) if n > 0 => Err("the previous start wasn't marked healthy"),
-        Some(_) if answer.why != "default" => Err("the start isn't counted"),
-        Some(_) => Ok(()),
+/// What a hand-back start with `display=epd-fw` does about the firmware's panel refresh
+/// (loader spec 003 FR-009, FR-010; boot `docs/handback.md`): whether it may draw, and
+/// the loader-owned keys its record writes carry.
+///
+/// - `display_failed` set: no draw, whatever `unmarked` says; only the running system
+///   clears it.
+/// - `unmarked` above 0 at entry: no draw; when the start before drew (`drew=1`), that
+///   draw may have hung: `display_failed=<unmarked>` is set, sticky.
+/// - else: the draw, on a start counted before it (the answer `default`), and the
+///   counting write says `drew=1`.
+///
+/// Every write of a start that doesn't draw clears `drew`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EpdPlan {
+    /// The draw, if the start is counted.
+    pub draw: bool,
+    /// Why not, for the log.
+    pub skip: Option<String>,
+    /// Keys for every write.
+    pub any: Vec<(&'static str, String)>,
+    /// Keys for the counting write only.
+    pub counted: Vec<(&'static str, String)>,
+}
+
+pub fn epd_plan(rec: Option<&InUse>) -> EpdPlan {
+    let Some(r) = rec else {
+        return EpdPlan { draw: false, skip: Some("no record".into()), any: Vec::new(), counted: Vec::new() };
+    };
+    let failed = r.rec.get("display_failed");
+    let drew = r.rec.get("drew") == "1";
+    let clear_drew = || if r.rec.get("drew").is_empty() { Vec::new() } else { alloc::vec![("drew", String::new())] };
+    if !failed.is_empty() {
+        return EpdPlan { draw: false, skip: Some(format!("display_failed={failed}")), any: clear_drew(), counted: Vec::new() };
+    }
+    let n = unmarked(r);
+    if n > 0 && drew {
+        return EpdPlan {
+            draw: false,
+            skip: Some(format!("the previous start drew and wasn't marked healthy: display_failed={n}")),
+            any: alloc::vec![("display_failed", n.to_string()), ("drew", String::new())],
+            counted: Vec::new(),
+        };
+    }
+    if n > 0 {
+        return EpdPlan { draw: false, skip: Some("the previous start wasn't marked healthy".into()), any: clear_drew(), counted: Vec::new() };
+    }
+    EpdPlan { draw: true, skip: None, any: clear_drew(), counted: alloc::vec![("drew", "1".into())] }
+}
+
+/// Whether the start of `answer` draws under `plan`: only a counted start (`default`).
+pub fn epd_draws(plan: &EpdPlan, answer: &Answer) -> Result<(), String> {
+    match (&plan.skip, answer.why) {
+        (Some(why), _) => Err(why.clone()),
+        (None, "default") if plan.draw => Ok(()),
+        _ => Err("the start isn't counted".into()),
     }
 }
 
