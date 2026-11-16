@@ -17,11 +17,12 @@ GlassineOS/boot owns what a PC's loader does and the bytes it reads and writes:
   (the splash and its one-time override);
 - [`docs/boot-partition.md`](https://github.com/GlassineOS/boot/blob/main/docs/boot-partition.md)
   (normative: the layout, the loader record, a kernel set, the splash store and its image
-  format, `format=1`).
+  format, `format=2`, which reads `format=1` too).
 
 This spec is the loader's own. It says how the loader meets those documents, which of
 their requirements it carries (by their numbers), and how it reads them where they leave
-a choice. It pins boot at commit `cf3271dd8947069aa8304b4ac9e16c18f0eafd92`. Where the
+a choice. It pins boot at commit `cf3271dd8947069aa8304b4ac9e16c18f0eafd92`, and the image
+format at `887ee626e9723f4bd722afbb19be2e16c0b84cb7` (format 2). Where the
 documents and this spec differ, the documents win and this spec is corrected.
 
 The loader is one program for x86-64 PCs today. The same program is meant to build for
@@ -186,8 +187,11 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
   draws `splash.gspl`, `default.gspl` when that is missing or skipped, and nothing when
   both are. (011 FR-001, FR-002, FR-012, FR-013, boot-partition "The splash store")
 - **FR-023** An image is checked in the order `boot-partition.md` gives (length, magic,
-  header CRC, version, kind, payload length, limits, pixel layout, payload CRC, decode)
-  and skipped on the first failure; bytes 56 to 63 of the header are not looked at.
+  header CRC, version, kind, payload length, limits, pixel layout, compression and
+  filter, payload CRC, decode) and skipped on the first failure; bytes 56 to 63 of the
+  header are not looked at. The loader reads format 2 in every pixel layout (BGRx,
+  RGB888, grey8) with every compression (none, run-length, LZ4) and filter (none, up),
+  and format 1; it checks the pixel limit before it reserves memory for a picture.
   Reading and checking one image takes at most one second, else it is skipped. A
   leave-screen image (kind 1) is valid only as the override and only with its picture
   fields zero and no payload. (011 FR-004, FR-005)
@@ -254,7 +258,7 @@ the loader starts nothing, writes nothing, says why on screen, and returns to th
 
 | Contract | Owned / consumed | Version | Spec location |
 |---|---|---|---|
-| Boot partition layout, loader record, kernel set, splash store and image format | consumed (GlassineOS/boot) | `format=1`, boot `cf3271dd` | `docs/boot-partition.md` |
+| Boot partition layout, loader record, kernel set, splash store and image format | consumed (GlassineOS/boot) | `format=1`, boot `cf3271dd`; image format `format=2` (and 1), boot `887ee626` | `docs/boot-partition.md` |
 | Deployments on UEFI PCs | consumed (GlassineOS/boot) | spec 010 at `cf3271dd` | `specs/010-uefi-deployments/spec.md` |
 | Boot splash | consumed (GlassineOS/boot) | spec 011 at `cf3271dd` | `specs/011-boot-splash/spec.md` |
 | `glassine.deploy.once=` on the command line | consumed (GlassineOS/boot) | `docs/boot.md` "Command-line keys" | boot 001, 010 FR-042 |

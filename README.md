@@ -17,7 +17,8 @@ requirements ([`specs/001-uefi-loader/spec.md`](specs/001-uefi-loader/spec.md)):
 - [011 — boot splash](https://github.com/GlassineOS/boot/blob/main/specs/011-boot-splash/spec.md):
   the splash and its one-time override;
 - [`docs/boot-partition.md`](https://github.com/GlassineOS/boot/blob/main/docs/boot-partition.md)
-  (format 1): the bytes it reads and writes. Pinned at boot `cf3271dd`.
+  (format 1; the image format 2, which reads format 1 too): the bytes it reads and writes.
+  Pinned at boot `cf3271dd`, the image format at boot `887ee626`.
 
 ## What it does at a start
 
@@ -62,6 +63,13 @@ consoles, file systems) to the partition. The QEMU cases run it under a stand-in
 - `loader/`: the EFI program. `src/arch/` holds what depends on the processor (clock,
   serial log); `src/display/` the displays, with the firmware's graphics output as one
   backend; `c/` the LVGL shim and configuration.
+- `tools/gspl-encode/`: the host tool every writer of a splash shares (the running
+  system, the release images, the tests): a PNM picture or raw framebuffer pixels to an
+  image of format 2, in the layout the target's display takes (`--layout grey8` for a
+  grey panel), the smallest payload by default or `--compression fast` (LZ4, no filter)
+  for the hibernate preview; `--check FILE` checks an image as the loader does. Built by
+  `make` for the build host (`target/release/gspl-encode`). `tools/mksplash.py` writes
+  format 1 for the tests that keep it.
 - `tests/stub/`: a stand-in kernel that prints its command line and the sum of the
   initramfs it gets, for the QEMU tests; with `stub.answer=`, a broken loader.
 - `tests/parent/`: a stand-in parent bootloader for the hand-back cases.
@@ -118,7 +126,8 @@ GPL-2.0-or-later (see `LICENSE`).
   (BSD-3-Clause) and the built-in font `lv_font_montserrat_20`, converted by LVGL from
   Montserrat and Font Awesome 5 symbols (both SIL OFL 1.1 upstream; a release carries
   the OFL notices in `NOTICES-<arch>.txt`).
-- Crates: `uefi`, `uefi-raw`, `sha2` (MIT OR Apache-2.0).
+- Crates: `uefi`, `uefi-raw`, `sha2` (MIT OR Apache-2.0), `lz4_flex` (MIT, the splash's
+  LZ4 decoder).
 - `tests/golden/pc-boot/` is copied from GlassineOS/installer (GPL-2.0-or-later).
 - Test only, never committed or shipped: OVMF and AAVMF (Debian `ovmf`,
   `qemu-efi-aarch64`, BSD-2-Clause-Patent), Alpine `linux-lts` and `busybox-static`
