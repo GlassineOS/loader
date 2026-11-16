@@ -211,6 +211,35 @@ fn hand_back() -> Result<Boot, String> {
     Ok(a.boot)
 }
 
+type SetWatchdog = unsafe extern "efiapi" fn(usize, u64, usize, *const u16) -> Status;
+static mut WATCHDOG: Option<SetWatchdog> = None;
+
+/// `SetWatchdogTimer` through the stand-in: every call is logged
+/// (`PARENT_WATCHDOG <seconds>`), then made.
+unsafe extern "efiapi" fn watchdog(secs: usize, code: u64, size: usize, data: *const u16) -> Status {
+    say(&format!("PARENT_WATCHDOG {secs}"));
+    match unsafe { WATCHDOG } {
+        Some(f) => unsafe { f(secs, code, size, data) },
+        None => Status::UNSUPPORTED,
+    }
+}
+
+/// Puts [`watchdog`] in the boot services table (and its CRC), so the loader's calls are
+/// seen.
+fn hook_watchdog() {
+    let st = uefi::table::system_table_raw().unwrap();
+    let bt = unsafe { st.as_ref().boot_services };
+    unsafe {
+        let orig = (*bt).set_watchdog_timer;
+        WATCHDOG = Some(core::mem::transmute::<_, SetWatchdog>(orig));
+        (*bt).set_watchdog_timer = core::mem::transmute::<SetWatchdog, _>(watchdog as SetWatchdog);
+        (*bt).header.crc = 0;
+        let mut crc = 0u32;
+        let _ = ((*bt).calculate_crc32)(bt as *const core::ffi::c_void, (*bt).header.size as usize, &mut crc);
+        (*bt).header.crc = crc;
+    }
+}
+
 #[entry]
 fn main() -> Status {
     say("PARENT_START_PARENT");
@@ -218,13 +247,18 @@ fn main() -> Status {
     let word = cfg.split(' ').find_map(|w| w.strip_prefix("parent.fakefw="));
     let fake = word.is_some();
     if let Some(w) = word {
+        fakefw::set_nopointer(cfg.split(' ').any(|w| w == "parent.nopointer=1"));
         say(&fakefw::install_all(fakefw::Shape::parse(w).expect("parent.fakefw")));
+        fakefw::set_taps(cfg.split(' ').find_map(|w| w.strip_prefix("parent.taps=")).unwrap_or(""));
+        fakefw::set_fbdump(cfg.split(' ').any(|w| w == "parent.fbdump=1"));
     }
+    hook_watchdog();
     let r = hand_back();
     if fake {
         for l in fakefw::report() {
             say(&l);
         }
+        fakefw::dump();
     }
     match r {
         Ok(Boot::Baseline) => say("PARENT_BOOT baseline"),
