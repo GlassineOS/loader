@@ -108,8 +108,10 @@ make clean                 # target/, out/
 
 A tag `v<version>` (the workspace's version in `Cargo.toml`) makes a GitHub Release
 (`.github/workflows/release.yml`): `glassine-loader-x86_64.efi` and
-`glassine-loader-aarch64.efi`, `SHA256SUMS`, and `NOTICES-<arch>.txt` with the licenses
-of what each binary has compiled in (`make notices`). Each binary is built twice on
+`glassine-loader-aarch64.efi`, `gspl-encode-x86_64-linux` and `gspl-encode-aarch64-linux`
+(the splash writer as a static Linux program, `make gspl-encode-static`), `SHA256SUMS`, and
+`NOTICES-<arch>.txt` and `NOTICES-gspl-encode-<arch>.txt` with the licenses of what each
+binary has compiled in (`make notices`). Each binary is built twice on
 separate runners and the two must match byte for byte; the released one is the one the
 QEMU cases ran. A 0.x version is a prerelease. A release is never replaced, since
 GlassineOS/images pins its files by SHA-256 (`targets/uefi-pc/release.conf`): a change
