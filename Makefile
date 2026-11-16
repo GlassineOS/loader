@@ -25,7 +25,7 @@ third_party/lvgl-9.6.0/.ok: scripts/fetch-lvgl.sh | image
 	$(RUN) scripts/fetch-lvgl.sh
 
 loader: image third_party/lvgl-9.6.0/.ok
-	$(RUN) cargo build --release --locked --target $(TARGET) -p glassine-loader -p glassine-test-kernel
+	$(RUN) cargo build --release --locked --target $(TARGET) -p glassine-loader -p glassine-test-kernel -p glassine-test-parent
 	@ls -l $(EFI) | awk '{print "loader ($(ARCH)):", $$5, "bytes"}'
 	@sha256sum $(EFI)
 

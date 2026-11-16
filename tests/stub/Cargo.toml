@@ -16,3 +16,4 @@ bench = false
 uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
 uefi-raw = "=0.17.0"
 sha2 = { version = "0.10", default-features = false }
+glassine-loader-core = { path = "../../core" }

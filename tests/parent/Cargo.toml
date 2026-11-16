@@ -1,0 +1,18 @@
+[package]
+name = "glassine-test-parent"
+description = "A stand-in parent bootloader for the QEMU tests: starts the loader from a raw partition as the hand-back contract says and reports its answer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "glassine-test-parent"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+glassine-loader-core = { path = "../../core" }
+uefi = { version = "=0.41.0", default-features = false, features = ["alloc", "global_allocator"] }
+uefi-raw = "=0.17.0"
