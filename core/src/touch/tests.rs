@@ -18,6 +18,15 @@ enum Fail {
     SysinfoTwice,
     NoSysinfo,
     Dead,
+    /// The bootloader answers launch-app after 150 ms.
+    SlowBoot,
+    /// The first three writes aren't taken.
+    NackFirst,
+    /// The application's sentinel 700 ms after the answer, the controller not answering
+    /// its address until then.
+    LateApp,
+    /// No answer to launch-app (a controller already in its application).
+    NoLaunch,
 }
 
 struct Fake {
@@ -31,6 +40,11 @@ struct Fake {
     fail: Fail,
     open: bool,
     longest_call: u32,
+    /// Frames due at a time.
+    due: Vec<(u64, Vec<u8>)>,
+    /// Neither reads nor writes are taken in this window.
+    busy: (u64, u64),
+    nacks: u32,
 }
 
 impl Fake {
@@ -46,6 +60,9 @@ impl Fake {
             fail,
             open: false,
             longest_call: 0,
+            due: Vec::new(),
+            busy: (0, 0),
+            nacks: 0,
         };
         if found_on {
             f.out[61] = Some(true);
@@ -69,6 +86,14 @@ impl Fake {
         } else if self.reset_seen && !self.up {
             self.up = true;
             self.queue.push_back(vec![0, 0]);
+        }
+    }
+    fn tick(&mut self) {
+        let now = self.now;
+        let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut self.due).into_iter().partition(|(t, _)| *t <= now);
+        self.due = later;
+        for (_, f) in ready {
+            self.queue.push_back(f);
         }
     }
     fn pins_ops(&self) -> Vec<&str> {
@@ -135,18 +160,23 @@ impl Hw for Fake {
         assert!(self.open, "read on a closed bus");
         self.longest_call = self.longest_call.max(t);
         self.now += 1;
-        if !self.up {
-            // No answer: the call runs to its timeout.
-            self.now += t as u64;
+        if !self.up || (self.busy.0..self.busy.1).contains(&self.now) {
+            // No answer to the address.
+            self.now += 1;
             return Err("nack".into());
         }
+        self.tick();
         buf.fill(0);
-        if let Some(f) = self.queue.front() {
-            let n = f.len().min(buf.len());
-            buf[..n].copy_from_slice(&f[..n]);
-            if buf.len() >= f.len() || f.len() <= 2 {
-                self.queue.pop_front();
+        match self.queue.front() {
+            Some(f) => {
+                let n = f.len().min(buf.len());
+                buf[..n].copy_from_slice(&f[..n]);
+                if buf.len() >= f.len() || f.len() <= 2 {
+                    self.queue.pop_front();
+                }
             }
+            // Nothing waiting: length 2.
+            None => buf[0] = 2,
         }
         Ok(())
     }
@@ -158,9 +188,12 @@ impl Hw for Fake {
         if self.fail == Fail::Write {
             return Err("0x8002".into());
         }
-        if !self.up {
-            self.now += t as u64;
-            return Err("nack".into());
+        if self.fail == Fail::NackFirst && self.nacks < 3 {
+            self.nacks += 1;
+            return Err("0x110000c8".into());
+        }
+        if !self.up || (self.busy.0..self.busy.1).contains(&self.now) {
+            return Err("0x110000c8".into());
         }
         match (reg, data) {
             (0x0001, []) => match self.fail {
@@ -168,7 +201,17 @@ impl Hw for Fake {
                 Fail::BadDesc => self.queue.push_back(desc(0x0200)),
                 _ => self.queue.push_back(desc(0x0100)),
             },
-            (0x0004, d) if d == launch_app_cmd() => self.queue.push_back(vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]),
+            (0x0004, d) if d == launch_app_cmd() && self.fail == Fail::NoLaunch => {}
+            (0x0004, d) if d == launch_app_cmd() => {
+                // The answer, then the application's sentinel.
+                let answer = self.now + if self.fail == Fail::SlowBoot { 150 } else { 10 };
+                let app = answer + if self.fail == Fail::LateApp { 700 } else { 20 };
+                self.due.push((answer, vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+                self.due.push((app, vec![0, 0]));
+                if self.fail == Fail::LateApp {
+                    self.busy = (answer + 20, app);
+                }
+            }
             (0x0004, d) if d == SYSINFO_CMD_BYTES => {
                 self.asks += 1;
                 let empty = self.fail == Fail::NoSysinfo || (self.fail == Fail::SysinfoTwice && self.asks <= 2);
@@ -238,7 +281,7 @@ fn a_failure_at_each_step_powers_down() {
         (Fail::NoDesc, "hid"),
         (Fail::BadDesc, "hid"),
         (Fail::NoSysinfo, "sysinfo"),
-        (Fail::Dead, "empty"),
+        (Fail::Dead, "hid"),
     ] {
         let mut f = Fake::new(fail, false);
         let up = bring_up(&mut f, true);
@@ -321,4 +364,32 @@ fn the_mapping_to_portrait() {
         let (u, v) = crate::menu::to_portrait(x, y, r, ORIENT, 1872, 1404).unwrap();
         assert_eq!((u as u64, v as u64), (1403 - y, 1871 - x), "{x},{y}");
     }
+}
+
+#[test]
+fn slow_boot_late_app_and_nacks_are_waited_for() {
+    for fail in [Fail::SlowBoot, Fail::LateApp, Fail::NackFirst] {
+        let mut f = Fake::new(fail, false);
+        let up = bring_up(&mut f, false);
+        assert!(up.ok(), "{fail:?}: {:?} {:?}", up.result, up.lines);
+        assert!(line(&up, "touch.launch").starts_with("answer 0b00"), "{fail:?}: {:?}", up.lines);
+        assert!(line(&up, "touch.wait.reset").ends_with("ok"), "{fail:?}: {:?}", up.lines);
+        assert!(line(&up, "touch.wait.app").contains(" ok"), "{fail:?}: {:?}", up.lines);
+        let ms = |k: &str| line(&up, k).split(' ').next().unwrap().parse::<u64>().unwrap();
+        match fail {
+            Fail::SlowBoot => assert!((145..=200).contains(&ms("touch.wait.launch")), "{:?}", up.lines),
+            Fail::LateApp => assert!((650..=760).contains(&ms("touch.wait.app")), "{:?}", up.lines),
+            _ => assert!(f.ops.iter().filter(|o| o.starts_with("wr0004:0b00")).count() == 4, "{:?}", f.ops),
+        }
+        assert!(f.now - 1000 < DEADLINE_MS);
+    }
+}
+
+#[test]
+fn a_launch_without_an_answer_isnt_fatal() {
+    let mut f = Fake::new(Fail::NoLaunch, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.launch"), "no answer");
+    assert!(line(&up, "touch.wait.launch").contains("timeout") && line(&up, "touch.wait.app").is_empty(), "{:?}", up.lines);
 }

@@ -24,6 +24,13 @@ pub const I2C_KHZ: u32 = 100;
 pub const DEADLINE_MS: u64 = 3000;
 pub const CALL_MS: u64 = 100;
 pub const POLL_MS: u64 = 5;
+/// The waits after a reset: the reset sentinel, the bootloader's answer to launch-app,
+/// the application's sentinel; how long a write the controller doesn't take is sent
+/// again.
+pub const RESET_WAIT_MS: u64 = 500;
+pub const LAUNCH_WAIT_MS: u64 = 500;
+pub const APP_WAIT_MS: u64 = 1000;
+pub const WRITE_RETRY_MS: u64 = 300;
 
 /// How the controller's axes lie on the display panel's native axes (spec 005 FR-013):
 /// its X along the native x, its Y along the native y flipped. **Unverified on
@@ -70,6 +77,8 @@ pub trait Hw {
     /// Writes `data` to register `reg` (on the wire: its low byte, its high byte, `data`).
     fn write(&mut self, reg: u16, data: &[u8], timeout_ms: u32) -> Result<(), String>;
     fn close(&mut self);
+    /// One line for the loader's log (`TOUCH_WAIT ...`).
+    fn log(&mut self, _line: &str) {}
 }
 
 /// The CRC the controller's bootloader commands carry (CRC-16/CCITT, MSB first, as
@@ -143,36 +152,103 @@ fn call_ms<H: Hw>(hw: &mut H, deadline: u64) -> Option<u32> {
     (left > 0).then(|| left.min(CALL_MS) as u32)
 }
 
-/// One frame from the input register: its length, then the frame. `Ok(None)` when no
-/// report waits (length 0 or 2).
-pub fn read_frame<H: Hw>(hw: &mut H, deadline: u64) -> Result<Option<Vec<u8>>, String> {
+/// What the input register gave: the reset sentinel (length 0: the controller has
+/// just come out of reset, or its application has just started), nothing waiting
+/// (length 2), or a frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frame {
+    Sentinel,
+    Empty,
+    Data(Vec<u8>),
+}
+
+/// One read of the input register: its length, then the frame.
+pub fn read_any<H: Hw>(hw: &mut H, deadline: u64) -> Result<Frame, String> {
     let t = call_ms(hw, deadline).ok_or("deadline")?;
     let mut len = [0u8; 2];
     hw.read_input(&mut len, t)?;
     let n = u16::from_le_bytes(len) as usize;
-    if n <= 2 {
-        return Ok(None);
-    }
-    if n > MAX_FRAME {
-        return Err(format!("length {n}"));
+    match n {
+        0 => return Ok(Frame::Sentinel),
+        1 | 2 => return Ok(Frame::Empty),
+        _ if n > MAX_FRAME => return Err(format!("length {n}")),
+        _ => {}
     }
     let t = call_ms(hw, deadline).ok_or("deadline")?;
     let mut f = alloc::vec![0u8; n];
     hw.read_input(&mut f, t)?;
-    Ok(Some(f))
+    Ok(Frame::Data(f))
 }
 
-/// Frames until one comes or the time ends.
-fn wait_frame<H: Hw>(hw: &mut H, until: u64, deadline: u64) -> Result<Option<Vec<u8>>, String> {
-    let until = until.min(deadline);
-    loop {
-        if let Some(f) = read_frame(hw, deadline)? {
-            return Ok(Some(f));
+/// One frame from the input register; `Ok(None)` when no report waits (length 0 or 2).
+pub fn read_frame<H: Hw>(hw: &mut H, deadline: u64) -> Result<Option<Vec<u8>>, String> {
+    Ok(match read_any(hw, deadline)? {
+        Frame::Data(f) => Some(f),
+        _ => None,
+    })
+}
+
+/// Polls the input register every [`POLL_MS`] until `want` takes what it gave, for at
+/// most `max_ms` (never past `deadline`). A read that fails counts as nothing yet: a
+/// controller busy starting up doesn't answer its address. Logged (`TOUCH_WAIT`) and
+/// reported (`key`) with how long it took.
+fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadline: u64, mut want: impl FnMut(Frame) -> Option<T>) -> Option<T> {
+    let start = hw.now_ms();
+    let until = (start + max_ms).min(deadline);
+    let (mut errs, mut last) = (0u32, String::new());
+    let got = loop {
+        match read_any(hw, deadline) {
+            Ok(f) => {
+                if let Some(t) = want(f) {
+                    break Some(t);
+                }
+            }
+            Err(e) => {
+                errs += 1;
+                last = e;
+            }
         }
         if hw.now_ms() + POLL_MS >= until {
-            return Ok(None);
+            break None;
         }
         hw.stall_ms(POLL_MS);
+    };
+    let ms = hw.now_ms().saturating_sub(start);
+    let errs = if errs > 0 { format!(" read_errors={errs} last={last}") } else { String::new() };
+    let v = format!("{} ms {}{errs}", ms, if got.is_some() { "ok" } else { "timeout" });
+    hw.log(&format!("TOUCH_WAIT {} {v}", key.trim_start_matches("touch.wait.")));
+    match up.lines.iter_mut().find(|l| l.0 == key) {
+        Some(l) => l.1 = v,
+        None => up.lines.push((key, v)),
+    }
+    got
+}
+
+/// A write, sent again every 10 ms while the controller doesn't take it (a busy
+/// controller doesn't answer its address), for at most [`WRITE_RETRY_MS`].
+fn write_retry<H: Hw>(hw: &mut H, reg: u16, data: &[u8], deadline: u64) -> Result<(), String> {
+    let start = hw.now_ms();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let t = call_ms(hw, deadline).ok_or("deadline")?;
+        let r = hw.write(reg, data, t);
+        let ms = hw.now_ms().saturating_sub(start);
+        match r {
+            Ok(()) => {
+                if tries > 1 {
+                    hw.log(&format!("TOUCH_WAIT write 0x{reg:04x} {ms} ms ok tries={tries}"));
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if ms + 10 > WRITE_RETRY_MS || hw.now_ms() + 10 >= deadline {
+                    hw.log(&format!("TOUCH_WAIT write 0x{reg:04x} {ms} ms failed tries={tries}"));
+                    return Err(e);
+                }
+                hw.stall_ms(10);
+            }
+        }
     }
 }
 
@@ -258,31 +334,33 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     }
     up.opened = true;
     up.lines.push(("touch.open", format!("instance={I2C_INSTANCE} address=0x{I2C_ADDRESS:02x} khz={I2C_KHZ}")));
-    // What waits after the reset (mainline's deassert-int): read until empty.
-    for _ in 0..8 {
-        if read_frame(hw, deadline).map_err(|e| format!("empty: {e}"))?.is_none() {
-            break;
-        }
-    }
-    // The bootloader's launch-app: its answer is logged; a failure isn't fatal (the lab
-    // saw an error status there with the controller working).
-    let t = call_ms(hw, deadline).ok_or("launch: deadline")?;
-    let launch = match hw.write(REG_OUTPUT, &launch_app_cmd(), t) {
+    // The reset sentinel (length 0); anything before it is dropped.
+    wait(hw, up, "touch.wait.reset", RESET_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
+    // The bootloader's launch-app and its answer (lengths 0 and 2 aren't one); then the
+    // application, once started, sends its own sentinel. None of it is fatal: a
+    // controller already in its application answers launch-app with an error or not at
+    // all (the lab saw an error status there with the controller working).
+    let launch = match write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
         Err(e) => format!("write failed {e}"),
-        Ok(()) => {
-            let now = hw.now_ms();
-            match wait_frame(hw, now + 300, deadline) {
-                Ok(Some(f)) => format!("answer {}", hex(&f[..f.len().min(16)])),
-                Ok(None) => "no answer".into(),
-                Err(e) => format!("read failed {e}"),
+        Ok(()) => match wait(hw, up, "touch.wait.launch", LAUNCH_WAIT_MS, deadline, |f| match f {
+            Frame::Data(f) => Some(f),
+            _ => None,
+        }) {
+            Some(f) => {
+                wait(hw, up, "touch.wait.app", APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
+                format!("answer {}", hex(&f[..f.len().min(16)]))
             }
-        }
+            None => "no answer".into(),
+        },
     };
     up.lines.push(("touch.launch", launch));
     // The HID descriptor.
-    let t = call_ms(hw, deadline).ok_or("hid: deadline")?;
-    hw.write(REG_HID_DESC, &[], t).map_err(|e| format!("hid: write {e}"))?;
-    let desc = wait_frame(hw, deadline, deadline).map_err(|e| format!("hid: {e}"))?.ok_or_else(|| String::from("hid: no answer"))?;
+    write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
+    let desc = wait(hw, up, "touch.wait.hid", DEADLINE_MS, deadline, |f| match f {
+        Frame::Data(f) => Some(f),
+        _ => None,
+    })
+    .ok_or_else(|| String::from("hid: no answer"))?;
     up.lines.push(("touch.desc", hex(&desc)));
     if !hid_ok(&desc) {
         up.lines.push(("touch.hid", "unknown".into()));
@@ -292,10 +370,14 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     up.lines.push(("touch.hid", format!("vendor=0x{:04x} product=0x{:04x} version=0x{:04x} max_input={}", le(22), le(24), le(26), le(12))));
     // The system information, asked again while the answer isn't one (lab patch 0002).
     for ask in 1..=5u32 {
-        let Some(t) = call_ms(hw, deadline) else { break };
-        hw.write(REG_OUTPUT, &SYSINFO_CMD_BYTES, t).map_err(|e| format!("sysinfo: write {e}"))?;
-        let now = hw.now_ms();
-        let f = wait_frame(hw, now + 500, deadline).map_err(|e| format!("sysinfo: {e}"))?;
+        if call_ms(hw, deadline).is_none() {
+            break;
+        }
+        write_retry(hw, REG_OUTPUT, &SYSINFO_CMD_BYTES, deadline).map_err(|e| format!("sysinfo: write {e}"))?;
+        let f = wait(hw, up, "touch.wait.sysinfo", 500, deadline, |f| match f {
+            Frame::Data(f) => Some(f),
+            _ => None,
+        });
         match f.as_deref().and_then(parse_sysinfo) {
             Some(si) => {
                 up.lines.push(("touch.sysinfo", hex(f.as_deref().unwrap_or(&[]))));

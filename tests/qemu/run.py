@@ -1475,6 +1475,27 @@ def touch_probe_fails_at_each_step_and_powers_down():
 
 
 @case("x86_64", "aarch64")
+def touch_probe_waits_for_a_slow_controller():
+    """005 FR-005, FR-007: the reset sentinel, the bootloader's answer to launch-app and
+    the application's sentinel are waited for (logged TOUCH_WAIT with their duration);
+    writes the controller doesn't take are sent again; all inside the deadline."""
+    for mode in ("slow-boot", "nack-first", "late-app"):
+        d, log, keys, c, seq = touch_run(f"touch-{mode}", mode)
+        ms = lambda k: int(keys[k].split()[0])
+        assert keys["touch.launch"].startswith("answer 0b00"), (mode, keys)
+        assert keys["touch.wait.reset"].endswith("ok") and " ok" in keys["touch.wait.app"], (mode, keys)
+        assert re.search(r"TOUCH_WAIT reset \d+ ms ok", log) and re.search(r"TOUCH_WAIT launch \d+ ms ok", log), mode
+        if mode == "slow-boot":
+            assert ms("touch.wait.launch") >= 100, keys
+        if mode == "late-app":
+            assert ms("touch.wait.app") >= 400 and "read_errors=" in keys["touch.wait.app"], keys
+            assert seq.index("wr0001:") > seq.index(next(o for o in seq if o.startswith("wr0004:0b00"))), seq
+        if mode == "nack-first":
+            assert re.search(r"TOUCH_WAIT write 0x0004 \d+ ms ok tries=4", log), log[-2000:]
+            assert sum(o.startswith("wr0004:0b00") for o in seq) == 4, seq
+
+
+@case("x86_64", "aarch64")
 def touch_probe_a_hang_is_not_repeated():
     """005 Scenario 3, FR-004: an I2C read that never returns: the machine is reset; the
     next start finds touch cleared, makes no GPIO or I2C call and answers. A record
