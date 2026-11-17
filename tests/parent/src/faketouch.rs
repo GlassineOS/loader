@@ -20,7 +20,9 @@
 //! `baddesc` (a descriptor of the wrong version), `slow-boot` (the answer to launch-app
 //! 30 reads late, about 150 ms), `nack-first` (the first three writes not taken),
 //! `late-app` (the application's sentinel 140 reads, about 700 ms, after the answer,
-//! reads and writes not taken until then), `sysinfo-retry` (the first two
+//! reads and writes not taken until then), `sysinfo-late` (the first `GET_SYSINFO`
+//! answered 500 reads, about 2.5 s, late), `sysinfo-second` (the first never answered,
+//! the second 150 reads late), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -59,6 +61,8 @@ pub enum Mode {
     SlowBoot,
     NackFirst,
     LateApp,
+    SysinfoLate,
+    SysinfoSecond,
 }
 
 impl Mode {
@@ -77,6 +81,8 @@ impl Mode {
             "slow-boot" => Mode::SlowBoot,
             "nack-first" => Mode::NackFirst,
             "late-app" => Mode::LateApp,
+            "sysinfo-late" => Mode::SysinfoLate,
+            "sysinfo-second" => Mode::SysinfoSecond,
             _ => return None,
         })
     }
@@ -308,6 +314,7 @@ fn sysinfo() -> Vec<u8> {
 fn descriptor(version: u16) -> Vec<u8> {
     let mut d = alloc::vec![0u8; 32];
     d[0] = 32;
+    d[2] = 0xf7; // the application's packet id
     d[4..6].copy_from_slice(&version.to_le_bytes());
     d[8] = 0x02; // report descriptor register
     d[10] = 0x03; // input register
@@ -362,7 +369,12 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
                 Mode::SysinfoRetry => s.sysinfo_asks <= 2,
                 _ => false,
             };
-            s.queue.push_back(if empty { alloc::vec![0, 0] } else { sysinfo() });
+            match s.mode {
+                Mode::SysinfoLate if s.sysinfo_asks == 1 => s.due.push((s.reads + 500, sysinfo())),
+                Mode::SysinfoSecond if s.sysinfo_asks == 1 => {}
+                Mode::SysinfoSecond => s.due.push((s.reads + 150, sysinfo())),
+                _ => s.queue.push_back(if empty { alloc::vec![0, 0] } else { sysinfo() }),
+            }
         }
         _ => {}
     }

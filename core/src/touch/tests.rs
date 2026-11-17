@@ -27,6 +27,12 @@ enum Fail {
     LateApp,
     /// No answer to launch-app (a controller already in its application).
     NoLaunch,
+    /// The first GET_SYSINFO answered 2.5 s late.
+    SysinfoLate,
+    /// The first GET_SYSINFO never answered, the second after 770 ms.
+    SysinfoSecond,
+    /// Still in the bootloader at the descriptor: the first launch-app unanswered.
+    Bootloader,
 }
 
 struct Fake {
@@ -45,6 +51,7 @@ struct Fake {
     /// Neither reads nor writes are taken in this window.
     busy: (u64, u64),
     nacks: u32,
+    launched: bool,
 }
 
 impl Fake {
@@ -63,6 +70,7 @@ impl Fake {
             due: Vec::new(),
             busy: (0, 0),
             nacks: 0,
+            launched: false,
         };
         if found_on {
             f.out[61] = Some(true);
@@ -102,8 +110,13 @@ impl Fake {
 }
 
 fn desc(version: u16) -> Vec<u8> {
+    desc_as(version, PACKET_APP)
+}
+
+fn desc_as(version: u16, packet: u8) -> Vec<u8> {
     let mut d = vec![0u8; 32];
     d[0] = 32;
+    d[2] = packet;
     d[4..6].copy_from_slice(&version.to_le_bytes());
     d[22..24].copy_from_slice(&0x04b4u16.to_le_bytes());
     d
@@ -199,15 +212,18 @@ impl Hw for Fake {
             (0x0001, []) => match self.fail {
                 Fail::NoDesc => {}
                 Fail::BadDesc => self.queue.push_back(desc(0x0200)),
+                _ if self.fail == Fail::Bootloader && !self.launched => self.queue.push_back(desc_as(0x0100, PACKET_BL)),
                 _ => self.queue.push_back(desc(0x0100)),
             },
             (0x0004, d) if d == launch_app_cmd() && self.fail == Fail::NoLaunch => {}
+            (0x0004, d) if d == launch_app_cmd() && self.fail == Fail::Bootloader && !self.ops.iter().any(|o| o == "wr0001:") => {}
             (0x0004, d) if d == launch_app_cmd() => {
                 // The answer, then the application's sentinel.
                 let answer = self.now + if self.fail == Fail::SlowBoot { 150 } else { 10 };
                 let app = answer + if self.fail == Fail::LateApp { 700 } else { 20 };
                 self.due.push((answer, vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
                 self.due.push((app, vec![0, 0]));
+                self.launched = true;
                 if self.fail == Fail::LateApp {
                     self.busy = (answer + 20, app);
                 }
@@ -215,7 +231,12 @@ impl Hw for Fake {
             (0x0004, d) if d == SYSINFO_CMD_BYTES => {
                 self.asks += 1;
                 let empty = self.fail == Fail::NoSysinfo || (self.fail == Fail::SysinfoTwice && self.asks <= 2);
-                self.queue.push_back(if empty { vec![0, 0] } else { sysinfo(1872, 1404, 0) });
+                match self.fail {
+                    Fail::SysinfoLate if self.asks == 1 => self.due.push((self.now + 2500, sysinfo(1872, 1404, 0))),
+                    Fail::SysinfoSecond if self.asks == 1 => {}
+                    Fail::SysinfoSecond => self.due.push((self.now + 770, sysinfo(1872, 1404, 0))),
+                    _ => self.queue.push_back(if empty { vec![0, 0] } else { sysinfo(1872, 1404, 0) }),
+                }
             }
             _ => {}
         }
@@ -392,4 +413,40 @@ fn a_launch_without_an_answer_isnt_fatal() {
     assert!(up.ok(), "{:?}", up.lines);
     assert_eq!(line(&up, "touch.launch"), "no answer");
     assert!(line(&up, "touch.wait.launch").contains("timeout") && line(&up, "touch.wait.app").is_empty(), "{:?}", up.lines);
+}
+
+#[test]
+fn sysinfo_is_waited_for_like_linux() {
+    let mut f = Fake::new(Fail::SysinfoLate, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(f.asks, 1, "sent once");
+    assert!(line(&up, "touch.res").ends_with("ask=1"));
+    let ms: u64 = line(&up, "touch.wait.sysinfo").split(' ').next().unwrap().parse().unwrap();
+    assert!((2450..=2600).contains(&ms), "{:?}", up.lines);
+    let mut f = Fake::new(Fail::SysinfoSecond, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(f.asks, 2);
+    assert!(line(&up, "touch.res").ends_with("ask=2"));
+    assert!(f.now - 1000 < DEADLINE_MS);
+    // Never answered: three sends, then the failure, inside the deadline.
+    let mut f = Fake::new(Fail::NoSysinfo, false);
+    let up = bring_up(&mut f, false);
+    assert_eq!(f.asks, SYSINFO_SENDS);
+    assert!(up.result.as_ref().unwrap_err().starts_with("sysinfo") && f.now - 1000 <= DEADLINE_MS + CALL_MS + 10);
+}
+
+#[test]
+fn the_mode_from_the_descriptor() {
+    let mut f = Fake::new(Fail::None, false);
+    let up = bring_up(&mut f, false);
+    assert_eq!(line(&up, "touch.mode"), "app");
+    let mut f = Fake::new(Fail::Bootloader, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!((line(&up, "touch.mode"), line(&up, "touch.mode.bl")), ("bl", "app"), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.launch"), "no answer");
+    assert!(line(&up, "touch.launch.bl").starts_with("answer"), "{:?}", up.lines);
+    assert_eq!(f.ops.iter().filter(|o| o.starts_with("wr0004:0b00")).count(), 2);
 }
