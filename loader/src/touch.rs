@@ -97,6 +97,9 @@ impl Hw for Fw {
             b.close();
         }
     }
+    fn log(&mut self, line: &str) {
+        log!("{}", line);
+    }
 }
 
 /// `touch=probe` (FR-005 to FR-010): one bring-up, released before it returns; the

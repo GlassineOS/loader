@@ -9,14 +9,18 @@
 //! - The I2C protocol: six words, revision 0x10000; `open` of instance 3 only, `read`
 //!   and `write` of address 0x24 only.
 //! - The controller answers only while both power pins (61, 62) are high and its reset
-//!   (66) is high, after a reset pulse. After the reset it has the empty frame `00 00`
-//!   waiting; the bootloader's launch-app command, the HID descriptor (register 0x0001)
+//!   (66) is high, after a reset pulse. After the reset it has the reset sentinel
+//!   `00 00` waiting (with nothing waiting a read gives length 2); the bootloader's
+//!   launch-app command (its answer, then the application's sentinel), the HID descriptor (register 0x0001)
 //!   and `GET_SYSINFO` (to register 0x0004) each queue their answer. A read of register
 //!   0x03 gives the first bytes of the waiting frame and takes it when it reads it whole.
 //!
 //! Modes: `1` all good; `powered` 61 and 62 read high before anything (the controller
 //! found powered); `fail-open`, `fail-write`, `nodesc` (no answer to the descriptor),
-//! `baddesc` (a descriptor of the wrong version), `sysinfo-retry` (the first two
+//! `baddesc` (a descriptor of the wrong version), `slow-boot` (the answer to launch-app
+//! 30 reads late, about 150 ms), `nack-first` (the first three writes not taken),
+//! `late-app` (the application's sentinel 140 reads, about 700 ms, after the answer,
+//! reads and writes not taken until then), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -52,6 +56,9 @@ pub enum Mode {
     NoSysinfo,
     HangRead,
     FailGpio,
+    SlowBoot,
+    NackFirst,
+    LateApp,
 }
 
 impl Mode {
@@ -67,6 +74,9 @@ impl Mode {
             "nosysinfo" => Mode::NoSysinfo,
             "hang-read" => Mode::HangRead,
             "fail-gpio" => Mode::FailGpio,
+            "slow-boot" => Mode::SlowBoot,
+            "nack-first" => Mode::NackFirst,
+            "late-app" => Mode::LateApp,
             _ => return None,
         })
     }
@@ -87,6 +97,14 @@ struct State {
     counts: [u32; 8],
     open_handles: u32,
     taps: Vec<(u32, u16, u16)>,
+    /// Reads of the input register so far: the stand-in's clock (the loader polls about
+    /// every 5 ms).
+    reads: u32,
+    /// Frames due at a read count.
+    due: Vec<(u32, Vec<u8>)>,
+    /// Reads and writes not taken in this window of read counts.
+    busy: (u32, u32),
+    nacks: u32,
     tap_next: usize,
     tap_read: u32,
     tap_quiet: u32,
@@ -235,8 +253,26 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
     if !s.up {
         return 0x8001; // no answer: a NACK
     }
+    s.reads += 1;
+    if (s.busy.0..s.busy.1).contains(&s.reads) {
+        return 0x1100_00c8;
+    }
+    let now = s.reads;
+    let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due).into_iter().partition(|(t, _)| *t <= now);
+    s.due = later;
+    s.queue.extend(ready.into_iter().map(|(_, f)| f));
     if len == 2 && s.queue.is_empty() {
         next_tap(s);
+    }
+    if s.queue.is_empty() {
+        // Nothing waiting: length 2.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
+        out.fill(0);
+        out[0] = 2;
+        if !done.is_null() {
+            unsafe { *done = len as u32 };
+        }
+        return 0;
     }
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
     out.fill(0);
@@ -296,8 +332,12 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
     if s.mode == Mode::FailWrite {
         return 0x8002;
     }
-    if !s.up {
-        return 0x8001;
+    if s.mode == Mode::NackFirst && s.nacks < 3 {
+        s.nacks += 1;
+        return 0x1100_00c8;
+    }
+    if !s.up || (s.busy.0..s.busy.1).contains(&s.reads) {
+        return 0x1100_00c8;
     }
     match (reg, &data[1..]) {
         (0x0001, []) => match s.mode {
@@ -305,7 +345,16 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
             Mode::BadDesc => s.queue.push_back(descriptor(0x0200)),
             _ => s.queue.push_back(descriptor(0x0100)),
         },
-        (0x0004, [0x0b, 0x00, 0x40, 0x00, 0x01, 0x3b, ..]) => s.queue.push_back(alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]),
+        (0x0004, [0x0b, 0x00, 0x40, 0x00, 0x01, 0x3b, ..]) => {
+            // The bootloader's answer, then the application's sentinel (in reads).
+            let answer = s.reads + if s.mode == Mode::SlowBoot { 30 } else { 2 };
+            let app = answer + if s.mode == Mode::LateApp { 140 } else { 4 };
+            s.due.push((answer, alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+            s.due.push((app, alloc::vec![0, 0]));
+            if s.mode == Mode::LateApp {
+                s.busy = (answer + 4, app);
+            }
+        }
         (0x0004, [0x05, 0x00, 0x2f, 0x00, 0x02]) => {
             s.sysinfo_asks += 1;
             let empty = match s.mode {
@@ -353,6 +402,10 @@ pub fn install(mode: Mode) -> String {
         counts: [0; 8],
         open_handles: 0,
         taps: Vec::new(),
+        reads: 0,
+        due: Vec::new(),
+        busy: (0, 0),
+        nacks: 0,
         tap_next: 0,
         tap_read: 0,
         tap_quiet: 1000,
