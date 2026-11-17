@@ -28,7 +28,8 @@
 //! `linux-trace` (Linux's own probe on the device: no answer to launch-app, the
 //! application's five sentinels 80 ms after it; before them the descriptor says
 //! bootloader, 0xFF, and a `GET_SYSINFO` is lost; after them `GET_SYSINFO` answered
-//! 745 ms later), `irq-stuck` (the interrupt never asserted), `sysinfo-retry` (the first two
+//! 745 ms later), `irq-stuck` (the interrupt never asserted), `rail-off` (pm660l LDO3 off: the
+//! controller answers but senses no taps until it is on), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -36,6 +37,10 @@
 //! `parent.taps` does for the stand-in pointer: tap k once the loader has made n
 //! refreshes and 60 reads of the input register passed since the last one; five touch
 //! reports with the contact down, then one with it lifted off, one per read.
+//!
+//! - The PMIC regulator protocol: seven words, revision 0x10005; PMIC 0 LDO3 (1.0 V)
+//!   and LDO11 (1.8 V) on, PMIC 1 LDO3 (3.3 V) on except in `rail-off`; any other
+//!   regulator an invalid parameter. Every call recorded (`vreg ...`).
 //!
 //! After the loader returns, [`report`] prints the counts and the call sequence.
 use alloc::boxed::Box;
@@ -49,6 +54,7 @@ use uefi::{Guid, Status, guid};
 
 const I2C_GUID: Guid = guid!("b27ae8b1-3e10-4d07-ab5c-eb9a6dc6fa8f");
 const GPIO_GUID: Guid = guid!("ad9aec18-7bf0-4809-9e96-3012309f3df7");
+const VREG_GUID: Guid = guid!("22d38d3d-e8b6-4f8f-9c26-bceb07d6cb68");
 const ADDR: u32 = 0x24;
 const INSTANCE: u32 = 3;
 
@@ -72,6 +78,7 @@ pub enum Mode {
     EarlySentinel,
     LinuxTrace,
     IrqStuck,
+    RailOff,
 }
 
 impl Mode {
@@ -95,6 +102,7 @@ impl Mode {
             "early-sentinel" => Mode::EarlySentinel,
             "linux-trace" => Mode::LinuxTrace,
             "irq-stuck" => Mode::IrqStuck,
+            "rail-off" => Mode::RailOff,
             _ => return None,
         })
     }
@@ -104,6 +112,9 @@ struct State {
     mode: Mode,
     /// When the application's sentinels come (after launch-app).
     app_at: Option<u64>,
+    /// The regulators: (pmic, regulator id) → (on, mV); the calls made.
+    rails: Vec<((u32, u32), (bool, u32))>,
+    vreg_seq: Vec<String>,
     /// Per pin: Some(level) when an output.
     out: [Option<bool>; 128],
     /// The latched output level per pin (set before configure).
@@ -298,7 +309,7 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
         return 0x1100_00c8;
     }
     due(s);
-    if len == 2 && s.queue.is_empty() {
+    if len == 2 && s.queue.is_empty() && sensing(s) {
         next_tap(s);
     }
     if s.queue.is_empty() {
@@ -331,6 +342,74 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
 
 fn app_started(s: &State) -> bool {
     s.app_at.is_some_and(|t| now_ms() >= t)
+}
+
+/// The panel senses only with pm660l LDO3 on.
+fn sensing(s: &State) -> bool {
+    s.rails.iter().any(|r| r.0 == (1, 2) && r.1.0)
+}
+
+fn rail(s: &mut State, pmic: u32, id: u32) -> Option<&mut (bool, u32)> {
+    s.rails.iter_mut().find(|r| r.0 == (pmic, id)).map(|r| &mut r.1)
+}
+
+unsafe extern "efiapi" fn vreg_control(pmic: u32, id: u32, on: u8) -> Status {
+    let s = st();
+    s.vreg_seq.push(format!("ctl{pmic}.{id}={on}"));
+    match rail(s, pmic, id) {
+        Some(r) => {
+            r.0 = on != 0;
+            Status::SUCCESS
+        }
+        None => Status::INVALID_PARAMETER,
+    }
+}
+
+unsafe extern "efiapi" fn vreg_set_level(pmic: u32, id: u32, mv: u32) -> Status {
+    let s = st();
+    s.vreg_seq.push(format!("set{pmic}.{id}={mv}"));
+    match rail(s, pmic, id) {
+        Some(r) => {
+            r.1 = mv;
+            Status::SUCCESS
+        }
+        None => Status::INVALID_PARAMETER,
+    }
+}
+
+unsafe extern "efiapi" fn vreg_get_level(pmic: u32, id: u32, out: *mut u32) -> Status {
+    let s = st();
+    s.vreg_seq.push(format!("lvl{pmic}.{id}"));
+    match rail(s, pmic, id) {
+        Some(r) => {
+            unsafe { *out = r.1 };
+            Status::SUCCESS
+        }
+        None => Status::INVALID_PARAMETER,
+    }
+}
+
+unsafe extern "efiapi" fn vreg_get_status(pmic: u32, id: u32, out: *mut u32) -> Status {
+    let s = st();
+    s.vreg_seq.push(format!("st{pmic}.{id}"));
+    match rail(s, pmic, id) {
+        Some(r) => {
+            // pull-down, mode, pin control, software enable, then the "ok" byte.
+            let on = r.0 as u32;
+            unsafe {
+                for (i, v) in [0, 2, 0, on, on].into_iter().enumerate() {
+                    *out.add(i) = v;
+                }
+            }
+            Status::SUCCESS
+        }
+        None => Status::INVALID_PARAMETER,
+    }
+}
+
+unsafe extern "efiapi" fn vreg_other() -> Status {
+    st().vreg_seq.push(String::from("other"));
+    Status::UNSUPPORTED
 }
 
 /// The frames whose time has come, waiting.
@@ -519,6 +598,8 @@ pub fn install(mode: Mode) -> String {
         reads: 0,
         reads_high: 0,
         app_at: None,
+        rails: alloc::vec![((0, 2), (true, 1000)), ((1, 2), (mode != Mode::RailOff, 3300)), ((0, 10), (true, 1800))],
+        vreg_seq: Vec::new(),
         busy: (0, 0),
         nacks: 0,
         due_ms: Vec::new(),
@@ -552,7 +633,18 @@ pub fn install(mode: Mode) -> String {
         i2c_transfer as *const () as u64,
         i2c_close as *const () as u64,
     ];
+    let vreg: [u64; 8] = [
+        0x10005,
+        vreg_control as *const () as u64,
+        vreg_set_level as *const () as u64,
+        vreg_get_level as *const () as u64,
+        vreg_other as *const () as u64,
+        vreg_other as *const () as u64,
+        vreg_get_status as *const () as u64,
+        vreg_other as *const () as u64,
+    ];
     unsafe {
+        boot::install_protocol_interface(None, &VREG_GUID, leak(vreg) as *const c_void).expect("install vreg");
         boot::install_protocol_interface(None, &GPIO_GUID, leak(gpio) as *const c_void).expect("install gpio");
         boot::install_protocol_interface(None, &I2C_GUID, leak(i2c) as *const c_void).expect("install i2c");
     }
@@ -619,5 +711,6 @@ pub fn report() -> Vec<String> {
             s.reads_high
         ),
         format!("PARENT_FAKETOUCH seq {}", s.seq.join(" ")),
+        format!("PARENT_FAKETOUCH vreg {} l3b={}", s.vreg_seq.join(" "), sensing(s) as u8),
     ]
 }

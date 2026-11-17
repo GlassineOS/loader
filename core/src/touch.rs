@@ -107,7 +107,43 @@ pub trait Hw {
     /// Writes the two-byte register `reg` (low byte first) and reads `buf.len()` bytes
     /// back in the same transfer.
     fn read_reg(&mut self, reg: u16, buf: &mut [u8], timeout_ms: u32) -> Result<(), String>;
+    /// A regulator of PMIC `pmic` (LDO `ldo`, numbered from 1): whether it is enabled
+    /// and its level in mV (read only). Without the firmware's regulator protocol, an
+    /// error.
+    fn rail_get(&mut self, _pmic: u32, _ldo: u32) -> Result<(bool, u32), String> {
+        Err("none".into())
+    }
+    /// Sets its level (mV).
+    fn rail_set(&mut self, _pmic: u32, _ldo: u32, _mv: u32) -> Result<(), String> {
+        Err("none".into())
+    }
+    /// Enables or disables it.
+    fn rail_enable(&mut self, _pmic: u32, _ldo: u32, _on: bool) -> Result<(), String> {
+        Err("none".into())
+    }
 }
+
+/// A supply behind the controller's power switches (`touch_rail=on` turns it on when
+/// off): its name, PMIC index and LDO, the level it is set to, and the levels its
+/// current setting must be in for the loader to touch it (else it isn't that supply).
+pub struct Rail {
+    pub name: &'static str,
+    pub pmic: u32,
+    pub ldo: u32,
+    pub mv: u32,
+    pub expect: (u32, u32),
+}
+
+/// pm660l LDO3 (3.3 V, behind 61) and pm660 LDO11 (1.8 V, behind 62); PMIC index 0 is
+/// pm660, 1 pm660l (unverified on the device: the reads below report all three).
+pub const RAILS: [Rail; 2] = [
+    Rail { name: "l3b", pmic: 1, ldo: 3, mv: 3300, expect: (2800, 3400) },
+    Rail { name: "l11a", pmic: 0, ldo: 11, mv: 1800, expect: (1700, 1950) },
+];
+/// The regulators read (only read) at every bring-up: LDO3 and LDO11 of PMICs 0 to 2.
+pub const RAIL_READS: [(u32, u32); 6] = [(0, 3), (1, 3), (2, 3), (0, 11), (1, 11), (2, 11)];
+/// After turning a supply on, before the power switches.
+pub const RAIL_SETTLE_MS: u64 = 5;
 
 /// The CRC the controller's bootloader commands carry (CRC-16/CCITT, MSB first, as
 /// Linux's `crc_itu_t`).
@@ -333,9 +369,16 @@ pub struct Up {
     pub lines: Vec<(&'static str, String)>,
     /// The interrupt was seen asserted (from then on no fallback reads).
     pub irq_seen: bool,
+    /// `touch_rail=on`: the supplies turned on when off.
+    pub rail: bool,
+    /// The supplies the loader turned on (turned off again at the power-down).
+    pub rails_on: Vec<(u32, u32)>,
 }
 
 impl Up {
+    pub fn new(rail: bool) -> Up {
+        Up { found: Vec::new(), found_on: false, powered: false, opened: false, sysinfo: None, result: Ok(()), lines: Vec::new(), irq_seen: false, rail, rails_on: Vec::new() }
+    }
     pub fn ok(&self) -> bool {
         self.result.is_ok()
     }
@@ -345,9 +388,15 @@ impl Up {
 /// powered for the tap source; else (or after a failure) both are released by
 /// [`power_down`] before this returns.
 pub fn bring_up<H: Hw>(hw: &mut H, keep: bool) -> Up {
+    bring_up_with(hw, keep, false)
+}
+
+/// [`bring_up`]; with `rail` (`touch_rail=on`) the supplies ([`RAILS`]) are turned on
+/// first when off.
+pub fn bring_up_with<H: Hw>(hw: &mut H, keep: bool, rail: bool) -> Up {
     let start = hw.now_ms();
     let deadline = start + DEADLINE_MS;
-    let mut up = Up { found: Vec::new(), found_on: false, powered: false, opened: false, sysinfo: None, result: Ok(()), lines: Vec::new(), irq_seen: false };
+    let mut up = Up::new(rail);
     let r = steps(hw, &mut up, deadline);
     up.result = r;
     let el = hw.now_ms().saturating_sub(start);
@@ -375,6 +424,11 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
         return Err("found: a pin can't be read".into());
     }
     up.found_on = up.found[0] == Ok(true) && up.found[1] == Ok(true);
+    rails_read(hw, up);
+    if up.rail {
+        let v = if up.found_on { "skipped found on".into() } else { rails_on(hw, up) };
+        up.lines.push(("touch.rail.on", v));
+    }
     if up.found_on {
         up.lines.push(("touch.power", "found on: left as found".into()));
     } else {
@@ -552,9 +606,64 @@ fn hid_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<Vec<u8>, St
     Ok(desc)
 }
 
+/// The supplies' state, read only (`touch.rail.p<pmic>.l<ldo>`: `on|off <mV> mV`, or
+/// `error <why>`).
+fn rails_read<H: Hw>(hw: &mut H, up: &mut Up) {
+    for (pmic, ldo) in RAIL_READS {
+        let v = match hw.rail_get(pmic, ldo) {
+            Ok((on, mv)) => format!("{} {mv} mV", if on { "on" } else { "off" }),
+            Err(e) => format!("error {e}"),
+        };
+        up.lines.push((rail_key(pmic, ldo), v));
+    }
+}
+
+fn rail_key(pmic: u32, ldo: u32) -> &'static str {
+    match (pmic, ldo) {
+        (0, 3) => "touch.rail.p0.l3",
+        (1, 3) => "touch.rail.p1.l3",
+        (2, 3) => "touch.rail.p2.l3",
+        (0, 11) => "touch.rail.p0.l11",
+        (1, 11) => "touch.rail.p1.l11",
+        (2, 11) => "touch.rail.p2.l11",
+        _ => "touch.rail.other",
+    }
+}
+
+/// `touch_rail=on`: each supply in [`RAILS`] that is off and whose setting is in its
+/// expected range is set to its level and enabled (recorded for the power-down). One
+/// already on, or not readable, or out of range is left alone. Never fatal.
+fn rails_on<H: Hw>(hw: &mut H, up: &mut Up) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for r in &RAILS {
+        let v = match hw.rail_get(r.pmic, r.ldo) {
+            Err(e) => format!("{} error {e}", r.name),
+            Ok((true, mv)) => format!("{} already on {mv} mV", r.name),
+            Ok((false, mv)) if mv < r.expect.0 || mv > r.expect.1 => format!("{} refused {mv} mV", r.name),
+            Ok((false, _)) => match hw.rail_set(r.pmic, r.ldo, r.mv).and_then(|()| hw.rail_enable(r.pmic, r.ldo, true)) {
+                Err(e) => format!("{} failed {e}", r.name),
+                Ok(()) => {
+                    up.rails_on.push((r.pmic, r.ldo));
+                    match hw.rail_get(r.pmic, r.ldo) {
+                        Ok((on, mv)) => format!("{} turned on {} {mv} mV", r.name, if on { "on" } else { "off" }),
+                        Err(e) => format!("{} turned on, read error {e}", r.name),
+                    }
+                }
+            },
+        };
+        out.push(v);
+    }
+    if !up.rails_on.is_empty() {
+        hw.stall_ms(RAIL_SETTLE_MS);
+    }
+    out.join(", ")
+}
+
 /// Releases what the bring-up took (FR-008): the bus closed; the controller powered
-/// down when the loader powered it (reset low, 62 low, 61 low); found on, the power left
-/// and the reset high.
+/// down when the loader powered it (reset low, 62 low, 61 low), then the supplies the
+/// loader turned on turned off, then the three pins it drove configured as inputs (the
+/// firmware's protocol can't read a pin's configuration to restore it); found on, the
+/// power left and the reset high.
 pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
     if up.opened {
         hw.close();
@@ -569,6 +678,23 @@ pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
         }
         up.powered = false;
         up.lines.push(("touch.down", if errs.is_empty() { "off: 66, 62, 61".into() } else { format!("errors {}", errs.join(", ")) }));
+        if !up.rails_on.is_empty() {
+            let mut v: Vec<String> = Vec::new();
+            for (pmic, ldo) in core::mem::take(&mut up.rails_on).into_iter().rev() {
+                v.push(match hw.rail_enable(pmic, ldo, false) {
+                    Ok(()) => format!("p{pmic}.l{ldo} off"),
+                    Err(e) => format!("p{pmic}.l{ldo} error {e}"),
+                });
+            }
+            up.lines.push(("touch.rail.off", v.join(", ")));
+        }
+        let mut v: Vec<String> = Vec::new();
+        for p in [PIN_RESET, PIN_VDDIO, PIN_VDD] {
+            if let Err(e) = hw.pin_in(p) {
+                v.push(format!("{p}: {e}"));
+            }
+        }
+        up.lines.push(("touch.release", if v.is_empty() { "inputs: 66, 62, 61".into() } else { format!("errors {}", v.join(", ")) }));
     } else if up.found_on {
         if let Err(e) = hw.pin_out(PIN_RESET, true) {
             errs.push(format!("66: {e}"));

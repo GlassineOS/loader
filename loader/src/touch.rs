@@ -14,7 +14,7 @@ use glassine_loader_core::touch::{self, Hw, I2C_ADDRESS, I2C_INSTANCE, I2C_KHZ, 
 use uefi::Status;
 
 use crate::epdmenu::TapSource;
-use crate::fwbus::{self, Bus, GPIO, Gpio, I2C, I2c};
+use crate::fwbus::{self, Bus, GPIO, Gpio, I2C, I2c, VREG, Vreg};
 use crate::log;
 
 /// Both protocols, found and checked (FR-001), and the bus once open.
@@ -22,6 +22,9 @@ pub struct Fw {
     gpio: Gpio,
     i2c: I2c,
     bus: Option<Bus>,
+    /// The PMIC regulator protocol, when found and passing its checks (else the rail
+    /// calls give an error and nothing is touched).
+    vreg: Option<Vreg>,
     /// Log every I2C read (the bring-up) or only failed ones (the tap source's polls).
     pub quiet_reads: bool,
     /// Reads not logged: input-register reads with nothing waiting (`02 00`), interrupt
@@ -42,7 +45,14 @@ impl Fw {
         };
         let g = one(GPIO)?;
         let i = one(I2C)?;
-        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, quiet_reads: false, empty_reads: 0, irq_reads: 0 })
+        let vreg = match one(VREG) {
+            Ok(v) => Vreg::new(&v),
+            Err(why) => {
+                log!("TOUCH_PMIC {}", why);
+                None
+            }
+        };
+        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, vreg, quiet_reads: false, empty_reads: 0, irq_reads: 0 })
     }
 }
 
@@ -105,6 +115,15 @@ impl Hw for Fw {
     fn log(&mut self, line: &str) {
         log!("{}", line);
     }
+    fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), String> {
+        self.vreg.as_ref().ok_or("none")?.get(pmic, ldo).map_err(|s| format!("{s:?}"))
+    }
+    fn rail_set(&mut self, pmic: u32, ldo: u32, mv: u32) -> Result<(), String> {
+        st(self.vreg.as_ref().ok_or("none")?.set(pmic, ldo, mv))
+    }
+    fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), String> {
+        st(self.vreg.as_ref().ok_or("none")?.enable(pmic, ldo, on))
+    }
     fn irq_asserted(&mut self) -> Result<bool, String> {
         self.irq_reads += 1;
         self.gpio.read_quiet(touch::PIN_IRQ).map(|l| l == 0).map_err(|s| format!("{s:?}"))
@@ -133,7 +152,7 @@ pub fn probe() -> Vec<String> {
     log!("TOUCH_START probe");
     // The bring-up takes up to its deadline (10 s): a full watchdog period ahead of it.
     crate::watchdog::arm();
-    let up = touch::bring_up(&mut fw, false);
+    let up = touch::bring_up_with(&mut fw, false, RAIL.load(Ordering::Relaxed));
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
     log!("TOUCH_QUIET empty_reads={} irq_reads={}", fw.empty_reads, fw.irq_reads);
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
@@ -146,6 +165,36 @@ static ON: AtomicBool = AtomicBool::new(false);
 pub fn set_on(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
+
+/// Whether the record asks the driver to turn the controller's supplies on
+/// (`touch_rail=on`), set by the hand-back before a bring-up.
+static RAIL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_rail(on: bool) {
+    RAIL.store(on, Ordering::Relaxed);
+}
+
+/// What the tap source saw while the menu was open (spec 005 FR-016), logged at the
+/// menu's close (`TOUCH_MENU`).
+#[derive(Default)]
+struct Seen {
+    polls: u32,
+    irq_low: u32,
+    irq_changes: u32,
+    irq_last: Option<bool>,
+    empty_at_up: u32,
+    sentinels: u32,
+    frames: u32,
+    errors: u32,
+    /// Frames per report id (the frame's third byte).
+    ids: Vec<(u8, u32)>,
+    /// Frames that aren't touch reports, logged raw.
+    other_logged: u32,
+}
+
+/// How many interrupt changes and non-touch frames are logged one by one.
+const SEEN_LOG_MAX: u32 = 16;
+const OTHER_LOG_MAX: u32 = 4;
 
 enum State {
     /// Offered, not brought up (no hardware touched yet).
@@ -163,6 +212,7 @@ pub struct Source {
     w: u32,
     h: u32,
     down: bool,
+    seen: Seen,
 }
 
 /// The driver as the menu's tap source for a native `w`×`h` panel, with `touch=on` and
@@ -181,7 +231,7 @@ pub fn source(w: u32, h: u32) -> Option<Box<dyn TapSource>> {
                 ORIENT.flip_y as u8
             );
             let range = Range { min_x: 0, max_x: RES.0 as u64 - 1, min_y: 0, max_y: RES.1 as u64 - 1 };
-            Some(Box::new(Source { fw, state: State::Offered, range, w, h, down: false }))
+            Some(Box::new(Source { fw, state: State::Offered, range, w, h, down: false, seen: Seen::default() }))
         }
         Err(why) => {
             log!("TOUCH_SKIPPED {}", why);
@@ -193,9 +243,65 @@ pub fn source(w: u32, h: u32) -> Option<Box<dyn TapSource>> {
 impl Source {
     fn fail(&mut self, why: &str) {
         log!("TOUCH {}: no more taps", why);
+        self.release();
+    }
+
+    /// The menu's summary, then the power-down (its lines logged).
+    fn release(&mut self) {
         if let State::Up(mut up) = core::mem::replace(&mut self.state, State::Failed) {
+            let s = &self.seen;
+            let ids: Vec<String> = s.ids.iter().map(|(id, n)| format!("{id:02x}:{n}")).collect();
+            log!(
+                "TOUCH_MENU polls={} irq_low={} irq_changes={} empty={} sentinels={} frames={} ids={} errors={}",
+                s.polls,
+                s.irq_low,
+                s.irq_changes,
+                self.fw.empty_reads.saturating_sub(s.empty_at_up),
+                s.sentinels,
+                s.frames,
+                if ids.is_empty() { String::from("-") } else { ids.join(",") },
+                s.errors
+            );
+            let n = up.lines.len();
             touch::power_down(&mut self.fw, &mut up);
-            log!("TOUCH_DOWN {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
+            for (k, v) in &up.lines[n..] {
+                log!("TOUCH_DOWN {}={}", k, v);
+            }
+        }
+    }
+
+    /// The interrupt's level at a poll: counted, each change logged (the first few).
+    fn watch_irq(&mut self) {
+        let low = match self.fw.irq_asserted() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let s = &mut self.seen;
+        if low {
+            s.irq_low += 1;
+        }
+        if s.irq_last.is_some_and(|l| l != low) {
+            s.irq_changes += 1;
+            if s.irq_changes <= SEEN_LOG_MAX {
+                log!("TOUCH irq {} poll={} ms={}", if low { "low" } else { "high" }, s.polls, crate::arch::now_ms());
+            }
+        }
+        s.irq_last = Some(low);
+    }
+
+    /// One frame read at a poll, counted by its report id; a non-touch frame logged raw
+    /// (the first few).
+    fn note_frame(&mut self, f: &[u8]) {
+        let s = &mut self.seen;
+        s.frames += 1;
+        let id = f.get(2).copied().unwrap_or(0);
+        match s.ids.iter_mut().find(|e| e.0 == id) {
+            Some(e) => e.1 += 1,
+            None => s.ids.push((id, 1)),
+        }
+        if touch::parse_touch(f).is_none() && s.other_logged < OTHER_LOG_MAX {
+            s.other_logged += 1;
+            log!("TOUCH frame poll={} len={} {}", s.polls, f.len(), glassine_loader_core::hex(&f[..f.len().min(32)]));
         }
     }
 }
@@ -210,8 +316,9 @@ impl TapSource for Source {
             log!("TOUCH_START menu");
             crate::watchdog::arm();
             self.fw.quiet_reads = false;
-            let up = touch::bring_up(&mut self.fw, true);
+            let up = touch::bring_up_with(&mut self.fw, true, RAIL.load(Ordering::Relaxed));
             self.fw.quiet_reads = true;
+            self.seen.empty_at_up = self.fw.empty_reads;
             for (k, v) in &up.lines {
                 log!("TOUCH_UP {}={}", k, v);
             }
@@ -229,15 +336,26 @@ impl TapSource for Source {
         if !matches!(self.state, State::Up(_)) {
             return None;
         }
+        self.seen.polls += 1;
+        self.watch_irq();
         let deadline = crate::arch::now_ms() + touch::CALL_MS;
-        let f = match touch::read_frame(&mut self.fw, deadline) {
-            Ok(Some(f)) => f,
-            Ok(None) => return None,
+        let f = match touch::read_any(&mut self.fw, deadline) {
+            Ok(touch::Frame::Data(f)) => f,
+            Ok(touch::Frame::Sentinel) => {
+                self.seen.sentinels += 1;
+                if self.seen.sentinels <= OTHER_LOG_MAX {
+                    log!("TOUCH sentinel poll={}", self.seen.polls);
+                }
+                return None;
+            }
+            Ok(touch::Frame::Empty) => return None,
             Err(e) => {
+                self.seen.errors += 1;
                 self.fail(&format!("read {e}"));
                 return None;
             }
         };
+        self.note_frame(&f);
         let contact = touch::parse_touch(&f)?;
         let (pressed, x, y) = match contact {
             Some((x, y)) => (true, x, y),
@@ -257,9 +375,6 @@ impl TapSource for Source {
 impl Drop for Source {
     /// The menu closed (FR-015).
     fn drop(&mut self) {
-        if let State::Up(mut up) = core::mem::replace(&mut self.state, State::Failed) {
-            touch::power_down(&mut self.fw, &mut up);
-            log!("TOUCH_DOWN {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
-        }
+        self.release();
     }
 }

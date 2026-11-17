@@ -68,6 +68,32 @@ words:
 - The only read-only call is **read pin**. Whether an output reads back the level it
   drives is not known.
 
+## The PMIC regulator protocol
+
+GUID `22d38d3d-e8b6-4f8f-9c26-bceb07d6cb68`. The firmware's display driver uses it for
+its own supplies; its layout is the one the open edk2 ports for Qualcomm phones describe
+(BSD-licensed; only the GUID and the call layout are taken, in this project's words).
+The interface starts with a 64-bit revision, `0x1000x` (major 1; later minors add calls
+at the end), then function words; the loader reads the first seven words:
+
+| Offset | Word | Call |
+|---|---|---|
+| +0x00 | revision, `0x1000x` | — |
+| +0x08 | enable | `enable(pmic: u32, id: u32, on: u8) -> EFI_STATUS`: switches the regulator on (1) or off (0) |
+| +0x10 | set level | `set_level(pmic: u32, id: u32, mv: u32) -> EFI_STATUS`: its output in mV |
+| +0x18 | get level | `get_level(pmic: u32, id: u32, mv: *mut u32) -> EFI_STATUS`: its set output in mV |
+| +0x20, +0x28 | not used by the loader (the switching mode, the phases) | |
+| +0x30 | get status | `get_status(pmic: u32, id: u32, status: *mut Status) -> EFI_STATUS` |
+
+- **`pmic`**: the PMIC's index: 0 for pm660, 1 for pm660l on the Note Air (unverified:
+  the loader reads indexes 0 to 2 and reports what each answers).
+- **`id`**: the regulator: LDO *n* is `n − 1` (LDO1 … LDO33 are 0 … 32; the switching
+  regulators and others follow and aren't used).
+- **`Status`**, 20 bytes: four `u32` (pull-down on, the switching mode, pin control on,
+  software enable on: 1 = on), then one byte, 1 when the regulator reports its output
+  good. The loader passes a zeroed 32-byte buffer.
+- The read-only calls are **get level** and **get status**.
+
 ## The touch controller's pins
 
 | GPIO | Use |

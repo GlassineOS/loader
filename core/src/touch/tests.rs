@@ -42,6 +42,10 @@ enum Fail {
     LinuxTrace,
     /// The interrupt never asserted.
     IrqStuck,
+    /// pm660l LDO3 off (3.3 V set).
+    RailOff,
+    /// pm660l LDO3 off, set to 1.0 V (not the expected supply).
+    RailOdd,
 }
 
 struct Fake {
@@ -66,6 +70,8 @@ struct Fake {
     rdesc_reads: Vec<(u16, usize)>,
     /// When the application's sentinels come (after launch-app).
     app_at: Option<u64>,
+    /// The regulators: (pmic, ldo) → (on, mV).
+    rails: Vec<((u32, u32), (bool, u32))>,
 }
 
 impl Fake {
@@ -88,6 +94,7 @@ impl Fake {
             reads_high: 0,
             rdesc_reads: Vec::new(),
             app_at: None,
+            rails: vec![((0, 3), (true, 1000)), ((1, 3), (fail != Fail::RailOff && fail != Fail::RailOdd, if fail == Fail::RailOdd { 1000 } else { 3300 })), ((0, 11), (true, 1800))],
         };
         if found_on {
             f.out[61] = Some(true);
@@ -190,6 +197,21 @@ impl Hw for Fake {
         self.rdesc_reads.push((reg, buf.len()));
         buf.fill(0);
         buf[..4].copy_from_slice(&[0x05, 0x0d, 0x09, 0x04]);
+        Ok(())
+    }
+    fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), S> {
+        self.rails.iter().find(|r| r.0 == (pmic, ldo)).map(|r| r.1).ok_or_else(|| "INVALID_PARAMETER".into())
+    }
+    fn rail_set(&mut self, pmic: u32, ldo: u32, mv: u32) -> Result<(), S> {
+        self.ops.push(format!("rail-set{pmic}.{ldo}={mv}"));
+        let r = self.rails.iter_mut().find(|r| r.0 == (pmic, ldo)).ok_or("INVALID_PARAMETER")?;
+        r.1.1 = mv;
+        Ok(())
+    }
+    fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), S> {
+        self.ops.push(format!("rail-en{pmic}.{ldo}={}", on as u8));
+        let r = self.rails.iter_mut().find(|r| r.0 == (pmic, ldo)).ok_or("INVALID_PARAMETER")?;
+        r.1.0 = on;
         Ok(())
     }
     fn open(&mut self) -> Result<(), S> {
@@ -312,7 +334,7 @@ fn the_power_up_order_and_the_power_down() {
     assert!(line(&up, "touch.hid").starts_with("vendor=0x04b4"), "{:?}", up.lines);
     assert_eq!(line(&up, "touch.res"), "1872x1404 max_tch=10 ask=1");
     assert!(line(&up, "touch.result").starts_with("ok"));
-    assert_eq!(f.ops.last().map(|s| s.as_str()), Some("out61=0"));
+    assert_eq!(f.ops.last().map(|s| s.as_str()), Some("in61"));
     assert!(f.ops.contains(&"close".to_string()) && !f.open);
     // The commands as mainline puts them on the wire.
     assert!(f.ops.contains(&format!("wr0004:{}", crate::hex(&launch_app_cmd()))));
@@ -516,7 +538,8 @@ fn reads_only_with_the_interrupt_asserted() {
 fn the_report_descriptor_from_the_hid_descriptor() {
     let mut f = Fake::new(Fail::None, false);
     f.open = true;
-    let mut up = Up { found: Vec::new(), found_on: false, powered: false, opened: true, sysinfo: None, result: Ok(()), lines: Vec::new(), irq_seen: false };
+    let mut up = Up::new(false);
+    up.opened = true;
     let d = desc(0x0100);
     let le = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
     report_desc(&mut f, &mut up, 1_000_000, le(8), le(6), le(12));
@@ -583,4 +606,47 @@ fn the_descriptor_asked_again_when_the_interrupt_never_comes() {
     assert_eq!(f.ops.iter().filter(|o| *o == "wr0001:").count(), 2, "{:?}", up.lines);
     assert_eq!(line(&up, "touch.hid.resent"), "true");
     assert_eq!(up.result, Err("hid: no answer".to_string()));
+}
+
+#[test]
+fn the_supplies_are_read_and_the_pins_released_as_inputs() {
+    let mut f = Fake::new(Fail::None, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.rail.p1.l3"), "on 3300 mV");
+    assert_eq!(line(&up, "touch.rail.p0.l11"), "on 1800 mV");
+    assert_eq!(line(&up, "touch.rail.p2.l3"), "error INVALID_PARAMETER");
+    assert!(line(&up, "touch.rail.on").is_empty() && !f.ops.iter().any(|o| o.starts_with("rail-")));
+    // After the switches low: the three driven pins back to inputs.
+    let n = f.ops.len();
+    assert_eq!(&f.ops[n - 6..], ["out66=0", "out62=0", "out61=0", "in66", "in62", "in61"]);
+    assert_eq!(line(&up, "touch.release"), "inputs: 66, 62, 61");
+}
+
+#[test]
+fn touch_rail_turns_on_what_is_off_and_off_again() {
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_with(&mut f, false, true);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.rail.p1.l3"), "off 3300 mV");
+    assert_eq!(line(&up, "touch.rail.on"), "l3b turned on on 3300 mV, l11a already on 1800 mV");
+    let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
+    assert!(at("rail-set1.3=3300") < at("rail-en1.3=1") && at("rail-en1.3=1") < at("out61=1"));
+    assert!(at("out61=0") < at("rail-en1.3=0") && at("rail-en1.3=0") < at("in66"));
+    assert_eq!(line(&up, "touch.rail.off"), "p1.l3 off");
+    assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
+    // Not the expected supply: left alone.
+    let mut f = Fake::new(Fail::RailOdd, false);
+    let up = bring_up_with(&mut f, false, true);
+    assert_eq!(line(&up, "touch.rail.on"), "l3b refused 1000 mV, l11a already on 1800 mV");
+    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")) && line(&up, "touch.rail.off").is_empty());
+    // Found powered: no supply touched.
+    let mut f = Fake::new(Fail::RailOff, true);
+    let up = bring_up_with(&mut f, false, true);
+    assert_eq!(line(&up, "touch.rail.on"), "skipped found on");
+    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
+    // Without touch_rail: nothing written even with the supply off.
+    let mut f = Fake::new(Fail::RailOff, false);
+    bring_up(&mut f, false);
+    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
 }
