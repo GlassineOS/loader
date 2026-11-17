@@ -1409,7 +1409,7 @@ def pin_ops(seq):
     return out
 
 
-def touch_run(name, mode, record=None, want="ok"):
+def touch_run(name, mode, record=None, want="ok", budget=10200):
     d = hb_disk(name, record or hb_record(touch="probe"), cfg=f"parent.faketouch={mode}")
     log, boot, floor, _ = parent_run(name, d)
     assert (boot, floor) == ("baseline", None), (name, boot, floor)
@@ -1419,7 +1419,7 @@ def touch_run(name, mode, record=None, want="ok"):
     assert log.index("WRITE slot=") < log.index("TOUCH_GPIO"), f"{name}: drove a pin before the clearing write"
     assert keys.get("touch.result", "").startswith(want), (name, keys.get("touch.result"), log[-1500:])
     ms = int(re.search(r" in (\d+) ms", keys["touch.result"])[1])
-    assert ms <= 3200, f"{name}: the bring-up took {ms} ms"
+    assert ms <= budget, f"{name}: the bring-up took {ms} ms"
     c = faketouch_calls(log)
     assert c["open_now"] == "0", f"{name}: the bus left open: {c}"
     return d, log, keys, c, faketouch_seq(log)
@@ -1493,6 +1493,23 @@ def touch_probe_waits_for_a_slow_controller():
         if mode == "nack-first":
             assert re.search(r"TOUCH_WAIT write 0x0004 \d+ ms ok tries=4", log), log[-2000:]
             assert sum(o.startswith("wr0004:0b00") for o in seq) == 4, seq
+
+
+@case("x86_64", "aarch64")
+def touch_probe_waits_for_sysinfo_like_linux():
+    """005 FR-005, FR-007: GET_SYSINFO is sent once and waited for up to 3 s (an answer
+    2.5 s late is taken); with no answer it is sent again after 100 ms (an answer to the
+    second send is taken); the mode from the descriptor's packet id; inside the 10 s
+    deadline."""
+    for mode, asks in (("sysinfo-late", 1), ("sysinfo-second", 2)):
+        d, log, keys, c, seq = touch_run(f"touch-{mode}", mode, budget=10200)
+        assert keys["touch.mode"] == "app", (mode, keys)
+        assert keys["touch.res"] == f"1872x1404 max_tch=10 ask={asks}", (mode, keys)
+        assert sum(o == "wr0004:05002f0002" for o in seq) == asks, (mode, seq)
+        ms = int(keys["touch.wait.sysinfo"].split()[0])
+        assert ms >= (2000 if mode == "sysinfo-late" else 300), (mode, keys)
+        if mode == "sysinfo-second":
+            assert re.search(r"TOUCH_WAIT sysinfo (2[89]\d\d|3\d\d\d) ms timeout", log), log[-3000:]
 
 
 @case("x86_64", "aarch64")

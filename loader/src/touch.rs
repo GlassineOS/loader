@@ -113,6 +113,8 @@ pub fn probe() -> Vec<String> {
         }
     };
     log!("TOUCH_START probe");
+    // The bring-up takes up to its deadline (10 s): a full watchdog period ahead of it.
+    crate::watchdog::arm();
     let up = touch::bring_up(&mut fw, false);
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
@@ -187,6 +189,7 @@ impl TapSource for Source {
     fn poll(&mut self) -> Option<(bool, u32, u32)> {
         if let State::Offered = self.state {
             log!("TOUCH_START menu");
+            crate::watchdog::arm();
             self.fw.quiet_reads = false;
             let up = touch::bring_up(&mut self.fw, true);
             self.fw.quiet_reads = true;
