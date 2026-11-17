@@ -103,12 +103,17 @@ controller is powered down before the answer.
 - **FR-005**: The sequence: read the four pins (the state found; `touch.found`); when
   61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
   level set, configured as an output, its level set again); reset low, at least 1 ms,
-  high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); read the
-  input register until it is empty (length 0 or 2); the bootloader's launch-app command
-  (its failure logged, not fatal); the HID descriptor (register 0x0001; 32 bytes,
-  version 0x0100, `touch.hid`, `touch.desc`); `GET_SYSINFO` (asked up to 5 times while
-  the answer is an error, empty or shorter than 49 bytes, `touch.sysinfo`,
-  `touch.res`); close the bus.
+  high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); wait up to
+  500 ms for the reset sentinel (length 0); the bootloader's launch-app command and up
+  to 500 ms for its answer (lengths 0 and 2 aren't one), then, after an answer, up to
+  1 s for the application's own sentinel (none of it fatal: `touch.launch`); the HID
+  descriptor (register 0x0001; 32 bytes, version 0x0100, `touch.hid`, `touch.desc`);
+  `GET_SYSINFO` (asked up to 5 times while the answer is an error, empty or shorter
+  than 49 bytes, `touch.sysinfo`, `touch.res`); close the bus. Each wait polls the
+  input register every 5 ms, a read that fails counting as nothing yet (a controller
+  busy starting up doesn't answer its address), and is logged `TOUCH_WAIT <what> <ms>`
+  and reported (`touch.wait.reset`, `.launch`, `.app`, `.hid`, `.sysinfo`). A write the
+  controller doesn't take is sent again every 10 ms for up to 300 ms.
 - **FR-006**: The wire bytes are mainline's: a command is written as one write whose
   first byte is the register's low byte and whose data starts with its high byte; a
   report is read as a read of register 0x03 (one byte), first two bytes (the length),
@@ -150,7 +155,9 @@ Unverified on hardware, each checked by a device run with the person's go:
 - whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
   runs (the loader makes no PMIC call);
 - whether an output pin reads back its driven level;
-- whether a read of the input register with no report pending gives length 0 or 2;
+- whether the bootloader answers launch-app and how long the application takes to
+  start (the first device run: the reset sentinel and the bus worked; no answer within
+  77 ms, then the controller stopped answering its address);
 - the controller's timing after reset within the deadline;
 - the touch axes relative to the loader's drawing.
 
