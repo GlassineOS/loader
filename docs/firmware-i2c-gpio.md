@@ -79,7 +79,7 @@ GUID and the call layout are used here, in this project's words):
 |---|---|---|
 | +0x00 | revision, `0x10005` | — |
 | +0x08 | enable | `enable(pmic: u32, id: u32, on: u8) -> EFI_STATUS`: switches the regulator on (1) or off (0) |
-| +0x10 | set level | `set_level(pmic: u32, id: u32, mv: u32) -> EFI_STATUS`: its output in mV |
+| +0x10 | set level | `set_level(pmic: u32, id: u32, mv: u32) -> EFI_STATUS`: its output in mV. **Never called by the loader:** on the Note Air it hung inside the firmware for pm660l LDO3 (the SoC went to its crash-dump mode) |
 | +0x18 | get level | `get_level(pmic: u32, id: u32, level: *mut u32) -> EFI_STATUS`: its set output |
 | +0x20 | switching mode | not used by the loader |
 | +0x28 | phases | not used by the loader (returns `EFI_UNSUPPORTED` on the Note Air) |
@@ -90,8 +90,10 @@ GUID and the call layout are used here, in this project's words):
   `LDO<n>A` with index 0 (pm660) and `LDO<n>B` with index 1 (pm660l).
 - **`id`**: the regulator: LDO *n* is `n − 1` (LDO1 … LDO33 are 0 … 32; the switching
   regulators and others follow and aren't used).
-- **get level**'s unit is not described here: the set call takes mV and passes µV on;
-  the loader takes a value of 100 000 or more as µV.
+- **get level** gives µV on the Note Air (pm660l LDO3 read `3008000`); the loader takes
+  a value below 100 000 as mV.
+- The firmware's display driver locates the protocol but makes no call to it, so no
+  firmware precedent exists for a write; the enable call is unproven on the device.
 - **`Status`**, 20 bytes: four `u32` (pull-down on, the switching mode, pin control on,
   software enable on: 1 = on), then one byte, 1 when the regulator reports its output
   good. The loader passes a zeroed 32-byte buffer.

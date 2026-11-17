@@ -94,7 +94,7 @@ impl Fake {
             reads_high: 0,
             rdesc_reads: Vec::new(),
             app_at: None,
-            rails: vec![((0, 3), (true, 1000)), ((1, 3), (fail != Fail::RailOff && fail != Fail::RailOdd, if fail == Fail::RailOdd { 1000 } else { 3300 })), ((0, 11), (true, 1800))],
+            rails: vec![((0, 3), (true, 1000)), ((1, 3), (fail != Fail::RailOff && fail != Fail::RailOdd, if fail == Fail::RailOdd { 1000 } else { 3008 })), ((0, 11), (true, 1800))],
         };
         if found_on {
             f.out[61] = Some(true);
@@ -201,12 +201,6 @@ impl Hw for Fake {
     }
     fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), S> {
         self.rails.iter().find(|r| r.0 == (pmic, ldo)).map(|r| r.1).ok_or_else(|| "INVALID_PARAMETER".into())
-    }
-    fn rail_set(&mut self, pmic: u32, ldo: u32, mv: u32) -> Result<(), S> {
-        self.ops.push(format!("rail-set{pmic}.{ldo}={mv}"));
-        let r = self.rails.iter_mut().find(|r| r.0 == (pmic, ldo)).ok_or("INVALID_PARAMETER")?;
-        r.1.1 = mv;
-        Ok(())
     }
     fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), S> {
         self.ops.push(format!("rail-en{pmic}.{ldo}={}", on as u8));
@@ -613,7 +607,7 @@ fn the_supplies_are_read_and_the_pins_released_as_inputs() {
     let mut f = Fake::new(Fail::None, false);
     let up = bring_up(&mut f, false);
     assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.l3b"), "on 3300 mV");
+    assert_eq!(line(&up, "touch.rail.l3b"), "on 3008 mV");
     assert_eq!(line(&up, "touch.rail.l11a"), "on 1800 mV");
     assert!(line(&up, "touch.rail.on").is_empty() && !f.ops.iter().any(|o| o.starts_with("rail-")));
     // After the switches low: the three driven pins back to inputs.
@@ -627,10 +621,12 @@ fn touch_rail_turns_on_what_is_off_and_off_again() {
     let mut f = Fake::new(Fail::RailOff, false);
     let up = bring_up_with(&mut f, false, true);
     assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.l3b"), "off 3300 mV");
-    assert_eq!(line(&up, "touch.rail.on"), "l3b turned on on 3300 mV, l11a already on 1800 mV");
+    assert_eq!(line(&up, "touch.rail.l3b"), "off 3008 mV");
+    assert_eq!(line(&up, "touch.rail.on"), "l3b turned on on 3008 mV, l11a already on 1800 mV");
     let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
-    assert!(at("rail-set1.3=3300") < at("rail-en1.3=1") && at("rail-en1.3=1") < at("out61=1"));
+    // Only the enable: no level is ever set.
+    assert_eq!(f.ops.iter().filter(|o| o.starts_with("rail-")).collect::<Vec<_>>(), ["rail-en1.3=1", "rail-en1.3=0"]);
+    assert!(at("rail-en1.3=1") < at("out61=1"));
     assert!(at("out61=0") < at("rail-en1.3=0") && at("rail-en1.3=0") < at("in66"));
     assert_eq!(line(&up, "touch.rail.off"), "l3b off");
     assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
