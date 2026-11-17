@@ -106,16 +106,23 @@ controller is powered down before the answer.
   high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); wait up to
   500 ms for the reset sentinel (length 0); the bootloader's launch-app command and up
   to 500 ms for its answer (lengths 0 and 2 aren't one), then, after an answer, up to
-  1 s for the application's own sentinel (none of it fatal: `touch.launch`); the HID
+  1 s for the application's own sentinel; the application's sentinel straight after
+  launch-app (the bootloader not answering) is the launch too (none of it fatal:
+  `touch.launch`, `app sentinel <ms>` for the latter); the HID
   descriptor (register 0x0001; 32 bytes, version 0x0100, `touch.hid`, `touch.desc`),
   whose packet id gives the mode (`touch.mode`: 0xF7 `app`, 0xFF `bl`; in `bl`
   launch-app again, `touch.launch.bl`, and the descriptor again, `touch.mode.bl`);
-  `GET_SYSINFO` sent once and waited for up to 3 s, as Linux does (an application can
+  the report descriptor (its register and length from the HID descriptor, written with
+  the register low byte first and read back in one transfer; not fatal, `touch.rdesc`:
+  its length and first 16 bytes); `GET_SYSINFO` sent once and waited for up to 3 s, as Linux does (an application can
   take seconds after power-up), sent again after 100 ms when no answer or one that
   isn't the system information (one shorter than 49 bytes) came, at most 3 sends
-  (`touch.sysinfo`, `touch.res`); close the bus. Each wait polls the
-  input register every 5 ms, a read that fails counting as nothing yet (a controller
-  busy starting up doesn't answer its address), and is logged `TOUCH_WAIT <what> <ms>`
+  (`touch.sysinfo`, `touch.res`); close the bus. Each wait reads the interrupt (67)
+  every 5 ms and the input register only while it is asserted (low), as Linux does;
+  until it has been seen asserted in that wait, the register is also read every 50 ms.
+  A read that fails counts as nothing yet (a controller busy starting up doesn't answer
+  its address). Each wait is logged `TOUCH_WAIT <what> <ms>` with how often the
+  interrupt was asserted and the register read
   and reported (`touch.wait.reset`, `.launch`, `.app`, `.hid`, `.sysinfo`). A write the
   controller doesn't take is sent again every 10 ms for up to 300 ms.
 - **FR-006**: The wire bytes are mainline's: a command is written as one write whose
@@ -130,7 +137,10 @@ controller is powered down before the answer.
   low; also after a failure. Found powered: the power pins are left alone, reset ends
   high.
 - **FR-009**: Every GPIO and I2C call is logged with its arguments and status (`TOUCH_GPIO`,
-  `TOUCH_I2C`); the result is one line `touch.result=ok` or `touch.result=failed <step>`.
+  `TOUCH_I2C`), except the waits' interrupt reads and the input-register reads that
+  find nothing waiting (`02 00`): those are counted, in each `TOUCH_WAIT` line and in one
+  `TOUCH_QUIET` line after the bring-up, so the log keeps the rest. The result is one
+  line `touch.result=ok` or `touch.result=failed <step>`.
 - **FR-010**: The probe report is written at a `touch=probe` start (with or without
   `probe=1`), after the bring-up.
 

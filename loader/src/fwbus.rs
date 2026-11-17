@@ -125,6 +125,17 @@ impl Gpio {
 
     /// The pin's level (read only).
     pub fn read(&self, n: u32) -> Result<u32, Status> {
+        let r = self.read_quiet(n);
+        match r {
+            Ok(level) => log!("TOUCH_GPIO read {} -> SUCCESS level={}", n, level),
+            Err(st) => log!("TOUCH_GPIO read {} -> {:?}", n, st),
+        }
+        r
+    }
+
+    /// [`Gpio::read`] without its log line, for the interrupt's polls (the caller counts
+    /// them).
+    pub fn read_quiet(&self, n: u32) -> Result<u32, Status> {
         if !Self::allowed(n) {
             return Err(Status::ACCESS_DENIED);
         }
@@ -132,7 +143,6 @@ impl Gpio {
         let f: Read = unsafe { core::mem::transmute(self.word(3) as usize) };
         let mut level = 0u32;
         let st = unsafe { f(pin_cfg(n, false), &mut level) };
-        log!("TOUCH_GPIO read {} -> {:?} level={}", n, st, level);
         if st == Status::SUCCESS { Ok(level) } else { Err(st) }
     }
     /// Sets the pin as an output (latching `level` first) or as an input.
@@ -214,6 +224,17 @@ impl Bus {
         let f: Rd = unsafe { core::mem::transmute(rd64_at(self.iface, 2) as usize) };
         let mut n = 0u32;
         let st = unsafe { f(self.handle, &self.cfg, offset as u16, 1, buf.as_mut_ptr(), buf.len() as u16, &mut n, timeout_ms.max(1)) };
+        if st != 0 { Err(st) } else { Ok(n) }
+    }
+
+    /// Reads `buf.len()` bytes after writing the two-byte register `reg`, low byte first
+    /// (the protocol sends a two-byte offset high byte first, so it gets the bytes
+    /// swapped).
+    pub fn read16(&mut self, reg: u16, buf: &mut [u8], timeout_ms: u32) -> Result<u32, u32> {
+        type Rd = unsafe extern "efiapi" fn(*mut c_void, *const BusCfg, u16, u16, *mut u8, u16, *mut u32, u32) -> u32;
+        let f: Rd = unsafe { core::mem::transmute(rd64_at(self.iface, 2) as usize) };
+        let mut n = 0u32;
+        let st = unsafe { f(self.handle, &self.cfg, reg.swap_bytes(), 2, buf.as_mut_ptr(), buf.len() as u16, &mut n, timeout_ms.max(1)) };
         if st != 0 { Err(st) } else { Ok(n) }
     }
 

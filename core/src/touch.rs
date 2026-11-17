@@ -31,6 +31,9 @@ pub const RESET_WAIT_MS: u64 = 500;
 pub const LAUNCH_WAIT_MS: u64 = 500;
 pub const APP_WAIT_MS: u64 = 1000;
 pub const WRITE_RETRY_MS: u64 = 300;
+/// While the interrupt hasn't been seen asserted in a wait, the input register is read
+/// this often anyway (an interrupt line that never moves).
+pub const FALLBACK_MS: u64 = 50;
 /// How long one `GET_SYSINFO` is waited for (Linux's `CY_HID_OUTPUT_GET_SYSINFO_TIMEOUT_MS`;
 /// the controller's application can take seconds after power-up), the pause before it
 /// is sent again, how often it is sent at most.
@@ -88,6 +91,14 @@ pub trait Hw {
     fn close(&mut self);
     /// One line for the loader's log (`TOUCH_WAIT ...`).
     fn log(&mut self, _line: &str) {}
+    /// Whether the interrupt (67, active low) is asserted: a frame waits. Read during
+    /// the waits; the loader reads it without logging each read.
+    fn irq_asserted(&mut self) -> Result<bool, String> {
+        self.pin_read(PIN_IRQ).map(|high| !high)
+    }
+    /// Writes the two-byte register `reg` (low byte first) and reads `buf.len()` bytes
+    /// back in the same transfer.
+    fn read_reg(&mut self, reg: u16, buf: &mut [u8], timeout_ms: u32) -> Result<(), String>;
 }
 
 /// The CRC the controller's bootloader commands carry (CRC-16/CCITT, MSB first, as
@@ -197,15 +208,35 @@ pub fn read_frame<H: Hw>(hw: &mut H, deadline: u64) -> Result<Option<Vec<u8>>, S
     })
 }
 
-/// Polls the input register every [`POLL_MS`] until `want` takes what it gave, for at
-/// most `max_ms` (never past `deadline`). A read that fails counts as nothing yet: a
-/// controller busy starting up doesn't answer its address. Logged (`TOUCH_WAIT`) and
-/// reported (`key`) with how long it took.
+/// Waits for `want` to take what the input register gives, for at most `max_ms` (never
+/// past `deadline`). Every [`POLL_MS`] the interrupt is read, and the register only
+/// while it is asserted, as Linux reads it; until the interrupt has been seen asserted
+/// in this wait, the register is also read every [`FALLBACK_MS`]. A read that fails
+/// counts as nothing yet: a controller busy starting up doesn't answer its address.
+/// Logged (`TOUCH_WAIT`) and reported (`key`) with how long it took and how often the
+/// interrupt was asserted and the register read.
 fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadline: u64, mut want: impl FnMut(Frame) -> Option<T>) -> Option<T> {
     let start = hw.now_ms();
     let until = (start + max_ms).min(deadline);
     let (mut errs, mut last) = (0u32, String::new());
+    let (mut low, mut reads, mut seen, mut last_read) = (0u32, 0u32, false, start);
     let got = loop {
+        let now = hw.now_ms();
+        let asserted = hw.irq_asserted().unwrap_or(false);
+        if asserted {
+            low += 1;
+            seen = true;
+        }
+        let read = asserted || (!seen && now.saturating_sub(last_read) >= FALLBACK_MS);
+        if !read {
+            if now + POLL_MS >= until {
+                break None;
+            }
+            hw.stall_ms(POLL_MS);
+            continue;
+        }
+        reads += 1;
+        last_read = now;
         match read_any(hw, deadline) {
             Ok(f) => {
                 if let Some(t) = want(f) {
@@ -224,7 +255,7 @@ fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadl
     };
     let ms = hw.now_ms().saturating_sub(start);
     let errs = if errs > 0 { format!(" read_errors={errs} last={last}") } else { String::new() };
-    let v = format!("{} ms {}{errs}", ms, if got.is_some() { "ok" } else { "timeout" });
+    let v = format!("{} ms {} irq_low={low} reads={reads}{errs}", ms, if got.is_some() { "ok" } else { "timeout" });
     hw.log(&format!("TOUCH_WAIT {} {v}", key.trim_start_matches("touch.wait.")));
     set(up, key, v);
     got
@@ -369,6 +400,7 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     }
     let le = |o: usize| u16::from_le_bytes([desc[o], desc[o + 1]]);
     up.lines.push(("touch.hid", format!("vendor=0x{:04x} product=0x{:04x} version=0x{:04x} max_input={}", le(22), le(24), le(26), le(12))));
+    report_desc(hw, up, deadline, le(8), le(6), le(12));
     // The system information: sent once and waited for as Linux does; on no answer (or
     // one that isn't it: lab patch 0002), sent again after a pause.
     for ask in 1..=SYSINFO_SENDS {
@@ -415,17 +447,46 @@ fn set(up: &mut Up, key: &'static str, v: String) {
 fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, keys: [&'static str; 2]) -> String {
     match write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
         Err(e) => format!("write failed {e}"),
-        Ok(()) => match wait(hw, up, keys[0], LAUNCH_WAIT_MS, deadline, |f| match f {
-            Frame::Data(f) => Some(f),
-            _ => None,
-        }) {
-            Some(f) => {
-                wait(hw, up, keys[1], APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
-                format!("answer {}", hex(&f[..f.len().min(16)]))
+        Ok(()) => {
+            let start = hw.now_ms();
+            // The bootloader's answer, or straight away the application's sentinel (the
+            // launch worked; the bootloader doesn't always answer).
+            match wait(hw, up, keys[0], LAUNCH_WAIT_MS, deadline, |f| match f {
+                Frame::Data(f) => Some(Some(f)),
+                Frame::Sentinel => Some(None),
+                Frame::Empty => None,
+            }) {
+                Some(Some(f)) => {
+                    wait(hw, up, keys[1], APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
+                    format!("answer {}", hex(&f[..f.len().min(16)]))
+                }
+                Some(None) => format!("app sentinel {} ms", hw.now_ms().saturating_sub(start)),
+                None => "no answer".into(),
             }
-            None => "no answer".into(),
-        },
+        }
     }
+}
+
+/// The report descriptor: its register (the HID descriptor's `wReportDescRegister`)
+/// written and its `wReportDescLength` bytes read back, as HID over I2C reads it.
+/// Reported (`touch.rdesc`: the length and the first 16 bytes); not fatal.
+fn report_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, reg: u16, len: u16, max_input: u16) {
+    let v = if len == 0 || len > max_input.max(MAX_FRAME as u16) {
+        format!("skipped length {len}")
+    } else {
+        match call_ms(hw, deadline) {
+            None => "skipped deadline".into(),
+            Some(t) => {
+                let mut b = alloc::vec![0u8; len as usize];
+                match hw.read_reg(reg, &mut b, t) {
+                    Ok(()) => format!("reg=0x{reg:04x} len={len} {}", hex(&b[..b.len().min(16)])),
+                    Err(e) => format!("reg=0x{reg:04x} len={len} failed {e}"),
+                }
+            }
+        }
+    };
+    hw.log(&format!("TOUCH rdesc {v}"));
+    up.lines.push(("touch.rdesc", v));
 }
 
 /// The HID descriptor (register 0x0001), reported (`touch.desc`).
