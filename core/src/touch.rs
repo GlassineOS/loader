@@ -135,13 +135,11 @@ pub struct Rail {
 }
 
 /// pm660l LDO3 (3.3 V, behind 61) and pm660 LDO11 (1.8 V, behind 62); PMIC index 0 is
-/// pm660, 1 pm660l (unverified on the device: the reads below report all three).
+/// pm660 ("A"), 1 pm660l ("B"), as the firmware's display driver names them.
 pub const RAILS: [Rail; 2] = [
     Rail { name: "l3b", pmic: 1, ldo: 3, mv: 3300, expect: (2800, 3400) },
     Rail { name: "l11a", pmic: 0, ldo: 11, mv: 1800, expect: (1700, 1950) },
 ];
-/// The regulators read (only read) at every bring-up: LDO3 and LDO11 of PMICs 0 to 2.
-pub const RAIL_READS: [(u32, u32); 6] = [(0, 3), (1, 3), (2, 3), (0, 11), (1, 11), (2, 11)];
 /// After turning a supply on, before the power switches.
 pub const RAIL_SETTLE_MS: u64 = 5;
 
@@ -606,28 +604,20 @@ fn hid_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<Vec<u8>, St
     Ok(desc)
 }
 
-/// The supplies' state, read only (`touch.rail.p<pmic>.l<ldo>`: `on|off <mV> mV`, or
+/// The supplies' state, read only (`touch.rail.<name>`: `on|off <mV> mV`, or
 /// `error <why>`).
 fn rails_read<H: Hw>(hw: &mut H, up: &mut Up) {
-    for (pmic, ldo) in RAIL_READS {
-        let v = match hw.rail_get(pmic, ldo) {
+    for r in &RAILS {
+        let v = match hw.rail_get(r.pmic, r.ldo) {
             Ok((on, mv)) => format!("{} {mv} mV", if on { "on" } else { "off" }),
             Err(e) => format!("error {e}"),
         };
-        up.lines.push((rail_key(pmic, ldo), v));
+        up.lines.push((if r.ldo == 3 { "touch.rail.l3b" } else { "touch.rail.l11a" }, v));
     }
 }
 
-fn rail_key(pmic: u32, ldo: u32) -> &'static str {
-    match (pmic, ldo) {
-        (0, 3) => "touch.rail.p0.l3",
-        (1, 3) => "touch.rail.p1.l3",
-        (2, 3) => "touch.rail.p2.l3",
-        (0, 11) => "touch.rail.p0.l11",
-        (1, 11) => "touch.rail.p1.l11",
-        (2, 11) => "touch.rail.p2.l11",
-        _ => "touch.rail.other",
-    }
+fn rail_name(pmic: u32, ldo: u32) -> &'static str {
+    RAILS.iter().find(|r| (r.pmic, r.ldo) == (pmic, ldo)).map_or("other", |r| r.name)
 }
 
 /// `touch_rail=on`: each supply in [`RAILS`] that is off and whose setting is in its
@@ -682,8 +672,8 @@ pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
             let mut v: Vec<String> = Vec::new();
             for (pmic, ldo) in core::mem::take(&mut up.rails_on).into_iter().rev() {
                 v.push(match hw.rail_enable(pmic, ldo, false) {
-                    Ok(()) => format!("p{pmic}.l{ldo} off"),
-                    Err(e) => format!("p{pmic}.l{ldo} error {e}"),
+                    Ok(()) => format!("{} off", rail_name(pmic, ldo)),
+                    Err(e) => format!("{} error {e}", rail_name(pmic, ldo)),
                 });
             }
             up.lines.push(("touch.rail.off", v.join(", ")));

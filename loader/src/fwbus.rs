@@ -26,15 +26,12 @@ pub struct Kind {
     pub guid: Guid,
     pub words: usize,
     pub revision: u64,
-    /// The revision's low 16 bits (its minor version) may be any.
-    pub any_minor: bool,
 }
 
-pub const I2C: Kind = Kind { key: "i2c", guid: I2C_GUID, words: 6, revision: 0x10000, any_minor: false };
-pub const GPIO: Kind = Kind { key: "gpio", guid: GPIO_GUID, words: 8, revision: 1, any_minor: false };
-/// The PMIC regulator protocol: revision 1.x; the loader reads its first seven words
-/// (the revision and six calls; later revisions add calls after them).
-pub const VREG: Kind = Kind { key: "vreg", guid: VREG_GUID, words: 7, revision: 0x10000, any_minor: true };
+pub const I2C: Kind = Kind { key: "i2c", guid: I2C_GUID, words: 6, revision: 0x10000 };
+pub const GPIO: Kind = Kind { key: "gpio", guid: GPIO_GUID, words: 8, revision: 1 };
+/// The PMIC regulator protocol: the revision and seven calls.
+pub const VREG: Kind = Kind { key: "vreg", guid: VREG_GUID, words: 8, revision: 0x10005 };
 
 /// One protocol as found.
 pub struct Found {
@@ -57,8 +54,7 @@ pub fn find(k: Kind, ram: &Ram, images: &Images) -> Option<Found> {
         return Some(Found { handle, iface: Some(iface), words: None, check: Err("not-ram".into()) });
     }
     let w: Vec<u64> = (0..k.words).map(|i| unsafe { rd64(iface + 8 * i as u64) }).collect();
-    let rev = if k.any_minor { w[0] & !0xffff } else { w[0] };
-    let check = if rev != k.revision {
+    let check = if w[0] != k.revision {
         Err(format!("revision=0x{:x}", w[0]))
     } else {
         let img = images.of(w[1]).map(|i| i.index);
@@ -265,13 +261,9 @@ impl Bus {
 
 // ---- the PMIC regulator protocol --------------------------------------------------------
 
-/// The regulators the touch driver reads: LDO3 and LDO11 of PMICs 0 to 2 (spec 005).
-fn vreg_readable(pmic: u32, ldo: u32) -> bool {
-    pmic <= 2 && (ldo == 3 || ldo == 11)
-}
-
-/// The only ones it may set or switch (`touch_rail=on`): pm660l LDO3, pm660 LDO11.
-fn vreg_writable(pmic: u32, ldo: u32) -> bool {
+/// The only regulators the touch driver reads, sets or switches (spec 005): pm660l
+/// LDO3 (PMIC 1) and pm660 LDO11 (PMIC 0).
+fn vreg_allowed(pmic: u32, ldo: u32) -> bool {
     matches!((pmic, ldo), (1, 3) | (0, 11))
 }
 
@@ -294,7 +286,7 @@ impl Vreg {
     /// Enabled (software enable on) and the level in mV: the status call (word 6) and
     /// the level call (word 3). Read only.
     pub fn get(&self, pmic: u32, ldo: u32) -> Result<(bool, u32), Status> {
-        if !vreg_readable(pmic, ldo) {
+        if !vreg_allowed(pmic, ldo) {
             return Err(Status::ACCESS_DENIED);
         }
         type GetStatus = unsafe extern "efiapi" fn(u32, u32, *mut u32) -> Status;
@@ -310,16 +302,19 @@ impl Vreg {
         let mut mv = 0u32;
         let f: GetLevel = unsafe { core::mem::transmute(self.word(3) as usize) };
         let st = unsafe { f(pmic, ldo - 1, &mut mv) };
-        log!("TOUCH_PMIC level p{} l{} -> {:?} {} mV", pmic, ldo, st, mv);
+        // The level is the set output; taken as µV when it is that large (the set call
+        // takes mV).
+        let level = if mv >= 100_000 { mv / 1000 } else { mv };
+        log!("TOUCH_PMIC level p{} l{} -> {:?} raw={} {} mV", pmic, ldo, st, mv, level);
         if st != Status::SUCCESS {
             return Err(st);
         }
-        Ok((status[3] == 1, mv))
+        Ok((status[3] == 1, level))
     }
 
     /// Sets the level (word 2).
     pub fn set(&self, pmic: u32, ldo: u32, mv: u32) -> Status {
-        if !vreg_writable(pmic, ldo) {
+        if !vreg_allowed(pmic, ldo) {
             return Status::ACCESS_DENIED;
         }
         type SetLevel = unsafe extern "efiapi" fn(u32, u32, u32) -> Status;
@@ -331,7 +326,7 @@ impl Vreg {
 
     /// Enables or disables it (word 1).
     pub fn enable(&self, pmic: u32, ldo: u32, on: bool) -> Status {
-        if !vreg_writable(pmic, ldo) {
+        if !vreg_allowed(pmic, ldo) {
             return Status::ACCESS_DENIED;
         }
         type Control = unsafe extern "efiapi" fn(u32, u32, u8) -> Status;

@@ -38,8 +38,8 @@
 //! refreshes and 60 reads of the input register passed since the last one; five touch
 //! reports with the contact down, then one with it lifted off, one per read.
 //!
-//! - The PMIC regulator protocol: seven words, revision 0x10005; PMIC 0 LDO3 (1.0 V)
-//!   and LDO11 (1.8 V) on, PMIC 1 LDO3 (3.3 V) on except in `rail-off`; any other
+//! - The PMIC regulator protocol: eight words, revision 0x10005; PMIC 0 LDO11 (1.8 V)
+//!   on, PMIC 1 LDO3 (3.3 V, its level in µV) on except in `rail-off`; any other
 //!   regulator an invalid parameter. Every call recorded (`vreg ...`).
 //!
 //! After the loader returns, [`report`] prints the counts and the call sequence.
@@ -382,7 +382,7 @@ unsafe extern "efiapi" fn vreg_get_level(pmic: u32, id: u32, out: *mut u32) -> S
     s.vreg_seq.push(format!("lvl{pmic}.{id}"));
     match rail(s, pmic, id) {
         Some(r) => {
-            unsafe { *out = r.1 };
+            unsafe { *out = if (pmic, id) == (1, 2) { r.1 * 1000 } else { r.1 } };
             Status::SUCCESS
         }
         None => Status::INVALID_PARAMETER,
@@ -598,7 +598,7 @@ pub fn install(mode: Mode) -> String {
         reads: 0,
         reads_high: 0,
         app_at: None,
-        rails: alloc::vec![((0, 2), (true, 1000)), ((1, 2), (mode != Mode::RailOff, 3300)), ((0, 10), (true, 1800))],
+        rails: alloc::vec![((1, 2), (mode != Mode::RailOff, 3300)), ((0, 10), (true, 1800))],
         vreg_seq: Vec::new(),
         busy: (0, 0),
         nacks: 0,

@@ -96,7 +96,7 @@ controller is powered down before the answer.
   `gpio.pin62`, `gpio.pin66`, `gpio.pin67` come from the pin read, called only after
   `gpio.check=ok`. No other function of either protocol is called by the probe. The
   PMIC regulator protocol (`docs/firmware-i2c-gpio.md`) gets the same lines from memory
-  (`vreg`, `vreg.words`: seven words, `vreg.in`, `vreg.check`: revision major 1); none
+  (`vreg`, `vreg.words`: eight words, `vreg.in`, `vreg.check`: revision `0x10005`); none
   of its functions is called by the probe.
 
 ### The bring-up (`touch=probe`)
@@ -104,7 +104,7 @@ controller is powered down before the answer.
 - **FR-004**: Before its first GPIO or I2C call the loader writes the record with `touch`
   cleared; when the write fails the bring-up doesn't run (`TOUCH_SKIPPED not-written`).
 - **FR-005**: The sequence: read the four pins (the state found; `touch.found`); read the
-  supplies, read only (FR-017; `touch.rail.p<i>.l<n>`), and with `touch_rail=on` turn
+  supplies, read only (FR-017; `touch.rail.l3b`, `touch.rail.l11a`), and with `touch_rail=on` turn
   them on (FR-017); when
   61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
   level set, configured as an output, its level set again); reset low, at least 1 ms,
@@ -182,8 +182,8 @@ controller is powered down before the answer.
 ### The supplies (`touch_rail`)
 
 - **FR-017**: At every bring-up the loader reads, through the PMIC regulator protocol
-  when it passes its checks (else `error none`), LDO3 and LDO11 of PMICs 0, 1 and 2:
-  status and level, nothing written (`touch.rail.p<i>.l<n>`: `on|off <mV> mV` or
+  when it passes its checks (else `error none`), the two supplies: status and level,
+  nothing written (`touch.rail.l3b`, `touch.rail.l11a`: `on|off <mV> mV` or
   `error <status>`). Only with the record's `touch_rail=on`, and only when the
   controller wasn't found powered, it turns on the supplies behind the power switches
   before them: pm660l LDO3 (index 1, 3.3 V, behind 61) and pm660 LDO11 (index 0, 1.8 V,
@@ -201,7 +201,8 @@ Unverified on hardware, each checked by a device run with the person's go:
   (milliseconds, from how the firmware passes it on);
 - whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
   runs (a device run: the bring-up works, the panel never reports a touch;
-  FR-017 reads them, `touch_rail=on` turns them on), and the PMIC indexes;
+  FR-017 reads them, `touch_rail=on` turns them on); the PMIC indexes are the
+  firmware's display driver's (A = 0, B = 1), the level's unit is inferred;
 - whether the pins configured as inputs after the power-down hold the switches off;
 - whether an output pin reads back its driven level;
 - whether the bootloader answers launch-app and how long the application takes to

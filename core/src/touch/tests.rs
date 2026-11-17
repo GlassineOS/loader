@@ -613,9 +613,8 @@ fn the_supplies_are_read_and_the_pins_released_as_inputs() {
     let mut f = Fake::new(Fail::None, false);
     let up = bring_up(&mut f, false);
     assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.p1.l3"), "on 3300 mV");
-    assert_eq!(line(&up, "touch.rail.p0.l11"), "on 1800 mV");
-    assert_eq!(line(&up, "touch.rail.p2.l3"), "error INVALID_PARAMETER");
+    assert_eq!(line(&up, "touch.rail.l3b"), "on 3300 mV");
+    assert_eq!(line(&up, "touch.rail.l11a"), "on 1800 mV");
     assert!(line(&up, "touch.rail.on").is_empty() && !f.ops.iter().any(|o| o.starts_with("rail-")));
     // After the switches low: the three driven pins back to inputs.
     let n = f.ops.len();
@@ -628,12 +627,12 @@ fn touch_rail_turns_on_what_is_off_and_off_again() {
     let mut f = Fake::new(Fail::RailOff, false);
     let up = bring_up_with(&mut f, false, true);
     assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.p1.l3"), "off 3300 mV");
+    assert_eq!(line(&up, "touch.rail.l3b"), "off 3300 mV");
     assert_eq!(line(&up, "touch.rail.on"), "l3b turned on on 3300 mV, l11a already on 1800 mV");
     let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
     assert!(at("rail-set1.3=3300") < at("rail-en1.3=1") && at("rail-en1.3=1") < at("out61=1"));
     assert!(at("out61=0") < at("rail-en1.3=0") && at("rail-en1.3=0") < at("in66"));
-    assert_eq!(line(&up, "touch.rail.off"), "p1.l3 off");
+    assert_eq!(line(&up, "touch.rail.off"), "l3b off");
     assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
     // Not the expected supply: left alone.
     let mut f = Fake::new(Fail::RailOdd, false);
