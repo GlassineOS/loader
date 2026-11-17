@@ -21,7 +21,7 @@ pub const I2C_ADDRESS: u32 = 0x24;
 pub const I2C_KHZ: u32 = 100;
 
 /// The whole bring-up's time (FR-007), the longest single I2C call, the poll period.
-pub const DEADLINE_MS: u64 = 3000;
+pub const DEADLINE_MS: u64 = 10_000;
 pub const CALL_MS: u64 = 100;
 pub const POLL_MS: u64 = 5;
 /// The waits after a reset: the reset sentinel, the bootloader's answer to launch-app,
@@ -31,6 +31,15 @@ pub const RESET_WAIT_MS: u64 = 500;
 pub const LAUNCH_WAIT_MS: u64 = 500;
 pub const APP_WAIT_MS: u64 = 1000;
 pub const WRITE_RETRY_MS: u64 = 300;
+/// How long one `GET_SYSINFO` is waited for (Linux's `CY_HID_OUTPUT_GET_SYSINFO_TIMEOUT_MS`;
+/// the controller's application can take seconds after power-up), the pause before it
+/// is sent again, how often it is sent at most.
+pub const SYSINFO_WAIT_MS: u64 = 3000;
+pub const SYSINFO_PAUSE_MS: u64 = 100;
+pub const SYSINFO_SENDS: u32 = 3;
+/// The HID descriptor's packet id: the controller's application, its bootloader.
+pub const PACKET_APP: u8 = 0xf7;
+pub const PACKET_BL: u8 = 0xff;
 
 /// How the controller's axes lie on the display panel's native axes (spec 005 FR-013):
 /// its X along the native x, its Y along the native y flipped. **Unverified on
@@ -217,10 +226,7 @@ fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadl
     let errs = if errs > 0 { format!(" read_errors={errs} last={last}") } else { String::new() };
     let v = format!("{} ms {}{errs}", ms, if got.is_some() { "ok" } else { "timeout" });
     hw.log(&format!("TOUCH_WAIT {} {v}", key.trim_start_matches("touch.wait.")));
-    match up.lines.iter_mut().find(|l| l.0 == key) {
-        Some(l) => l.1 = v,
-        None => up.lines.push((key, v)),
-    }
+    set(up, key, v);
     got
 }
 
@@ -336,45 +342,41 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     up.lines.push(("touch.open", format!("instance={I2C_INSTANCE} address=0x{I2C_ADDRESS:02x} khz={I2C_KHZ}")));
     // The reset sentinel (length 0); anything before it is dropped.
     wait(hw, up, "touch.wait.reset", RESET_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
-    // The bootloader's launch-app and its answer (lengths 0 and 2 aren't one); then the
-    // application, once started, sends its own sentinel. None of it is fatal: a
-    // controller already in its application answers launch-app with an error or not at
-    // all (the lab saw an error status there with the controller working).
-    let launch = match write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
-        Err(e) => format!("write failed {e}"),
-        Ok(()) => match wait(hw, up, "touch.wait.launch", LAUNCH_WAIT_MS, deadline, |f| match f {
-            Frame::Data(f) => Some(f),
-            _ => None,
-        }) {
-            Some(f) => {
-                wait(hw, up, "touch.wait.app", APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
-                format!("answer {}", hex(&f[..f.len().min(16)]))
-            }
-            None => "no answer".into(),
-        },
-    };
-    up.lines.push(("touch.launch", launch));
-    // The HID descriptor.
-    write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
-    let desc = wait(hw, up, "touch.wait.hid", DEADLINE_MS, deadline, |f| match f {
-        Frame::Data(f) => Some(f),
-        _ => None,
-    })
-    .ok_or_else(|| String::from("hid: no answer"))?;
-    up.lines.push(("touch.desc", hex(&desc)));
+    let l = launch(hw, up, deadline, ["touch.wait.launch", "touch.wait.app"]);
+    up.lines.push(("touch.launch", l));
+    // The HID descriptor; its packet id tells the mode. Still in the bootloader:
+    // launch-app again, then the descriptor again.
+    let mut desc = hid_desc(hw, up, deadline)?;
+    match desc.get(2).copied() {
+        Some(PACKET_APP) => set(up, "touch.mode", "app".into()),
+        Some(PACKET_BL) => {
+            set(up, "touch.mode", "bl".into());
+            let l = launch(hw, up, deadline, ["touch.wait.launch.bl", "touch.wait.app.bl"]);
+            up.lines.push(("touch.launch.bl", l));
+            desc = hid_desc(hw, up, deadline)?;
+            let m = match desc.get(2).copied() {
+                Some(PACKET_APP) => "app".into(),
+                Some(PACKET_BL) => "bl".into(),
+                p => format!("unknown {p:02x?}"),
+            };
+            set(up, "touch.mode.bl", m);
+        }
+        p => set(up, "touch.mode", format!("unknown {p:02x?}")),
+    }
     if !hid_ok(&desc) {
         up.lines.push(("touch.hid", "unknown".into()));
         return Err("hid: not the descriptor".into());
     }
     let le = |o: usize| u16::from_le_bytes([desc[o], desc[o + 1]]);
     up.lines.push(("touch.hid", format!("vendor=0x{:04x} product=0x{:04x} version=0x{:04x} max_input={}", le(22), le(24), le(26), le(12))));
-    // The system information, asked again while the answer isn't one (lab patch 0002).
-    for ask in 1..=5u32 {
+    // The system information: sent once and waited for as Linux does; on no answer (or
+    // one that isn't it: lab patch 0002), sent again after a pause.
+    for ask in 1..=SYSINFO_SENDS {
         if call_ms(hw, deadline).is_none() {
             break;
         }
         write_retry(hw, REG_OUTPUT, &SYSINFO_CMD_BYTES, deadline).map_err(|e| format!("sysinfo: write {e}"))?;
-        let f = wait(hw, up, "touch.wait.sysinfo", 500, deadline, |f| match f {
+        let f = wait(hw, up, "touch.wait.sysinfo", SYSINFO_WAIT_MS, deadline, |f| match f {
             Frame::Data(f) => Some(f),
             _ => None,
         });
@@ -386,14 +388,56 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
                 return Ok(());
             }
             None => {
-                if hw.now_ms() + 100 >= deadline {
+                if let Some(f) = &f {
+                    hw.log(&format!("TOUCH sysinfo answer not one: {}", hex(&f[..f.len().min(16)])));
+                }
+                if ask == SYSINFO_SENDS || hw.now_ms() + SYSINFO_PAUSE_MS >= deadline {
                     break;
                 }
-                hw.stall_ms(100);
+                hw.stall_ms(SYSINFO_PAUSE_MS);
             }
         }
     }
     Err("sysinfo: no answer".into())
+}
+
+/// A report line, replaced when the key is already there.
+fn set(up: &mut Up, key: &'static str, v: String) {
+    match up.lines.iter_mut().find(|l| l.0 == key) {
+        Some(l) => l.1 = v,
+        None => up.lines.push((key, v)),
+    }
+}
+
+/// The bootloader's launch-app and its answer (lengths 0 and 2 aren't one); then the
+/// application, once started, sends its own sentinel. None of it is fatal: a controller
+/// already in its application answers launch-app with an error or not at all.
+fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, keys: [&'static str; 2]) -> String {
+    match write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
+        Err(e) => format!("write failed {e}"),
+        Ok(()) => match wait(hw, up, keys[0], LAUNCH_WAIT_MS, deadline, |f| match f {
+            Frame::Data(f) => Some(f),
+            _ => None,
+        }) {
+            Some(f) => {
+                wait(hw, up, keys[1], APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
+                format!("answer {}", hex(&f[..f.len().min(16)]))
+            }
+            None => "no answer".into(),
+        },
+    }
+}
+
+/// The HID descriptor (register 0x0001), reported (`touch.desc`).
+fn hid_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<Vec<u8>, String> {
+    write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
+    let desc = wait(hw, up, "touch.wait.hid", SYSINFO_WAIT_MS, deadline, |f| match f {
+        Frame::Data(f) => Some(f),
+        _ => None,
+    })
+    .ok_or_else(|| String::from("hid: no answer"))?;
+    set(up, "touch.desc", hex(&desc));
+    Ok(desc)
 }
 
 /// Releases what the bring-up took (FR-008): the bus closed; the controller powered

@@ -107,9 +107,13 @@ controller is powered down before the answer.
   500 ms for the reset sentinel (length 0); the bootloader's launch-app command and up
   to 500 ms for its answer (lengths 0 and 2 aren't one), then, after an answer, up to
   1 s for the application's own sentinel (none of it fatal: `touch.launch`); the HID
-  descriptor (register 0x0001; 32 bytes, version 0x0100, `touch.hid`, `touch.desc`);
-  `GET_SYSINFO` (asked up to 5 times while the answer is an error, empty or shorter
-  than 49 bytes, `touch.sysinfo`, `touch.res`); close the bus. Each wait polls the
+  descriptor (register 0x0001; 32 bytes, version 0x0100, `touch.hid`, `touch.desc`),
+  whose packet id gives the mode (`touch.mode`: 0xF7 `app`, 0xFF `bl`; in `bl`
+  launch-app again, `touch.launch.bl`, and the descriptor again, `touch.mode.bl`);
+  `GET_SYSINFO` sent once and waited for up to 3 s, as Linux does (an application can
+  take seconds after power-up), sent again after 100 ms when no answer or one that
+  isn't the system information (one shorter than 49 bytes) came, at most 3 sends
+  (`touch.sysinfo`, `touch.res`); close the bus. Each wait polls the
   input register every 5 ms, a read that fails counting as nothing yet (a controller
   busy starting up doesn't answer its address), and is logged `TOUCH_WAIT <what> <ms>`
   and reported (`touch.wait.reset`, `.launch`, `.app`, `.hid`, `.sysinfo`). A write the
@@ -119,7 +123,8 @@ controller is powered down before the answer.
   report is read as a read of register 0x03 (one byte), first two bytes (the length),
   then the length. A length of 0 or 2 is no report. The interrupt pin's level is logged
   as a hint only.
-- **FR-007**: One deadline: 3 s from the first GPIO call. Every wait and retry ends at
+- **FR-007**: One deadline: 10 s from the first GPIO call, the firmware watchdog
+  re-armed (30 s) just before it. Every wait and retry ends at
   it and each I2C call's timeout is at most 100 ms and never past it. Polls every 5 ms.
 - **FR-008**: Power down when the loader powered the controller: reset low, 62 low, 61
   low; also after a failure. Found powered: the power pins are left alone, reset ends
