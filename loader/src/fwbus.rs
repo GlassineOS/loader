@@ -261,8 +261,9 @@ impl Bus {
 
 // ---- the PMIC regulator protocol --------------------------------------------------------
 
-/// The only regulators the touch driver reads, sets or switches (spec 005): pm660l
-/// LDO3 (PMIC 1) and pm660 LDO11 (PMIC 0).
+/// The only regulators the touch driver reads or switches (spec 005): pm660l LDO3
+/// (PMIC 1) and pm660 LDO11 (PMIC 0). It never calls set level (on the device it hung
+/// inside the firmware, 900E).
 fn vreg_allowed(pmic: u32, ldo: u32) -> bool {
     matches!((pmic, ldo), (1, 3) | (0, 11))
 }
@@ -302,26 +303,14 @@ impl Vreg {
         let mut mv = 0u32;
         let f: GetLevel = unsafe { core::mem::transmute(self.word(3) as usize) };
         let st = unsafe { f(pmic, ldo - 1, &mut mv) };
-        // The level is the set output; taken as µV when it is that large (the set call
-        // takes mV).
+        // The level is the set output, in µV on the Note Air (the firmware's driver
+        // stores it raw); a value below 100 000 is taken as mV.
         let level = if mv >= 100_000 { mv / 1000 } else { mv };
         log!("TOUCH_PMIC level p{} l{} -> {:?} raw={} {} mV", pmic, ldo, st, mv, level);
         if st != Status::SUCCESS {
             return Err(st);
         }
         Ok((status[3] == 1, level))
-    }
-
-    /// Sets the level (word 2).
-    pub fn set(&self, pmic: u32, ldo: u32, mv: u32) -> Status {
-        if !vreg_allowed(pmic, ldo) {
-            return Status::ACCESS_DENIED;
-        }
-        type SetLevel = unsafe extern "efiapi" fn(u32, u32, u32) -> Status;
-        let f: SetLevel = unsafe { core::mem::transmute(self.word(2) as usize) };
-        let st = unsafe { f(pmic, ldo - 1, mv) };
-        log!("TOUCH_PMIC set p{} l{} {} mV -> {:?}", pmic, ldo, mv, st);
-        st
     }
 
     /// Enables or disables it (word 1).

@@ -113,32 +113,30 @@ pub trait Hw {
     fn rail_get(&mut self, _pmic: u32, _ldo: u32) -> Result<(bool, u32), String> {
         Err("none".into())
     }
-    /// Sets its level (mV).
-    fn rail_set(&mut self, _pmic: u32, _ldo: u32, _mv: u32) -> Result<(), String> {
-        Err("none".into())
-    }
     /// Enables or disables it.
     fn rail_enable(&mut self, _pmic: u32, _ldo: u32, _on: bool) -> Result<(), String> {
         Err("none".into())
     }
 }
 
-/// A supply behind the controller's power switches (`touch_rail=on` turns it on when
-/// off): its name, PMIC index and LDO, the level it is set to, and the levels its
-/// current setting must be in for the loader to touch it (else it isn't that supply).
+/// A supply behind the controller's power switches (`touch_rail=on` enables it when
+/// off): its name, PMIC index and LDO, and the range its set level must already be in
+/// (the controller's supply range). The loader never sets a level: the firmware's
+/// set-level call hung on the device (900E), so only the enable call is made, and only
+/// on a level already in range.
 pub struct Rail {
     pub name: &'static str,
     pub pmic: u32,
     pub ldo: u32,
-    pub mv: u32,
     pub expect: (u32, u32),
 }
 
-/// pm660l LDO3 (3.3 V, behind 61) and pm660 LDO11 (1.8 V, behind 62); PMIC index 0 is
-/// pm660 ("A"), 1 pm660l ("B"), as the firmware's display driver names them.
+/// pm660l LDO3 (behind 61; the controller's VDD, 2.7–3.6 V; Linux and the stock kernel
+/// run it at 3.0 V) and pm660 LDO11 (behind 62; 1.8 V I/O); PMIC index 0 is pm660
+/// ("A"), 1 pm660l ("B"), as the firmware's display driver names them.
 pub const RAILS: [Rail; 2] = [
-    Rail { name: "l3b", pmic: 1, ldo: 3, mv: 3300, expect: (2800, 3400) },
-    Rail { name: "l11a", pmic: 0, ldo: 11, mv: 1800, expect: (1700, 1950) },
+    Rail { name: "l3b", pmic: 1, ldo: 3, expect: (2700, 3600) },
+    Rail { name: "l11a", pmic: 0, ldo: 11, expect: (1650, 1950) },
 ];
 /// After turning a supply on, before the power switches.
 pub const RAIL_SETTLE_MS: u64 = 5;
@@ -620,9 +618,9 @@ fn rail_name(pmic: u32, ldo: u32) -> &'static str {
     RAILS.iter().find(|r| (r.pmic, r.ldo) == (pmic, ldo)).map_or("other", |r| r.name)
 }
 
-/// `touch_rail=on`: each supply in [`RAILS`] that is off and whose setting is in its
-/// expected range is set to its level and enabled (recorded for the power-down). One
-/// already on, or not readable, or out of range is left alone. Never fatal.
+/// `touch_rail=on`: each supply in [`RAILS`] that is off and whose set level is already
+/// in its range is enabled, nothing else (recorded for the power-down). One already
+/// on, or not readable, or out of range is left alone. Never fatal.
 fn rails_on<H: Hw>(hw: &mut H, up: &mut Up) -> String {
     let mut out: Vec<String> = Vec::new();
     for r in &RAILS {
@@ -630,7 +628,7 @@ fn rails_on<H: Hw>(hw: &mut H, up: &mut Up) -> String {
             Err(e) => format!("{} error {e}", r.name),
             Ok((true, mv)) => format!("{} already on {mv} mV", r.name),
             Ok((false, mv)) if mv < r.expect.0 || mv > r.expect.1 => format!("{} refused {mv} mV", r.name),
-            Ok((false, _)) => match hw.rail_set(r.pmic, r.ldo, r.mv).and_then(|()| hw.rail_enable(r.pmic, r.ldo, true)) {
+            Ok((false, _)) => match hw.rail_enable(r.pmic, r.ldo, true) {
                 Err(e) => format!("{} failed {e}", r.name),
                 Ok(()) => {
                     up.rails_on.push((r.pmic, r.ldo));

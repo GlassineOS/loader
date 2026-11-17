@@ -39,8 +39,10 @@
 //! reports with the contact down, then one with it lifted off, one per read.
 //!
 //! - The PMIC regulator protocol: eight words, revision 0x10005; PMIC 0 LDO11 (1.8 V)
-//!   on, PMIC 1 LDO3 (3.3 V, its level in µV) on except in `rail-off`; any other
-//!   regulator an invalid parameter. Every call recorded (`vreg ...`).
+//!   on, PMIC 1 LDO3 (3.008 V, its level in µV as on the device) on except in
+//!   `rail-off`; any other regulator an invalid parameter; set level always fails (it
+//!   hung on the device); an enable outside the firmware's convention is recorded
+//!   `ctl-bad`. Every call recorded (`vreg ...`).
 //!
 //! After the loader returns, [`report`] prints the counts and the call sequence.
 use alloc::boxed::Box;
@@ -353,8 +355,15 @@ fn rail(s: &mut State, pmic: u32, id: u32) -> Option<&mut (bool, u32)> {
     s.rails.iter_mut().find(|r| r.0 == (pmic, id)).map(|r| &mut r.1)
 }
 
+/// The firmware's convention (its display driver's table and PmicDxe): PMIC index 1 =
+/// pm660l ("B"), LDO n = id n - 1, the enable a byte 0 or 1. Anything else is recorded
+/// as a violation (`ctl-bad`).
 unsafe extern "efiapi" fn vreg_control(pmic: u32, id: u32, on: u8) -> Status {
     let s = st();
+    if !matches!((pmic, id), (1, 2) | (0, 10)) || on > 1 {
+        s.vreg_seq.push(format!("ctl-bad:{pmic}.{id}={on}"));
+        return Status::INVALID_PARAMETER;
+    }
     s.vreg_seq.push(format!("ctl{pmic}.{id}={on}"));
     match rail(s, pmic, id) {
         Some(r) => {
@@ -365,16 +374,11 @@ unsafe extern "efiapi" fn vreg_control(pmic: u32, id: u32, on: u8) -> Status {
     }
 }
 
+/// On the device this call hung inside the firmware (900E): the loader must never make
+/// it. Recorded, and it fails.
 unsafe extern "efiapi" fn vreg_set_level(pmic: u32, id: u32, mv: u32) -> Status {
-    let s = st();
-    s.vreg_seq.push(format!("set{pmic}.{id}={mv}"));
-    match rail(s, pmic, id) {
-        Some(r) => {
-            r.1 = mv;
-            Status::SUCCESS
-        }
-        None => Status::INVALID_PARAMETER,
-    }
+    st().vreg_seq.push(format!("set{pmic}.{id}={mv}"));
+    Status::DEVICE_ERROR
 }
 
 unsafe extern "efiapi" fn vreg_get_level(pmic: u32, id: u32, out: *mut u32) -> Status {
@@ -598,7 +602,7 @@ pub fn install(mode: Mode) -> String {
         reads: 0,
         reads_high: 0,
         app_at: None,
-        rails: alloc::vec![((1, 2), (mode != Mode::RailOff, 3300)), ((0, 10), (true, 1800))],
+        rails: alloc::vec![((1, 2), (mode != Mode::RailOff, 3008)), ((0, 10), (true, 1800))],
         vreg_seq: Vec::new(),
         busy: (0, 0),
         nacks: 0,

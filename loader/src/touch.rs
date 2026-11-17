@@ -118,9 +118,6 @@ impl Hw for Fw {
     fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), String> {
         self.vreg.as_ref().ok_or("none")?.get(pmic, ldo).map_err(|s| format!("{s:?}"))
     }
-    fn rail_set(&mut self, pmic: u32, ldo: u32, mv: u32) -> Result<(), String> {
-        st(self.vreg.as_ref().ok_or("none")?.set(pmic, ldo, mv))
-    }
     fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), String> {
         st(self.vreg.as_ref().ok_or("none")?.enable(pmic, ldo, on))
     }
