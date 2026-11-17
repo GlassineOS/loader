@@ -104,27 +104,30 @@ controller is powered down before the answer.
   61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
   level set, configured as an output, its level set again); reset low, at least 1 ms,
   high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); wait up to
-  500 ms for the reset sentinel (length 0); the bootloader's launch-app command and up
-  to 500 ms for its answer (lengths 0 and 2 aren't one), then, after an answer, up to
-  1 s for the application's own sentinel; the application's sentinel straight after
-  launch-app (the bootloader not answering) is the launch too (none of it fatal:
-  `touch.launch`, `app sentinel <ms>` for the latter); the HID
+  500 ms for the reset sentinel (length 0); the bootloader's launch-app command, then
+  the application's sentinel: a size-0 frame at least 30 ms after the write (frames
+  before that, and the bootloader's answer, are read and dropped), up to 1 s (200 ms
+  while the interrupt has never asserted), then the frames still waiting drained (read
+  while the interrupt is asserted, until it isn't or an empty read); none of it fatal
+  (`touch.launch`: `app sentinel <ms> ms drained=<n>`, or `no sentinel`); the HID
   descriptor (register 0x0001; 32 bytes, version 0x0100, `touch.hid`, `touch.desc`),
-  whose packet id gives the mode (`touch.mode`: 0xF7 `app`, 0xFF `bl`; in `bl`
-  launch-app again, `touch.launch.bl`, and the descriptor again, `touch.mode.bl`);
-  the report descriptor (its register and length from the HID descriptor, written with
-  the register low byte first and read back in one transfer; not fatal, `touch.rdesc`:
-  its length and first 16 bytes); `GET_SYSINFO` sent once and waited for up to 3 s, as Linux does (an application can
-  take seconds after power-up), sent again after 100 ms when no answer or one that
-  isn't the system information (one shorter than 49 bytes) came, at most 3 sends
-  (`touch.sysinfo`, `touch.res`); close the bus. Each wait reads the interrupt (67)
-  every 5 ms and the input register only while it is asserted (low), as Linux does;
-  until it has been seen asserted in that wait, the register is also read every 50 ms.
-  A read that fails counts as nothing yet (a controller busy starting up doesn't answer
-  its address). Each wait is logged `TOUCH_WAIT <what> <ms>` with how often the
-  interrupt was asserted and the register read
-  and reported (`touch.wait.reset`, `.launch`, `.app`, `.hid`, `.sysinfo`). A write the
-  controller doesn't take is sent again every 10 ms for up to 300 ms.
+  sent once more when the interrupt doesn't assert within 500 ms (`touch.hid.resent`),
+  up to 3 s in all, whose packet id gives the mode (`touch.mode`: 0xF7 `app`, 0xFF
+  `bl`; in `bl` launch-app again, `touch.launch.bl`, and the descriptor again,
+  `touch.mode.bl`); no report descriptor read (Linux's cyttsp5 doesn't put one on the
+  wire; the code is kept, off); `GET_SYSINFO` sent no sooner than 100 ms after the
+  drain (Linux's first send, before the application's sentinels, is lost) and waited
+  for up to 3 s, as Linux does (the application answers about 750 ms later), sent
+  again after 100 ms when no answer or one that isn't the system information (one
+  shorter than 49 bytes) came, at most 3 sends (`touch.sysinfo`, `touch.res`); close
+  the bus. Each wait reads the interrupt (67) every 5 ms and the input register only
+  while it is asserted (low), as Linux does; only while the interrupt has never been
+  seen asserted in the whole bring-up is the register also read every 50 ms. A read
+  that fails counts as nothing yet (a controller busy starting up doesn't answer its
+  address). Each wait is logged `TOUCH_WAIT <what> <ms>` with how often the interrupt
+  was asserted and the register read and reported (`touch.wait.reset`, `.app`, `.hid`,
+  `.hid.more`, `.sysinfo`). A write the controller doesn't take is sent again every
+  10 ms for up to 300 ms.
 - **FR-006**: The wire bytes are mainline's: a command is written as one write whose
   first byte is the register's low byte and whose data starts with its high byte; a
   report is read as a read of register 0x03 (one byte), first two bytes (the length),
