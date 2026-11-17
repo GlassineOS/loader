@@ -324,15 +324,17 @@ fn input_devices(
     out
 }
 
-/// The firmware's I2C and GPIO protocols (spec 005 FR-003): their interfaces read from
-/// memory and checked; after the GPIO protocol passes, the touch controller's four pins
+/// The firmware's I2C, GPIO and PMIC regulator protocols (spec 005 FR-003): their
+/// interfaces read from memory and checked; after the GPIO protocol passes, the touch controller's four pins
 /// through its pin read, which configures nothing. No other function of either is called.
 fn firmware_buses(ram: &crate::fwgop::Ram, images: &crate::fwgop::Images, index: &dyn Fn(Handle) -> Option<usize>) -> Vec<String> {
-    use crate::fwbus::{self, GPIO, I2C};
+    use crate::fwbus::{self, GPIO, I2C, VREG};
     let i2c = fwbus::find(I2C, ram, images);
     let gpio = fwbus::find(GPIO, ram, images);
+    let vreg = fwbus::find(VREG, ram, images);
     let mut out = fwbus::report_lines(I2C, i2c.as_ref(), index, images);
     out.extend(fwbus::report_lines(GPIO, gpio.as_ref(), index, images));
+    out.extend(fwbus::report_lines(VREG, vreg.as_ref(), index, images));
     if let Some(g) = gpio.as_ref().and_then(fwbus::Gpio::new) {
         for n in fwbus::TOUCH_PINS {
             out.push(match g.read(n) {

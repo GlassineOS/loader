@@ -94,13 +94,18 @@ controller is powered down before the answer.
 - **FR-003**: The report's `i2c`, `i2c.words`, `i2c.in`, `i2c.check`, `gpio`,
   `gpio.words`, `gpio.in`, `gpio.check` lines are read from memory; `gpio.pin61`,
   `gpio.pin62`, `gpio.pin66`, `gpio.pin67` come from the pin read, called only after
-  `gpio.check=ok`. No other function of either protocol is called by the probe.
+  `gpio.check=ok`. No other function of either protocol is called by the probe. The
+  PMIC regulator protocol (`docs/firmware-i2c-gpio.md`) gets the same lines from memory
+  (`vreg`, `vreg.words`: eight words, `vreg.in`, `vreg.check`: revision `0x10005`); none
+  of its functions is called by the probe.
 
 ### The bring-up (`touch=probe`)
 
 - **FR-004**: Before its first GPIO or I2C call the loader writes the record with `touch`
   cleared; when the write fails the bring-up doesn't run (`TOUCH_SKIPPED not-written`).
-- **FR-005**: The sequence: read the four pins (the state found; `touch.found`); when
+- **FR-005**: The sequence: read the four pins (the state found; `touch.found`); read the
+  supplies, read only (FR-017; `touch.rail.l3b`, `touch.rail.l11a`), and with `touch_rail=on` turn
+  them on (FR-017); when
   61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
   level set, configured as an output, its level set again); reset low, at least 1 ms,
   high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); wait up to
@@ -137,7 +142,10 @@ controller is powered down before the answer.
   re-armed (30 s) just before it. Every wait and retry ends at
   it and each I2C call's timeout is at most 100 ms and never past it. Polls every 5 ms.
 - **FR-008**: Power down when the loader powered the controller: reset low, 62 low, 61
-  low; also after a failure. Found powered: the power pins are left alone, reset ends
+  low (`touch.down`); then the supplies it turned on (FR-017) off (`touch.rail.off`); then
+  66, 62 and 61 configured as inputs (`touch.release`: the firmware's protocol can't read
+  a pin's configuration to restore the one found, and inputs leave the pins to the
+  next owner); also after a failure. Found powered: the power pins are left alone, reset ends
   high.
 - **FR-009**: Every GPIO and I2C call is logged with its arguments and status (`TOUCH_GPIO`,
   `TOUCH_I2C`), except the waits' interrupt reads and the input-register reads that
@@ -163,6 +171,27 @@ controller is powered down before the answer.
 - **FR-014**: The source logs presses and releases (raw and portrait), not polls. A
   failed bring-up or a failed read ends the source (no more taps), logged.
 - **FR-015**: When the menu closes the controller is powered down (FR-008).
+- **FR-016**: While the menu is open the source counts its polls, the polls with the
+  interrupt asserted, the interrupt's changes (the first 16 logged with the poll and the
+  time), the empty reads, the sentinels (the first 4 logged), the frames by report id
+  and the read errors; the first 4 frames that aren't touch reports are logged raw. At
+  the menu's close one line sums them up (`TOUCH_MENU polls= irq_low= irq_changes=
+  empty= sentinels= frames= ids=<id>:<n>,... errors=`), then the power-down's lines
+  (`TOUCH_DOWN <key>=<value>`).
+
+### The supplies (`touch_rail`)
+
+- **FR-017**: At every bring-up the loader reads, through the PMIC regulator protocol
+  when it passes its checks (else `error none`), the two supplies: status and level,
+  nothing written (`touch.rail.l3b`, `touch.rail.l11a`: `on|off <mV> mV` or
+  `error <status>`). Only with the record's `touch_rail=on`, and only when the
+  controller wasn't found powered, it turns on the supplies behind the power switches
+  before them: pm660l LDO3 (index 1, 3.3 V, behind 61) and pm660 LDO11 (index 0, 1.8 V,
+  behind 62). A supply already on is left alone; one whose set level is outside its
+  range (2.8–3.4 V, 1.7–1.95 V: else it isn't that supply) is refused; else its level
+  is set and it is enabled, then 5 ms (`touch.rail.on`). None of it is fatal. What it
+  turned on is turned off at the power-down (FR-008). No other regulator is ever set
+  or switched; every regulator call is logged (`TOUCH_PMIC`).
 
 ## Device scope and risk
 
@@ -171,7 +200,10 @@ Unverified on hardware, each checked by a device run with the person's go:
 - whether `open(3)` succeeds after the firmware's start, and the timeout's unit
   (milliseconds, from how the firmware passes it on);
 - whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
-  runs (the loader makes no PMIC call);
+  runs (a device run: the bring-up works, the panel never reports a touch;
+  FR-017 reads them, `touch_rail=on` turns them on); the PMIC indexes are the
+  firmware's display driver's (A = 0, B = 1), the level's unit is inferred;
+- whether the pins configured as inputs after the power-down hold the switches off;
 - whether an output pin reads back its driven level;
 - whether the bootloader answers launch-app and how long the application takes to
   start (the first device run: the reset sentinel and the bus worked; no answer within
@@ -181,7 +213,8 @@ Unverified on hardware, each checked by a device run with the person's go:
 
 ## Out of scope
 
-Interrupts; multi-touch, gestures, the pen; any PMIC or clock call; touch on a PC.
+Interrupts; multi-touch, gestures, the pen; any PMIC call but FR-017's, any clock
+call; touch on a PC.
 
 ## Success criteria
 

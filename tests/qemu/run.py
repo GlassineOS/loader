@@ -1364,6 +1364,14 @@ def faketouch_calls(log):
     return dict(kv.split("=") for kv in m[-1].split())
 
 
+def faketouch_vreg(log):
+    """The stand-in regulator protocol's calls, and whether pm660l LDO3 ended on."""
+    m = re.findall(r"PARENT_FAKETOUCH vreg ?([^\r\n]*)", log)
+    assert m, "the stand-in regulator protocol reported nothing"
+    w = m[-1].split()
+    return w[:-1], w[-1] == "l3b=1"
+
+
 def faketouch_seq(log):
     m = re.findall(r"PARENT_FAKETOUCH seq ?([^\r\n]*)", log)
     assert m, "the stand-in touch protocols reported no sequence"
@@ -1392,6 +1400,10 @@ def handback_probe_reads_the_i2c_and_gpio_protocols():
         ins = keys[f"{k}.in"].split()
         assert len(ins) == n - 1 and len(set(ins)) == 1 and ins[0].startswith("image"), ins
     assert keys["i2c.words"].split()[0] == "0x10000" and keys["gpio.words"].split()[0] == "0x1"
+    # The regulator protocol: its words read and checked, none of its calls made.
+    assert len(keys["vreg.words"].split()) == 8 and keys["vreg.words"].split()[0] == "0x10005", keys
+    assert keys["vreg.check"] == "ok" and keys["vreg.in"] == keys["gpio.in"].split()[0] + (" " + keys["gpio.in"].split()[0]) * 6, keys
+    assert faketouch_vreg(log)[0] == [], log[-1500:]
     assert [keys[f"gpio.pin{n}"] for n in (61, 62, 66, 67)] == ["0", "0", "0", "1"], keys
     c = faketouch_calls(log)
     assert c["pin_read"] == "4", c
@@ -1549,6 +1561,45 @@ def touch_probe_follows_linuxs_probe_on_the_device():
     assert c["reads_high"] == "0", c
     launch = next(i for i, o in enumerate(seq) if o.startswith("wr0004:0b00"))
     assert launch < seq.index("wr0001:") < seq.index("wr0004:05002f0002"), seq
+
+
+@case("x86_64", "aarch64")
+def touch_probe_reads_the_supplies_and_releases_the_pins():
+    """005 FR-005, FR-008, FR-017: the two supplies read only (status and level, no
+    write) and reported; with touch_rail=on pm660l LDO3, found
+    off, set to 3.3 V and enabled before the power switches and disabled after them at
+    the power-down; then the three driven pins configured as inputs."""
+    d, log, keys, c, seq = touch_run("touch-rails", "1")
+    assert keys["touch.rail.l3b"] == "on 3300 mV" and keys["touch.rail.l11a"] == "on 1800 mV", keys
+    calls, l3b = faketouch_vreg(log)
+    assert calls and all(re.fullmatch(r"(st|lvl)\d\.\d+", x) for x in calls), calls
+    assert "touch.rail.on" not in keys and keys["touch.release"] == "inputs: 66, 62, 61", keys
+    last = len(seq) - 1 - seq[::-1].index("set61=0")
+    assert seq[last + 1:last + 4] == ["cfg66i", "cfg62i", "cfg61i"], seq
+    # touch_rail=on with LDO3 off: on for the bring-up, off at the end.
+    d, log, keys, c, seq = touch_run("touch-rail-on", "rail-off", record=hb_record(touch="probe", touch_rail="on"))
+    assert keys["touch.rail.l3b"] == "off 3300 mV", keys
+    assert keys["touch.rail.on"] == "l3b turned on on 3300 mV, l11a already on 1800 mV", keys
+    assert keys["touch.rail.off"] == "l3b off", keys
+    calls, l3b = faketouch_vreg(log)
+    assert [x for x in calls if x[:3] in ("set", "ctl")] == ["set1.2=3300", "ctl1.2=1", "ctl1.2=0"] and not l3b, calls
+    assert log.index("TOUCH_PMIC control p1 l3 1") < log.index("TOUCH_GPIO set 61 1"), log[-3000:]
+    assert log.rindex("TOUCH_GPIO set 61 0") < log.index("TOUCH_PMIC control p1 l3 0"), log[-3000:]
+    # Without the key: nothing written.
+    d, log, keys, c, seq = touch_run("touch-rail-off", "rail-off")
+    assert "touch.rail.on" not in keys and not [x for x in faketouch_vreg(log)[0] if x[:3] in ("set", "ctl")], keys
+
+
+@case("x86_64", "aarch64")
+def touch_on_with_touch_rail_taps_a_panel_that_needs_ldo3():
+    """005 FR-016, FR-017: a controller that senses only with pm660l LDO3 on: with
+    touch_rail=on the menu's taps come through, the menu's summary counts the frames
+    by report id, and LDO3 is off again when the menu closes."""
+    d, log, boot, got = touch_menu("touch-menu-rail", [touch_tap(4, 1)], mode="rail-off", touch_rail="on")
+    assert got and got.startswith("format=1 boot=recovery"), (got, log[-2000:])
+    m = re.search(r"TOUCH_MENU polls=(\d+) irq_low=(\d+) irq_changes=(\d+) empty=(\d+) sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
+    assert m and int(m[5]) == 6 and int(m[6]) == 6 and int(m[1]) >= int(m[5]), log[-2000:]
+    assert "TOUCH_DOWN touch.rail.off=l3b off" in log and not faketouch_vreg(log)[1], log[-2000:]
 
 
 @case("x86_64", "aarch64")
@@ -2076,7 +2127,7 @@ def touch_on_each_entry_by_tap():
         assert len(re.findall(r"TOUCH press raw=", log)) == len(taps), name
         w1 = log.index("WRITE slot=")
         assert w1 < log.index("TOUCH_GPIO set"), f"{name}: the controller touched before the menu write"
-        assert log.index("TOUCH_DOWN off: 66, 62, 61") < log.index("HANDBACK_ANSWER"), f"{name}: not powered down first"
+        assert log.index("TOUCH_DOWN touch.down=off: 66, 62, 61") < log.index("HANDBACK_ANSWER"), f"{name}: not powered down first"
         c = faketouch_calls(log)
         assert c["powered"] == "0" and c["open_now"] == "0", (name, c)
         assert d.record()[1].get("touch") == "on", "touch=on stays"
