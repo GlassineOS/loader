@@ -21,8 +21,8 @@
 //! 30 reads late, about 150 ms), `nack-first` (the first three writes not taken),
 //! `late-app` (the application's sentinel 140 reads, about 700 ms, after the answer,
 //! reads and writes not taken until then), `sysinfo-late` (the first `GET_SYSINFO`
-//! answered 500 reads, about 2.5 s, late), `sysinfo-second` (the first never answered,
-//! the second 150 reads late), `sysinfo-retry` (the first two
+//! answered 2.5 s late), `sysinfo-second` (the first never answered, the second
+//! 770 ms late), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -111,6 +111,9 @@ struct State {
     /// Reads and writes not taken in this window of read counts.
     busy: (u32, u32),
     nacks: u32,
+    /// Frames due at a time in ms (the GET_SYSINFO modes: a real clock, as the loader's
+    /// waits are timed, not counted).
+    due_ms: Vec<(u64, Vec<u8>)>,
     tap_next: usize,
     tap_read: u32,
     tap_quiet: u32,
@@ -267,6 +270,10 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
     let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due).into_iter().partition(|(t, _)| *t <= now);
     s.due = later;
     s.queue.extend(ready.into_iter().map(|(_, f)| f));
+    let t = now_ms();
+    let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due_ms).into_iter().partition(|(d, _)| *d <= t);
+    s.due_ms = later;
+    s.queue.extend(ready.into_iter().map(|(_, f)| f));
     if len == 2 && s.queue.is_empty() {
         next_tap(s);
     }
@@ -370,9 +377,9 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
                 _ => false,
             };
             match s.mode {
-                Mode::SysinfoLate if s.sysinfo_asks == 1 => s.due.push((s.reads + 500, sysinfo())),
+                Mode::SysinfoLate if s.sysinfo_asks == 1 => s.due_ms.push((now_ms() + 2500, sysinfo())),
                 Mode::SysinfoSecond if s.sysinfo_asks == 1 => {}
-                Mode::SysinfoSecond => s.due.push((s.reads + 150, sysinfo())),
+                Mode::SysinfoSecond => s.due_ms.push((now_ms() + 770, sysinfo())),
                 _ => s.queue.push_back(if empty { alloc::vec![0, 0] } else { sysinfo() }),
             }
         }
@@ -394,6 +401,44 @@ unsafe extern "efiapi" fn i2c_close(_h: *mut c_void) -> u32 {
     s.seq.push(String::from("close"));
     s.open_handles = s.open_handles.saturating_sub(1);
     0
+}
+
+static mut CLOCK: (u64, u64) = (0, 0);
+
+fn ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+}
+
+/// Milliseconds since [`install`], from the TSC calibrated against `Stall` (x86-64) or
+/// the generic timer (aarch64).
+fn now_ms() -> u64 {
+    let (t0, per) = unsafe { CLOCK };
+    ticks().wrapping_sub(t0) / per.max(1)
+}
+
+fn init_clock() {
+    let a = ticks();
+    #[cfg(target_arch = "x86_64")]
+    let per = {
+        boot::stall(core::time::Duration::from_millis(20));
+        (ticks() - a) / 20
+    };
+    #[cfg(target_arch = "aarch64")]
+    let per = {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack)) };
+        f / 1000
+    };
+    unsafe { CLOCK = (a, per.max(1)) };
 }
 
 fn leak<T>(v: T) -> u64 {
@@ -418,6 +463,7 @@ pub fn install(mode: Mode) -> String {
         due: Vec::new(),
         busy: (0, 0),
         nacks: 0,
+        due_ms: Vec::new(),
         tap_next: 0,
         tap_read: 0,
         tap_quiet: 1000,
@@ -429,6 +475,7 @@ pub fn install(mode: Mode) -> String {
         s.latch[62] = true;
     }
     unsafe { ST = Some(s) };
+    init_clock();
     let gpio: [u64; 8] = [
         1,
         gpio_configure as *const () as u64,
