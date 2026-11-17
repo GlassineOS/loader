@@ -1566,11 +1566,12 @@ def touch_probe_follows_linuxs_probe_on_the_device():
 @case("x86_64", "aarch64")
 def touch_probe_reads_the_supplies_and_releases_the_pins():
     """005 FR-005, FR-008, FR-017: the two supplies read only (status and level, no
-    write) and reported; with touch_rail=on pm660l LDO3, found
-    off, set to 3.3 V and enabled before the power switches and disabled after them at
-    the power-down; then the three driven pins configured as inputs."""
+    write) and reported; with touch_rail=on pm660l LDO3, found off at 3.008 V (in the
+    controller's range), only enabled (no set level) before the power switches and
+    disabled after them at the power-down, with the firmware's argument convention;
+    then the three driven pins configured as inputs."""
     d, log, keys, c, seq = touch_run("touch-rails", "1")
-    assert keys["touch.rail.l3b"] == "on 3300 mV" and keys["touch.rail.l11a"] == "on 1800 mV", keys
+    assert keys["touch.rail.l3b"] == "on 3008 mV" and keys["touch.rail.l11a"] == "on 1800 mV", keys
     calls, l3b = faketouch_vreg(log)
     assert calls and all(re.fullmatch(r"(st|lvl)\d\.\d+", x) for x in calls), calls
     assert "touch.rail.on" not in keys and keys["touch.release"] == "inputs: 66, 62, 61", keys
@@ -1578,11 +1579,13 @@ def touch_probe_reads_the_supplies_and_releases_the_pins():
     assert seq[last + 1:last + 4] == ["cfg66i", "cfg62i", "cfg61i"], seq
     # touch_rail=on with LDO3 off: on for the bring-up, off at the end.
     d, log, keys, c, seq = touch_run("touch-rail-on", "rail-off", record=hb_record(touch="probe", touch_rail="on"))
-    assert keys["touch.rail.l3b"] == "off 3300 mV", keys
-    assert keys["touch.rail.on"] == "l3b turned on on 3300 mV, l11a already on 1800 mV", keys
+    assert keys["touch.rail.l3b"] == "off 3008 mV", keys
+    assert keys["touch.rail.on"] == "l3b turned on on 3008 mV, l11a already on 1800 mV", keys
     assert keys["touch.rail.off"] == "l3b off", keys
     calls, l3b = faketouch_vreg(log)
-    assert [x for x in calls if x[:3] in ("set", "ctl")] == ["set1.2=3300", "ctl1.2=1", "ctl1.2=0"] and not l3b, calls
+    # Only the enable, with the firmware's convention (PMIC 1 = pm660l, id 2 = LDO3, a
+    # byte 1 then 0); never set level.
+    assert [x for x in calls if x[:3] in ("set", "ctl")] == ["ctl1.2=1", "ctl1.2=0"] and not l3b, calls
     assert log.index("TOUCH_PMIC control p1 l3 1") < log.index("TOUCH_GPIO set 61 1"), log[-3000:]
     assert log.rindex("TOUCH_GPIO set 61 0") < log.index("TOUCH_PMIC control p1 l3 0"), log[-3000:]
     # Without the key: nothing written.
@@ -1600,6 +1603,7 @@ def touch_on_with_touch_rail_taps_a_panel_that_needs_ldo3():
     m = re.search(r"TOUCH_MENU polls=(\d+) irq_low=(\d+) irq_changes=(\d+) empty=(\d+) sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
     assert m and int(m[5]) == 6 and int(m[6]) == 6 and int(m[1]) >= int(m[5]), log[-2000:]
     assert "TOUCH_DOWN touch.rail.off=l3b off" in log and not faketouch_vreg(log)[1], log[-2000:]
+    assert not [x for x in faketouch_vreg(log)[0] if x.startswith(("set", "ctl-bad"))], faketouch_vreg(log)
 
 
 @case("x86_64", "aarch64")

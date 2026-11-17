@@ -185,13 +185,14 @@ controller is powered down before the answer.
   when it passes its checks (else `error none`), the two supplies: status and level,
   nothing written (`touch.rail.l3b`, `touch.rail.l11a`: `on|off <mV> mV` or
   `error <status>`). Only with the record's `touch_rail=on`, and only when the
-  controller wasn't found powered, it turns on the supplies behind the power switches
-  before them: pm660l LDO3 (index 1, 3.3 V, behind 61) and pm660 LDO11 (index 0, 1.8 V,
-  behind 62). A supply already on is left alone; one whose set level is outside its
-  range (2.8–3.4 V, 1.7–1.95 V: else it isn't that supply) is refused; else its level
-  is set and it is enabled, then 5 ms (`touch.rail.on`). None of it is fatal. What it
-  turned on is turned off at the power-down (FR-008). No other regulator is ever set
-  or switched; every regulator call is logged (`TOUCH_PMIC`).
+  controller wasn't found powered, it enables the supplies behind the power switches
+  before them: pm660l LDO3 (index 1, behind 61) and pm660 LDO11 (index 0, behind 62).
+  A supply already on is left alone; one whose set level is outside the controller's
+  range (2.7–3.6 V, 1.65–1.95 V) is refused; else only the enable call is made, then
+  5 ms (`touch.rail.on`). **No level is ever set** (the set-level call hung inside the
+  firmware on the device). None of it is fatal. What it turned on is turned off at the
+  power-down (FR-008). No other regulator is ever switched; every regulator call is
+  logged (`TOUCH_PMIC`).
 
 ## Device scope and risk
 
@@ -201,8 +202,10 @@ Unverified on hardware, each checked by a device run with the person's go:
   (milliseconds, from how the firmware passes it on);
 - whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
   runs (a device run: the bring-up works, the panel never reports a touch;
-  FR-017 reads them, `touch_rail=on` turns them on); the PMIC indexes are the
-  firmware's display driver's (A = 0, B = 1), the level's unit is inferred;
+  FR-017 reads them: pm660l LDO3 off at 3.008 V, LDO11 on); whether the enable call
+  is safe from the loader (the set-level call wasn't: it hung, 900E; the firmware's
+  display driver never writes a regulator, so there is no precedent); the PMIC
+  indexes are the display driver's (A = 0, B = 1);
 - whether the pins configured as inputs after the power-down hold the switches off;
 - whether an output pin reads back its driven level;
 - whether the bootloader answers launch-app and how long the application takes to

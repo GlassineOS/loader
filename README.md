@@ -47,7 +47,7 @@ region table) with the load option `glassine.handback=1`
 ([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-device-boot-partition/spec.md),
 [`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md); this
 repository's [`specs/002-handback/spec.md`](specs/002-handback/spec.md); pinned at boot
-`9e3b8006`). Then the loader
+`b6f52f0d`). Then the loader
 reads its record from the boot partition, counts the start, and exits with its answer
 (`baseline`, `recovery` or a kernel set) in the exit data. It draws nothing, unless the
 record has `display=epd-fw` and the firmware's graphics output has a panel refresh: then
