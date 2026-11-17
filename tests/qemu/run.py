@@ -1483,7 +1483,7 @@ def touch_probe_waits_for_a_slow_controller():
         d, log, keys, c, seq = touch_run(f"touch-{mode}", mode)
         ms = lambda k: int(keys[k].split()[0])
         assert keys["touch.launch"].startswith("answer 0b00"), (mode, keys)
-        assert keys["touch.wait.reset"].endswith("ok") and " ok" in keys["touch.wait.app"], (mode, keys)
+        assert " ok" in keys["touch.wait.reset"] and " ok" in keys["touch.wait.app"], (mode, keys)
         assert re.search(r"TOUCH_WAIT reset \d+ ms ok", log) and re.search(r"TOUCH_WAIT launch \d+ ms ok", log), mode
         if mode == "slow-boot":
             assert ms("touch.wait.launch") >= 100, keys
@@ -1510,6 +1510,25 @@ def touch_probe_waits_for_sysinfo_like_linux():
         assert ms >= (2000 if mode == "sysinfo-late" else 300), (mode, keys)
         if mode == "sysinfo-second":
             assert re.search(r"TOUCH_WAIT sysinfo (2[89]\d\d|3\d\d\d) ms timeout", log), log[-3000:]
+
+
+@case("x86_64", "aarch64")
+def touch_probe_reads_with_the_interrupt():
+    """005 FR-005: the input register is read only while the interrupt (67) is asserted,
+    else every 50 ms until it has been; the report descriptor is read before
+    GET_SYSINFO; the application's sentinel after launch-app is the launch; reads with
+    nothing waiting aren't logged one by one."""
+    d, log, keys, c, seq = touch_run("touch-irq", "1")
+    assert c["reads_high"] == "0", (c, "a read without the interrupt")
+    assert keys["touch.rdesc"] == "reg=0x0002 len=236 050d0904000000000000000000000000", keys
+    assert "rd16:0002:236" in seq and seq.index("rd16:0002:236") < seq.index("wr0004:05002f0002"), seq
+    assert re.search(r"TOUCH_QUIET empty_reads=\d+ irq_reads=\d+", log) and "-> 0 n=2 0200" not in log, log[-2000:]
+    d, log, keys, c, seq = touch_run("touch-sentinel-only", "sentinel-only")
+    assert re.fullmatch(r"app sentinel \d+ ms", keys["touch.launch"]) and "touch.wait.app" not in keys, keys
+    d, log, keys, c, seq = touch_run("touch-irq-stuck", "irq-stuck")
+    for k in ("touch.wait.reset", "touch.wait.hid", "touch.wait.sysinfo"):
+        assert " ok irq_low=0 reads=" in keys[k] and int(keys[k].split()[0]) >= 45, (k, keys[k])
+    assert keys["touch.result"].startswith("ok"), keys
 
 
 @case("x86_64", "aarch64")

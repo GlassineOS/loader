@@ -24,6 +24,10 @@ pub struct Fw {
     bus: Option<Bus>,
     /// Log every I2C read (the bring-up) or only failed ones (the tap source's polls).
     pub quiet_reads: bool,
+    /// Reads not logged: input-register reads with nothing waiting (`02 00`), interrupt
+    /// reads.
+    pub empty_reads: u32,
+    pub irq_reads: u32,
 }
 
 impl Fw {
@@ -38,7 +42,7 @@ impl Fw {
         };
         let g = one(GPIO)?;
         let i = one(I2C)?;
-        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, quiet_reads: false })
+        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, quiet_reads: false, empty_reads: 0, irq_reads: 0 })
     }
 }
 
@@ -74,6 +78,7 @@ impl Hw for Fw {
         let r = b.read(REG_INPUT, buf, timeout_ms);
         let shown = &buf[..buf.len().min(16)];
         match r {
+            Ok(_) if buf.len() == 2 && buf[..] == [2, 0] => self.empty_reads += 1,
             Ok(n) if !self.quiet_reads => log!("TOUCH_I2C read 0x{:02x} {} -> 0 n={} {}", REG_INPUT, buf.len(), n, glassine_loader_core::hex(shown)),
             Ok(_) => {}
             Err(e) => log!("TOUCH_I2C read 0x{:02x} {} -> {}", REG_INPUT, buf.len(), e),
@@ -100,6 +105,19 @@ impl Hw for Fw {
     fn log(&mut self, line: &str) {
         log!("{}", line);
     }
+    fn irq_asserted(&mut self) -> Result<bool, String> {
+        self.irq_reads += 1;
+        self.gpio.read_quiet(touch::PIN_IRQ).map(|l| l == 0).map_err(|s| format!("{s:?}"))
+    }
+    fn read_reg(&mut self, reg: u16, buf: &mut [u8], timeout_ms: u32) -> Result<(), String> {
+        let b = self.bus.as_mut().ok_or("not open")?;
+        let r = b.read16(reg, buf, timeout_ms);
+        match r {
+            Ok(n) => log!("TOUCH_I2C read16 0x{:04x} {} -> 0 n={} {}", reg, buf.len(), n, glassine_loader_core::hex(&buf[..buf.len().min(16)])),
+            Err(e) => log!("TOUCH_I2C read16 0x{:04x} {} -> {}", reg, buf.len(), e),
+        }
+        r.map(|_| ()).map_err(|e| format!("{e}"))
+    }
 }
 
 /// `touch=probe` (FR-005 to FR-010): one bring-up, released before it returns; the
@@ -117,6 +135,7 @@ pub fn probe() -> Vec<String> {
     crate::watchdog::arm();
     let up = touch::bring_up(&mut fw, false);
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
+    log!("TOUCH_QUIET empty_reads={} irq_reads={}", fw.empty_reads, fw.irq_reads);
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
@@ -196,6 +215,7 @@ impl TapSource for Source {
             for (k, v) in &up.lines {
                 log!("TOUCH_UP {}={}", k, v);
             }
+            log!("TOUCH_QUIET empty_reads={} irq_reads={}", self.fw.empty_reads, self.fw.irq_reads);
             if !up.ok() {
                 self.state = State::Failed;
                 log!("TOUCH bring-up failed: no taps");

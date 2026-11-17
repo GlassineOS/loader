@@ -13,16 +13,18 @@
 //!   `00 00` waiting (with nothing waiting a read gives length 2); the bootloader's
 //!   launch-app command (its answer, then the application's sentinel), the HID descriptor (register 0x0001)
 //!   and `GET_SYSINFO` (to register 0x0004) each queue their answer. A read of register
-//!   0x03 gives the first bytes of the waiting frame and takes it when it reads it whole.
+//!   0x03 gives the first bytes of the waiting frame and takes it when it reads it whole;
+//!   a read with the two-byte offset 0x0002 gives the report descriptor.
 //!
 //! Modes: `1` all good; `powered` 61 and 62 read high before anything (the controller
 //! found powered); `fail-open`, `fail-write`, `nodesc` (no answer to the descriptor),
 //! `baddesc` (a descriptor of the wrong version), `slow-boot` (the answer to launch-app
-//! 30 reads late, about 150 ms), `nack-first` (the first three writes not taken),
-//! `late-app` (the application's sentinel 140 reads, about 700 ms, after the answer,
+//! 150 ms late), `nack-first` (the first three writes not taken),
+//! `late-app` (the application's sentinel 700 ms after the answer,
 //! reads and writes not taken until then), `sysinfo-late` (the first `GET_SYSINFO`
 //! answered 2.5 s late), `sysinfo-second` (the first never answered, the second
-//! 770 ms late), `sysinfo-retry` (the first two
+//! 770 ms late), `sentinel-only` (no answer to launch-app, the application's sentinel
+//! 85 ms later), `irq-stuck` (the interrupt never asserted), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -63,6 +65,8 @@ pub enum Mode {
     LateApp,
     SysinfoLate,
     SysinfoSecond,
+    SentinelOnly,
+    IrqStuck,
 }
 
 impl Mode {
@@ -83,6 +87,8 @@ impl Mode {
             "late-app" => Mode::LateApp,
             "sysinfo-late" => Mode::SysinfoLate,
             "sysinfo-second" => Mode::SysinfoSecond,
+            "sentinel-only" => Mode::SentinelOnly,
+            "irq-stuck" => Mode::IrqStuck,
             _ => return None,
         })
     }
@@ -106,10 +112,10 @@ struct State {
     /// Reads of the input register so far: the stand-in's clock (the loader polls about
     /// every 5 ms).
     reads: u32,
-    /// Frames due at a read count.
-    due: Vec<(u32, Vec<u8>)>,
+    /// Reads of the input register with nothing waiting.
+    reads_high: u32,
     /// Reads and writes not taken in this window of read counts.
-    busy: (u32, u32),
+    busy: (u64, u64),
     nacks: u32,
     /// Frames due at a time in ms (the GET_SYSINFO modes: a real clock, as the loader's
     /// waits are timed, not counted).
@@ -133,7 +139,7 @@ fn pin_of(cfg: u32) -> usize {
 fn level(s: &State, p: usize) -> bool {
     match s.out[p] {
         Some(l) => l,
-        None if p == 67 => s.queue.is_empty() || !s.up,
+        None if p == 67 => s.mode == Mode::IrqStuck || s.queue.is_empty() || !s.up,
         None => false,
     }
 }
@@ -187,8 +193,14 @@ unsafe extern "efiapi" fn gpio_read(cfg: u32, out: *mut u32) -> Status {
     let s = st();
     s.counts[2] += 1;
     let p = pin_of(cfg);
+    if p == 67 {
+        due(s);
+    }
     let l = level(s, p);
-    s.seq.push(format!("rd{p}={}", l as u8));
+    // The interrupt's polls during the waits are counted, not listed.
+    if !(p == 67 && s.open_handles > 0) {
+        s.seq.push(format!("rd{p}={}", l as u8));
+    }
     unsafe { *out = l as u32 };
     Status::SUCCESS
 }
@@ -255,6 +267,17 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
             core::hint::spin_loop();
         }
     }
+    if off_len == 2 && off == 0x0200 && check_handle(h, cfg) && !buf.is_null() && s.up {
+        // The report descriptor (register 0x0002, low byte first on the wire).
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
+        out.fill(0);
+        out[..4].copy_from_slice(&[0x05, 0x0d, 0x09, 0x04]);
+        s.seq.push(format!("rd16:0002:{len}"));
+        if !done.is_null() {
+            unsafe { *done = len as u32 };
+        }
+        return 0;
+    }
     if !check_handle(h, cfg) || buf.is_null() || len == 0 || timeout == 0 || off_len != 1 || off != 3 {
         s.seq.push(String::from("rd-bad"));
         return 1;
@@ -263,21 +286,15 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
         return 0x8001; // no answer: a NACK
     }
     s.reads += 1;
-    if (s.busy.0..s.busy.1).contains(&s.reads) {
+    if (s.busy.0..s.busy.1).contains(&now_ms()) {
         return 0x1100_00c8;
     }
-    let now = s.reads;
-    let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due).into_iter().partition(|(t, _)| *t <= now);
-    s.due = later;
-    s.queue.extend(ready.into_iter().map(|(_, f)| f));
-    let t = now_ms();
-    let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due_ms).into_iter().partition(|(d, _)| *d <= t);
-    s.due_ms = later;
-    s.queue.extend(ready.into_iter().map(|(_, f)| f));
+    due(s);
     if len == 2 && s.queue.is_empty() {
         next_tap(s);
     }
     if s.queue.is_empty() {
+        s.reads_high += 1;
         // Nothing waiting: length 2.
         let out = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
         out.fill(0);
@@ -304,6 +321,14 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
     0
 }
 
+/// The frames whose time has come, waiting.
+fn due(s: &mut State) {
+    let t = now_ms();
+    let (ready, later): (Vec<_>, Vec<_>) = core::mem::take(&mut s.due_ms).into_iter().partition(|(d, _)| *d <= t);
+    s.due_ms = later;
+    s.queue.extend(ready.into_iter().map(|(_, f)| f));
+}
+
 fn sysinfo() -> Vec<u8> {
     let mut f = alloc::vec![0u8; 51];
     f[0] = 51;
@@ -323,6 +348,7 @@ fn descriptor(version: u16) -> Vec<u8> {
     d[0] = 32;
     d[2] = 0xf7; // the application's packet id
     d[4..6].copy_from_slice(&version.to_le_bytes());
+    d[6..8].copy_from_slice(&236u16.to_le_bytes()); // report descriptor length
     d[8] = 0x02; // report descriptor register
     d[10] = 0x03; // input register
     d[12..14].copy_from_slice(&512u16.to_le_bytes());
@@ -350,7 +376,7 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
         s.nacks += 1;
         return 0x1100_00c8;
     }
-    if !s.up || (s.busy.0..s.busy.1).contains(&s.reads) {
+    if !s.up || (s.busy.0..s.busy.1).contains(&now_ms()) {
         return 0x1100_00c8;
     }
     match (reg, &data[1..]) {
@@ -360,13 +386,19 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
             _ => s.queue.push_back(descriptor(0x0100)),
         },
         (0x0004, [0x0b, 0x00, 0x40, 0x00, 0x01, 0x3b, ..]) => {
-            // The bootloader's answer, then the application's sentinel (in reads).
-            let answer = s.reads + if s.mode == Mode::SlowBoot { 30 } else { 2 };
-            let app = answer + if s.mode == Mode::LateApp { 140 } else { 4 };
-            s.due.push((answer, alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
-            s.due.push((app, alloc::vec![0, 0]));
+            // The bootloader's answer, then the application's sentinel.
+            let answer = now_ms() + if s.mode == Mode::SlowBoot { 150 } else { 10 };
+            let app = answer + match s.mode {
+                Mode::LateApp => 700,
+                Mode::SentinelOnly => 75,
+                _ => 20,
+            };
+            if s.mode != Mode::SentinelOnly {
+                s.due_ms.push((answer, alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+            }
+            s.due_ms.push((app, alloc::vec![0, 0]));
             if s.mode == Mode::LateApp {
-                s.busy = (answer + 4, app);
+                s.busy = (answer + 20, app);
             }
         }
         (0x0004, [0x05, 0x00, 0x2f, 0x00, 0x02]) => {
@@ -460,7 +492,7 @@ pub fn install(mode: Mode) -> String {
         open_handles: 0,
         taps: Vec::new(),
         reads: 0,
-        due: Vec::new(),
+        reads_high: 0,
         busy: (0, 0),
         nacks: 0,
         due_ms: Vec::new(),
@@ -547,7 +579,7 @@ pub fn report() -> Vec<String> {
     let c = s.counts;
     alloc::vec![
         format!(
-            "PARENT_FAKETOUCH calls configure={} group={} pin_read={} set={} other={} open={} read={} write={} open_now={} powered={}",
+            "PARENT_FAKETOUCH calls configure={} group={} pin_read={} set={} other={} open={} read={} write={} open_now={} powered={} reads_high={}",
             c[0],
             c[1],
             c[2],
@@ -557,7 +589,8 @@ pub fn report() -> Vec<String> {
             c[6],
             c[7],
             s.open_handles,
-            powered(s) as u8
+            powered(s) as u8,
+            s.reads_high
         ),
         format!("PARENT_FAKETOUCH seq {}", s.seq.join(" ")),
     ]

@@ -33,6 +33,10 @@ enum Fail {
     SysinfoSecond,
     /// Still in the bootloader at the descriptor: the first launch-app unanswered.
     Bootloader,
+    /// The bootloader doesn't answer launch-app; the application's sentinel 85 ms later.
+    SentinelOnly,
+    /// The interrupt never asserted.
+    IrqStuck,
 }
 
 struct Fake {
@@ -52,6 +56,9 @@ struct Fake {
     busy: (u64, u64),
     nacks: u32,
     launched: bool,
+    /// Reads of the input register while the interrupt wasn't asserted.
+    reads_high: u32,
+    rdesc_reads: Vec<(u16, usize)>,
 }
 
 impl Fake {
@@ -71,6 +78,8 @@ impl Fake {
             busy: (0, 0),
             nacks: 0,
             launched: false,
+            reads_high: 0,
+            rdesc_reads: Vec::new(),
         };
         if found_on {
             f.out[61] = Some(true);
@@ -118,6 +127,9 @@ fn desc_as(version: u16, packet: u8) -> Vec<u8> {
     d[0] = 32;
     d[2] = packet;
     d[4..6].copy_from_slice(&version.to_le_bytes());
+    d[6..8].copy_from_slice(&236u16.to_le_bytes());
+    d[8..10].copy_from_slice(&2u16.to_le_bytes());
+    d[12..14].copy_from_slice(&255u16.to_le_bytes());
     d[22..24].copy_from_slice(&0x04b4u16.to_le_bytes());
     d
 }
@@ -161,6 +173,17 @@ impl Hw for Fake {
         self.out[p as usize] = None;
         Ok(())
     }
+    fn irq_asserted(&mut self) -> Result<bool, S> {
+        self.tick();
+        Ok(self.fail != Fail::IrqStuck && self.up && !self.queue.is_empty())
+    }
+    fn read_reg(&mut self, reg: u16, buf: &mut [u8], _t: u32) -> Result<(), S> {
+        assert!(self.open);
+        self.rdesc_reads.push((reg, buf.len()));
+        buf.fill(0);
+        buf[..4].copy_from_slice(&[0x05, 0x0d, 0x09, 0x04]);
+        Ok(())
+    }
     fn open(&mut self) -> Result<(), S> {
         self.ops.push("open".into());
         if self.fail == Fail::Open {
@@ -179,6 +202,9 @@ impl Hw for Fake {
             return Err("nack".into());
         }
         self.tick();
+        if buf.len() == 2 && self.queue.is_empty() {
+            self.reads_high += 1;
+        }
         buf.fill(0);
         match self.queue.front() {
             Some(f) => {
@@ -220,8 +246,10 @@ impl Hw for Fake {
             (0x0004, d) if d == launch_app_cmd() => {
                 // The answer, then the application's sentinel.
                 let answer = self.now + if self.fail == Fail::SlowBoot { 150 } else { 10 };
-                let app = answer + if self.fail == Fail::LateApp { 700 } else { 20 };
-                self.due.push((answer, vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+                let app = answer + if self.fail == Fail::LateApp { 700 } else if self.fail == Fail::SentinelOnly { 75 } else { 20 };
+                if self.fail != Fail::SentinelOnly {
+                    self.due.push((answer, vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+                }
                 self.due.push((app, vec![0, 0]));
                 self.launched = true;
                 if self.fail == Fail::LateApp {
@@ -394,7 +422,7 @@ fn slow_boot_late_app_and_nacks_are_waited_for() {
         let up = bring_up(&mut f, false);
         assert!(up.ok(), "{fail:?}: {:?} {:?}", up.result, up.lines);
         assert!(line(&up, "touch.launch").starts_with("answer 0b00"), "{fail:?}: {:?}", up.lines);
-        assert!(line(&up, "touch.wait.reset").ends_with("ok"), "{fail:?}: {:?}", up.lines);
+        assert!(line(&up, "touch.wait.reset").contains(" ok"), "{fail:?}: {:?}", up.lines);
         assert!(line(&up, "touch.wait.app").contains(" ok"), "{fail:?}: {:?}", up.lines);
         let ms = |k: &str| line(&up, k).split(' ').next().unwrap().parse::<u64>().unwrap();
         match fail {
@@ -449,4 +477,40 @@ fn the_mode_from_the_descriptor() {
     assert_eq!(line(&up, "touch.launch"), "no answer");
     assert!(line(&up, "touch.launch.bl").starts_with("answer"), "{:?}", up.lines);
     assert_eq!(f.ops.iter().filter(|o| o.starts_with("wr0004:0b00")).count(), 2);
+}
+
+#[test]
+fn reads_only_with_the_interrupt_asserted() {
+    let mut f = Fake::new(Fail::None, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(f.reads_high, 0, "a read without the interrupt: {:?}", up.lines);
+    assert!(line(&up, "touch.wait.hid").contains("irq_low=1 reads=1"), "{:?}", up.lines);
+    // The report descriptor read before GET_SYSINFO, from the HID descriptor's fields.
+    assert_eq!(f.rdesc_reads, [(2, 236)]);
+    assert_eq!(line(&up, "touch.rdesc"), "reg=0x0002 len=236 050d0904000000000000000000000000");
+    let rd = up.lines.iter().position(|l| l.0 == "touch.rdesc").unwrap();
+    assert!(rd < up.lines.iter().position(|l| l.0 == "touch.res").unwrap());
+}
+
+#[test]
+fn an_interrupt_that_never_moves_falls_back_to_50_ms_polls() {
+    let mut f = Fake::new(Fail::IrqStuck, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    for k in ["touch.wait.reset", "touch.wait.hid", "touch.wait.sysinfo"] {
+        let v = line(&up, k);
+        let ms: u64 = v.split(' ').next().unwrap().parse().unwrap();
+        assert!(v.contains("irq_low=0") && (FALLBACK_MS..FALLBACK_MS + 20).contains(&ms), "{k}: {v}");
+    }
+}
+
+#[test]
+fn the_application_sentinel_is_a_launch() {
+    let mut f = Fake::new(Fail::SentinelOnly, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    let l = line(&up, "touch.launch");
+    assert!(l.starts_with("app sentinel ") && l.ends_with(" ms"), "{l}");
+    assert!(line(&up, "touch.wait.app").is_empty(), "{:?}", up.lines);
 }
