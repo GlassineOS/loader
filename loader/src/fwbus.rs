@@ -16,6 +16,7 @@ use crate::log;
 
 pub const I2C_GUID: Guid = guid!("b27ae8b1-3e10-4d07-ab5c-eb9a6dc6fa8f");
 pub const GPIO_GUID: Guid = guid!("ad9aec18-7bf0-4809-9e96-3012309f3df7");
+pub const VREG_GUID: Guid = guid!("22d38d3d-e8b6-4f8f-9c26-bceb07d6cb68");
 
 /// What the loader knows of each protocol: its interface's length in words and the
 /// revision in its first word.
@@ -29,6 +30,8 @@ pub struct Kind {
 
 pub const I2C: Kind = Kind { key: "i2c", guid: I2C_GUID, words: 6, revision: 0x10000 };
 pub const GPIO: Kind = Kind { key: "gpio", guid: GPIO_GUID, words: 8, revision: 1 };
+/// The PMIC regulator protocol: the revision and seven calls.
+pub const VREG: Kind = Kind { key: "vreg", guid: VREG_GUID, words: 8, revision: 0x10005 };
 
 /// One protocol as found.
 pub struct Found {
@@ -252,6 +255,84 @@ impl Bus {
         let f: Close = unsafe { core::mem::transmute(rd64_at(self.iface, 5) as usize) };
         let st = unsafe { f(self.handle) };
         log!("TOUCH_I2C close -> {}", st);
+        st
+    }
+}
+
+// ---- the PMIC regulator protocol --------------------------------------------------------
+
+/// The only regulators the touch driver reads, sets or switches (spec 005): pm660l
+/// LDO3 (PMIC 1) and pm660 LDO11 (PMIC 0).
+fn vreg_allowed(pmic: u32, ldo: u32) -> bool {
+    matches!((pmic, ldo), (1, 3) | (0, 11))
+}
+
+/// A regulator protocol that passed its checks. Calls take the PMIC index and the
+/// regulator id (LDO n is id n - 1).
+pub struct Vreg {
+    iface: u64,
+}
+
+impl Vreg {
+    pub fn new(f: &Found) -> Option<Vreg> {
+        f.check.is_ok().then_some(())?;
+        Some(Vreg { iface: f.iface? })
+    }
+
+    fn word(&self, i: u64) -> u64 {
+        unsafe { rd64(self.iface + 8 * i) }
+    }
+
+    /// Enabled (software enable on) and the level in mV: the status call (word 6) and
+    /// the level call (word 3). Read only.
+    pub fn get(&self, pmic: u32, ldo: u32) -> Result<(bool, u32), Status> {
+        if !vreg_allowed(pmic, ldo) {
+            return Err(Status::ACCESS_DENIED);
+        }
+        type GetStatus = unsafe extern "efiapi" fn(u32, u32, *mut u32) -> Status;
+        type GetLevel = unsafe extern "efiapi" fn(u32, u32, *mut u32) -> Status;
+        // pull-down, mode, pin control, software enable (u32 each), then "ok" (one byte).
+        let mut status = [0u32; 8];
+        let f: GetStatus = unsafe { core::mem::transmute(self.word(6) as usize) };
+        let st = unsafe { f(pmic, ldo - 1, status.as_mut_ptr()) };
+        log!("TOUCH_PMIC status p{} l{} -> {:?} pull_down={} mode={} pin_ctl={} enable={} ok={}", pmic, ldo, st, status[0], status[1], status[2], status[3], status[4] & 0xff);
+        if st != Status::SUCCESS {
+            return Err(st);
+        }
+        let mut mv = 0u32;
+        let f: GetLevel = unsafe { core::mem::transmute(self.word(3) as usize) };
+        let st = unsafe { f(pmic, ldo - 1, &mut mv) };
+        // The level is the set output; taken as µV when it is that large (the set call
+        // takes mV).
+        let level = if mv >= 100_000 { mv / 1000 } else { mv };
+        log!("TOUCH_PMIC level p{} l{} -> {:?} raw={} {} mV", pmic, ldo, st, mv, level);
+        if st != Status::SUCCESS {
+            return Err(st);
+        }
+        Ok((status[3] == 1, level))
+    }
+
+    /// Sets the level (word 2).
+    pub fn set(&self, pmic: u32, ldo: u32, mv: u32) -> Status {
+        if !vreg_allowed(pmic, ldo) {
+            return Status::ACCESS_DENIED;
+        }
+        type SetLevel = unsafe extern "efiapi" fn(u32, u32, u32) -> Status;
+        let f: SetLevel = unsafe { core::mem::transmute(self.word(2) as usize) };
+        let st = unsafe { f(pmic, ldo - 1, mv) };
+        log!("TOUCH_PMIC set p{} l{} {} mV -> {:?}", pmic, ldo, mv, st);
+        st
+    }
+
+    /// Enables or disables it (word 1).
+    pub fn enable(&self, pmic: u32, ldo: u32, on: bool) -> Status {
+        if !vreg_allowed(pmic, ldo) {
+            return Status::ACCESS_DENIED;
+        }
+        type Control = unsafe extern "efiapi" fn(u32, u32, u8) -> Status;
+        let f: Control = unsafe { core::mem::transmute(self.word(1) as usize) };
+        let st = unsafe { f(pmic, ldo - 1, on as u8) };
+        log!("TOUCH_PMIC control p{} l{} {} -> {:?}", pmic, ldo, on as u8, st);
         st
     }
 }

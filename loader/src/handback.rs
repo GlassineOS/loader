@@ -247,6 +247,7 @@ fn touch_probe<S: RecordStore + Log>(store: &mut S, rec: &mut Option<InUse>) -> 
         log!("TOUCH_SKIPPED not-written");
         return Some(alloc::vec![String::from("touch.result=skipped not-written")]);
     }
+    crate::touch::set_rail(cur.rec.get("touch_rail") == "on");
     Some(crate::touch::probe())
 }
 
@@ -271,6 +272,7 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
     let clear_menu: Vec<(&'static str, String)> =
         if rec.as_ref().is_some_and(|r| r.rec.get("request") == "menu") { alloc::vec![("request", String::new())] } else { Vec::new() };
     crate::touch::set_on(rec.as_ref().is_some_and(|r| r.rec.get("touch") == "on"));
+    crate::touch::set_rail(rec.as_ref().is_some_and(|r| r.rec.get("touch_rail") == "on"));
     if !wants_epd(rec.as_ref()) {
         return (plan::handback_with(store, rec, pick_recovery, &pairs(&clear_menu), &[]), false);
     }
