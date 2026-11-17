@@ -1476,19 +1476,20 @@ def touch_probe_fails_at_each_step_and_powers_down():
 
 @case("x86_64", "aarch64")
 def touch_probe_waits_for_a_slow_controller():
-    """005 FR-005, FR-007: the reset sentinel, the bootloader's answer to launch-app and
-    the application's sentinel are waited for (logged TOUCH_WAIT with their duration);
-    writes the controller doesn't take are sent again; all inside the deadline."""
+    """005 FR-005, FR-007: the reset sentinel and the application's sentinel after
+    launch-app are waited for (logged TOUCH_WAIT with their duration), the bootloader's
+    answer dropped; writes the controller doesn't take are sent again; all inside the
+    deadline."""
     for mode in ("slow-boot", "nack-first", "late-app"):
         d, log, keys, c, seq = touch_run(f"touch-{mode}", mode)
         ms = lambda k: int(keys[k].split()[0])
-        assert keys["touch.launch"].startswith("answer 0b00"), (mode, keys)
+        assert keys["touch.launch"].startswith("app sentinel "), (mode, keys)
         assert " ok" in keys["touch.wait.reset"] and " ok" in keys["touch.wait.app"], (mode, keys)
-        assert re.search(r"TOUCH_WAIT reset \d+ ms ok", log) and re.search(r"TOUCH_WAIT launch \d+ ms ok", log), mode
+        assert re.search(r"TOUCH_WAIT reset \d+ ms ok", log) and re.search(r"TOUCH_WAIT app \d+ ms ok", log), mode
         if mode == "slow-boot":
-            assert ms("touch.wait.launch") >= 100, keys
+            assert ms("touch.wait.app") >= 200, keys
         if mode == "late-app":
-            assert ms("touch.wait.app") >= 400 and "read_errors=" in keys["touch.wait.app"], keys
+            assert ms("touch.wait.app") >= 400, keys
             assert seq.index("wr0001:") > seq.index(next(o for o in seq if o.startswith("wr0004:0b00"))), seq
         if mode == "nack-first":
             assert re.search(r"TOUCH_WAIT write 0x0004 \d+ ms ok tries=4", log), log[-2000:]
@@ -1515,20 +1516,39 @@ def touch_probe_waits_for_sysinfo_like_linux():
 @case("x86_64", "aarch64")
 def touch_probe_reads_with_the_interrupt():
     """005 FR-005: the input register is read only while the interrupt (67) is asserted,
-    else every 50 ms until it has been; the report descriptor is read before
-    GET_SYSINFO; the application's sentinel after launch-app is the launch; reads with
-    nothing waiting aren't logged one by one."""
+    else every 50 ms while it never has been; no report descriptor read; a size-0 frame
+    within 30 ms of launch-app isn't the application's sentinel; reads with nothing
+    waiting aren't logged one by one."""
     d, log, keys, c, seq = touch_run("touch-irq", "1")
     assert c["reads_high"] == "0", (c, "a read without the interrupt")
-    assert keys["touch.rdesc"] == "reg=0x0002 len=236 050d0904000000000000000000000000", keys
-    assert "rd16:0002:236" in seq and seq.index("rd16:0002:236") < seq.index("wr0004:05002f0002"), seq
+    assert "touch.rdesc" not in keys and not any(o.startswith("rd16") for o in seq), (keys, seq)
     assert re.search(r"TOUCH_QUIET empty_reads=\d+ irq_reads=\d+", log) and "-> 0 n=2 0200" not in log, log[-2000:]
-    d, log, keys, c, seq = touch_run("touch-sentinel-only", "sentinel-only")
-    assert re.fullmatch(r"app sentinel \d+ ms", keys["touch.launch"]) and "touch.wait.app" not in keys, keys
+    d, log, keys, c, seq = touch_run("touch-early-sentinel", "early-sentinel")
+    m = re.fullmatch(r"app sentinel (\d+) ms drained=0 dropped=1", keys["touch.launch"])
+    assert m and int(m.group(1)) >= 80, keys
     d, log, keys, c, seq = touch_run("touch-irq-stuck", "irq-stuck")
     for k in ("touch.wait.reset", "touch.wait.hid", "touch.wait.sysinfo"):
         assert " ok irq_low=0 reads=" in keys[k] and int(keys[k].split()[0]) >= 45, (k, keys[k])
     assert keys["touch.result"].startswith("ok"), keys
+
+
+@case("x86_64", "aarch64")
+def touch_probe_follows_linuxs_probe_on_the_device():
+    """005 FR-005: the stand-in replays Linux's own probe traced on the device (no answer
+    to launch-app, five application sentinels 80 ms after it; before them the descriptor
+    says bootloader and GET_SYSINFO is lost; after them GET_SYSINFO answered 745 ms
+    later). The loader waits for the sentinels, drains them, asks the descriptor
+    (the application's), sends GET_SYSINFO once and reads its answer on the interrupt."""
+    d, log, keys, c, seq = touch_run("touch-linux-trace", "linux-trace")
+    m = re.fullmatch(r"app sentinel (\d+) ms drained=4", keys["touch.launch"])
+    assert m and int(m.group(1)) >= 80, keys
+    assert keys["touch.mode"] == "app" and "touch.mode.bl" not in keys, keys
+    assert seq.count("wr0004:05002f0002") == 1 and keys["touch.res"].endswith("ask=1"), (keys, seq)
+    w = keys["touch.wait.sysinfo"]
+    assert int(w.split()[0]) >= 740 and " ok irq_low=1 reads=1" in w, w
+    assert c["reads_high"] == "0", c
+    launch = next(i for i, o in enumerate(seq) if o.startswith("wr0004:0b00"))
+    assert launch < seq.index("wr0001:") < seq.index("wr0004:05002f0002"), seq
 
 
 @case("x86_64", "aarch64")

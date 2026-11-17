@@ -24,16 +24,24 @@ pub const I2C_KHZ: u32 = 100;
 pub const DEADLINE_MS: u64 = 10_000;
 pub const CALL_MS: u64 = 100;
 pub const POLL_MS: u64 = 5;
-/// The waits after a reset: the reset sentinel, the bootloader's answer to launch-app,
-/// the application's sentinel; how long a write the controller doesn't take is sent
-/// again.
+/// The waits after a reset: the reset sentinel; the application's sentinel after
+/// launch-app (frames within [`APP_EARLY_MS`] of the write are not it), at most
+/// [`APP_WAIT_MS`], or [`APP_WAIT_NO_IRQ_MS`] while the interrupt has never been seen
+/// asserted; how long a write the controller doesn't take is sent again.
 pub const RESET_WAIT_MS: u64 = 500;
-pub const LAUNCH_WAIT_MS: u64 = 500;
+pub const APP_EARLY_MS: u64 = 30;
 pub const APP_WAIT_MS: u64 = 1000;
+pub const APP_WAIT_NO_IRQ_MS: u64 = 200;
 pub const WRITE_RETRY_MS: u64 = 300;
-/// While the interrupt hasn't been seen asserted in a wait, the input register is read
-/// this often anyway (an interrupt line that never moves).
+/// The HID descriptor's request is sent once more when the interrupt doesn't assert
+/// within this long.
+pub const HID_RESEND_MS: u64 = 500;
+/// While the interrupt has never been seen asserted in the bring-up, the input register
+/// is read this often anyway (an interrupt line that never moves).
 pub const FALLBACK_MS: u64 = 50;
+/// The report descriptor read before `GET_SYSINFO` (HID over I2C does it; Linux's
+/// cyttsp5 doesn't put it on the wire). Off.
+pub const READ_REPORT_DESC: bool = false;
 /// How long one `GET_SYSINFO` is waited for (Linux's `CY_HID_OUTPUT_GET_SYSINFO_TIMEOUT_MS`;
 /// the controller's application can take seconds after power-up), the pause before it
 /// is sent again, how often it is sent at most.
@@ -208,26 +216,27 @@ pub fn read_frame<H: Hw>(hw: &mut H, deadline: u64) -> Result<Option<Vec<u8>>, S
     })
 }
 
-/// Waits for `want` to take what the input register gives, for at most `max_ms` (never
-/// past `deadline`). Every [`POLL_MS`] the interrupt is read, and the register only
-/// while it is asserted, as Linux reads it; until the interrupt has been seen asserted
-/// in this wait, the register is also read every [`FALLBACK_MS`]. A read that fails
-/// counts as nothing yet: a controller busy starting up doesn't answer its address.
-/// Logged (`TOUCH_WAIT`) and reported (`key`) with how long it took and how often the
-/// interrupt was asserted and the register read.
-fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadline: u64, mut want: impl FnMut(Frame) -> Option<T>) -> Option<T> {
+/// Waits for `want` to take what the input register gives (with the ms since `since`),
+/// for at most `max_ms` (never past `deadline`). Every [`POLL_MS`] the interrupt is
+/// read, and the register only while it is asserted, as Linux reads it; while the
+/// interrupt has never been seen asserted in the whole bring-up, the register is also
+/// read every [`FALLBACK_MS`]. A read that fails counts as nothing yet: a controller
+/// busy starting up doesn't answer its address. Logged (`TOUCH_WAIT`) and reported
+/// (`key`) with how long it took and how often the interrupt was asserted and the
+/// register read. Gives what `want` took and how often the interrupt was asserted.
+fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadline: u64, since: u64, mut want: impl FnMut(Frame, u64) -> Option<T>) -> (Option<T>, u32) {
     let start = hw.now_ms();
     let until = (start + max_ms).min(deadline);
     let (mut errs, mut last) = (0u32, String::new());
-    let (mut low, mut reads, mut seen, mut last_read) = (0u32, 0u32, false, start);
+    let (mut low, mut reads, mut last_read) = (0u32, 0u32, start);
     let got = loop {
         let now = hw.now_ms();
         let asserted = hw.irq_asserted().unwrap_or(false);
         if asserted {
             low += 1;
-            seen = true;
+            up.irq_seen = true;
         }
-        let read = asserted || (!seen && now.saturating_sub(last_read) >= FALLBACK_MS);
+        let read = asserted || (!up.irq_seen && now.saturating_sub(last_read) >= FALLBACK_MS);
         if !read {
             if now + POLL_MS >= until {
                 break None;
@@ -239,7 +248,8 @@ fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadl
         last_read = now;
         match read_any(hw, deadline) {
             Ok(f) => {
-                if let Some(t) = want(f) {
+                let at = hw.now_ms().saturating_sub(since);
+                if let Some(t) = want(f, at) {
                     break Some(t);
                 }
             }
@@ -258,7 +268,20 @@ fn wait<H: Hw, T>(hw: &mut H, up: &mut Up, key: &'static str, max_ms: u64, deadl
     let v = format!("{} ms {} irq_low={low} reads={reads}{errs}", ms, if got.is_some() { "ok" } else { "timeout" });
     hw.log(&format!("TOUCH_WAIT {} {v}", key.trim_start_matches("touch.wait.")));
     set(up, key, v);
-    got
+    (got, low)
+}
+
+/// After the application's sentinel: the frames still waiting read while the interrupt
+/// is asserted, until it isn't or an empty read (`02 00`). Gives how many were read.
+fn drain<H: Hw>(hw: &mut H, deadline: u64) -> u32 {
+    let mut n = 0u32;
+    while n < 32 && hw.now_ms() + POLL_MS < deadline && hw.irq_asserted().unwrap_or(false) {
+        match read_any(hw, deadline) {
+            Ok(Frame::Empty) | Err(_) => break,
+            Ok(_) => n += 1,
+        }
+    }
+    n
 }
 
 /// A write, sent again every 10 ms while the controller doesn't take it (a busy
@@ -308,6 +331,8 @@ pub struct Up {
     pub result: Result<(), String>,
     /// The report's `touch.*` lines, in order.
     pub lines: Vec<(&'static str, String)>,
+    /// The interrupt was seen asserted (from then on no fallback reads).
+    pub irq_seen: bool,
 }
 
 impl Up {
@@ -322,7 +347,7 @@ impl Up {
 pub fn bring_up<H: Hw>(hw: &mut H, keep: bool) -> Up {
     let start = hw.now_ms();
     let deadline = start + DEADLINE_MS;
-    let mut up = Up { found: Vec::new(), found_on: false, powered: false, opened: false, sysinfo: None, result: Ok(()), lines: Vec::new() };
+    let mut up = Up { found: Vec::new(), found_on: false, powered: false, opened: false, sysinfo: None, result: Ok(()), lines: Vec::new(), irq_seen: false };
     let r = steps(hw, &mut up, deadline);
     up.result = r;
     let el = hw.now_ms().saturating_sub(start);
@@ -372,9 +397,11 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     up.opened = true;
     up.lines.push(("touch.open", format!("instance={I2C_INSTANCE} address=0x{I2C_ADDRESS:02x} khz={I2C_KHZ}")));
     // The reset sentinel (length 0); anything before it is dropped.
-    wait(hw, up, "touch.wait.reset", RESET_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
-    let l = launch(hw, up, deadline, ["touch.wait.launch", "touch.wait.app"]);
+    let t = hw.now_ms();
+    wait(hw, up, "touch.wait.reset", RESET_WAIT_MS, deadline, t, |f, _| (f == Frame::Sentinel).then_some(()));
+    let l = launch(hw, up, deadline, "touch.wait.app");
     up.lines.push(("touch.launch", l));
+    let settled = hw.now_ms();
     // The HID descriptor; its packet id tells the mode. Still in the bootloader:
     // launch-app again, then the descriptor again.
     let mut desc = hid_desc(hw, up, deadline)?;
@@ -382,7 +409,7 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
         Some(PACKET_APP) => set(up, "touch.mode", "app".into()),
         Some(PACKET_BL) => {
             set(up, "touch.mode", "bl".into());
-            let l = launch(hw, up, deadline, ["touch.wait.launch.bl", "touch.wait.app.bl"]);
+            let l = launch(hw, up, deadline, "touch.wait.app.bl");
             up.lines.push(("touch.launch.bl", l));
             desc = hid_desc(hw, up, deadline)?;
             let m = match desc.get(2).copied() {
@@ -400,15 +427,25 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     }
     let le = |o: usize| u16::from_le_bytes([desc[o], desc[o + 1]]);
     up.lines.push(("touch.hid", format!("vendor=0x{:04x} product=0x{:04x} version=0x{:04x} max_input={}", le(22), le(24), le(26), le(12))));
-    report_desc(hw, up, deadline, le(8), le(6), le(12));
-    // The system information: sent once and waited for as Linux does; on no answer (or
-    // one that isn't it: lab patch 0002), sent again after a pause.
+    if READ_REPORT_DESC {
+        report_desc(hw, up, deadline, le(8), le(6), le(12));
+    }
+    // The system information: sent no sooner than SYSINFO_PAUSE_MS after the
+    // application's sentinels (Linux's first send, before them, is lost), and waited for
+    // as Linux does; on no answer (or one that isn't it: lab patch 0002), sent again
+    // after a pause.
+    let at = settled + SYSINFO_PAUSE_MS;
+    let now = hw.now_ms();
+    if at > now && at < deadline {
+        hw.stall_ms(at - now);
+    }
     for ask in 1..=SYSINFO_SENDS {
         if call_ms(hw, deadline).is_none() {
             break;
         }
         write_retry(hw, REG_OUTPUT, &SYSINFO_CMD_BYTES, deadline).map_err(|e| format!("sysinfo: write {e}"))?;
-        let f = wait(hw, up, "touch.wait.sysinfo", SYSINFO_WAIT_MS, deadline, |f| match f {
+        let t = hw.now_ms();
+        let (f, _) = wait(hw, up, "touch.wait.sysinfo", SYSINFO_WAIT_MS, deadline, t, |f, _| match f {
             Frame::Data(f) => Some(f),
             _ => None,
         });
@@ -441,29 +478,32 @@ fn set(up: &mut Up, key: &'static str, v: String) {
     }
 }
 
-/// The bootloader's launch-app and its answer (lengths 0 and 2 aren't one); then the
-/// application, once started, sends its own sentinel. None of it is fatal: a controller
-/// already in its application answers launch-app with an error or not at all.
-fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, keys: [&'static str; 2]) -> String {
-    match write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
-        Err(e) => format!("write failed {e}"),
-        Ok(()) => {
-            let start = hw.now_ms();
-            // The bootloader's answer, or straight away the application's sentinel (the
-            // launch worked; the bootloader doesn't always answer).
-            match wait(hw, up, keys[0], LAUNCH_WAIT_MS, deadline, |f| match f {
-                Frame::Data(f) => Some(Some(f)),
-                Frame::Sentinel => Some(None),
-                Frame::Empty => None,
-            }) {
-                Some(Some(f)) => {
-                    wait(hw, up, keys[1], APP_WAIT_MS, deadline, |f| (f == Frame::Sentinel).then_some(()));
-                    format!("answer {}", hex(&f[..f.len().min(16)]))
-                }
-                Some(None) => format!("app sentinel {} ms", hw.now_ms().saturating_sub(start)),
-                None => "no answer".into(),
-            }
+/// The bootloader's launch-app, then the application's sentinel: a size-0 frame at
+/// least [`APP_EARLY_MS`] after the write (frames before that, and any other frame, are
+/// read and dropped), then the frames still waiting drained. Not fatal: without a
+/// sentinel the bring-up goes on (a controller already in its application).
+fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, key: &'static str) -> String {
+    if let Err(e) = write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
+        return format!("write failed {e}");
+    }
+    let start = hw.now_ms();
+    let max = if up.irq_seen { APP_WAIT_MS } else { APP_WAIT_NO_IRQ_MS };
+    let mut dropped = 0u32;
+    let (got, _) = wait(hw, up, key, max, deadline, start, |f, at| match f {
+        Frame::Sentinel if at >= APP_EARLY_MS => Some(at),
+        Frame::Empty => None,
+        _ => {
+            dropped += 1;
+            None
         }
+    });
+    let dropped = if dropped > 0 { format!(" dropped={dropped}") } else { String::new() };
+    match got {
+        Some(at) => {
+            let n = drain(hw, deadline);
+            format!("app sentinel {at} ms drained={n}{dropped}")
+        }
+        None => format!("no sentinel{dropped}"),
     }
 }
 
@@ -491,12 +531,23 @@ fn report_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, reg: u16, len: u16
 
 /// The HID descriptor (register 0x0001), reported (`touch.desc`).
 fn hid_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<Vec<u8>, String> {
-    write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
-    let desc = wait(hw, up, "touch.wait.hid", SYSINFO_WAIT_MS, deadline, |f| match f {
+    let data = |f, _| match f {
         Frame::Data(f) => Some(f),
         _ => None,
-    })
-    .ok_or_else(|| String::from("hid: no answer"))?;
+    };
+    write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
+    let t = hw.now_ms();
+    let (mut desc, low) = wait(hw, up, "touch.wait.hid", HID_RESEND_MS, deadline, t, data);
+    if desc.is_none() {
+        // The interrupt never asserted: the request sent once more.
+        if low == 0 {
+            write_retry(hw, REG_HID_DESC, &[], deadline).map_err(|e| format!("hid: write {e}"))?;
+        }
+        let t = hw.now_ms();
+        desc = wait(hw, up, "touch.wait.hid.more", SYSINFO_WAIT_MS - HID_RESEND_MS, deadline, t, data).0;
+        set(up, "touch.hid.resent", format!("{}", low == 0));
+    }
+    let desc = desc.ok_or_else(|| String::from("hid: no answer"))?;
     set(up, "touch.desc", hex(&desc));
     Ok(desc)
 }

@@ -23,8 +23,12 @@
 //! `late-app` (the application's sentinel 700 ms after the answer,
 //! reads and writes not taken until then), `sysinfo-late` (the first `GET_SYSINFO`
 //! answered 2.5 s late), `sysinfo-second` (the first never answered, the second
-//! 770 ms late), `sentinel-only` (no answer to launch-app, the application's sentinel
-//! 85 ms later), `irq-stuck` (the interrupt never asserted), `sysinfo-retry` (the first two
+//! 770 ms late), `early-sentinel` (a size-0 frame 15 ms after launch-app, too
+//! early to be the application's, then the application's sentinel at 85 ms),
+//! `linux-trace` (Linux's own probe on the device: no answer to launch-app, the
+//! application's five sentinels 80 ms after it; before them the descriptor says
+//! bootloader, 0xFF, and a `GET_SYSINFO` is lost; after them `GET_SYSINFO` answered
+//! 745 ms later), `irq-stuck` (the interrupt never asserted), `sysinfo-retry` (the first two
 //! `GET_SYSINFO` answers empty), `nosysinfo` (never one), `hang-read` (an I2C read that
 //! never returns), `fail-gpio` (`set pin` fails).
 //!
@@ -65,7 +69,8 @@ pub enum Mode {
     LateApp,
     SysinfoLate,
     SysinfoSecond,
-    SentinelOnly,
+    EarlySentinel,
+    LinuxTrace,
     IrqStuck,
 }
 
@@ -87,7 +92,8 @@ impl Mode {
             "late-app" => Mode::LateApp,
             "sysinfo-late" => Mode::SysinfoLate,
             "sysinfo-second" => Mode::SysinfoSecond,
-            "sentinel-only" => Mode::SentinelOnly,
+            "early-sentinel" => Mode::EarlySentinel,
+            "linux-trace" => Mode::LinuxTrace,
             "irq-stuck" => Mode::IrqStuck,
             _ => return None,
         })
@@ -96,6 +102,8 @@ impl Mode {
 
 struct State {
     mode: Mode,
+    /// When the application's sentinels come (after launch-app).
+    app_at: Option<u64>,
     /// Per pin: Some(level) when an output.
     out: [Option<bool>; 128],
     /// The latched output level per pin (set before configure).
@@ -321,6 +329,10 @@ unsafe extern "efiapi" fn i2c_read(h: *mut c_void, cfg: *const BusCfg, off: u16,
     0
 }
 
+fn app_started(s: &State) -> bool {
+    s.app_at.is_some_and(|t| now_ms() >= t)
+}
+
 /// The frames whose time has come, waiting.
 fn due(s: &mut State) {
     let t = now_ms();
@@ -344,9 +356,13 @@ fn sysinfo() -> Vec<u8> {
 }
 
 fn descriptor(version: u16) -> Vec<u8> {
+    descriptor_as(version, 0xf7)
+}
+
+fn descriptor_as(version: u16, packet: u8) -> Vec<u8> {
     let mut d = alloc::vec![0u8; 32];
     d[0] = 32;
-    d[2] = 0xf7; // the application's packet id
+    d[2] = packet; // 0xf7 the application, 0xff the bootloader
     d[4..6].copy_from_slice(&version.to_le_bytes());
     d[6..8].copy_from_slice(&236u16.to_le_bytes()); // report descriptor length
     d[8] = 0x02; // report descriptor register
@@ -383,20 +399,27 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
         (0x0001, []) => match s.mode {
             Mode::NoDesc => {}
             Mode::BadDesc => s.queue.push_back(descriptor(0x0200)),
+            Mode::LinuxTrace if !app_started(s) => s.queue.push_back(descriptor_as(0x0100, 0xff)),
             _ => s.queue.push_back(descriptor(0x0100)),
         },
         (0x0004, [0x0b, 0x00, 0x40, 0x00, 0x01, 0x3b, ..]) => {
             // The bootloader's answer, then the application's sentinel.
             let answer = now_ms() + if s.mode == Mode::SlowBoot { 150 } else { 10 };
-            let app = answer + match s.mode {
-                Mode::LateApp => 700,
-                Mode::SentinelOnly => 75,
-                _ => 20,
+            let app = match s.mode {
+                Mode::LateApp => answer + 700,
+                Mode::SlowBoot => answer + 80,
+                Mode::EarlySentinel => now_ms() + 85,
+                _ => now_ms() + 80,
             };
-            if s.mode != Mode::SentinelOnly {
-                s.due_ms.push((answer, alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17]));
+            match s.mode {
+                Mode::EarlySentinel => s.due_ms.push((now_ms() + 15, alloc::vec![0, 0])),
+                Mode::LinuxTrace => {}
+                _ => s.due_ms.push((answer, alloc::vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17])),
             }
-            s.due_ms.push((app, alloc::vec![0, 0]));
+            for _ in 0..if s.mode == Mode::LinuxTrace { 5 } else { 1 } {
+                s.due_ms.push((app, alloc::vec![0, 0]));
+            }
+            s.app_at = Some(app);
             if s.mode == Mode::LateApp {
                 s.busy = (answer + 20, app);
             }
@@ -409,6 +432,8 @@ unsafe extern "efiapi" fn i2c_write(h: *mut c_void, cfg: *const BusCfg, off: u16
                 _ => false,
             };
             match s.mode {
+                Mode::LinuxTrace if !app_started(s) => {}
+                Mode::LinuxTrace => s.due_ms.push((now_ms() + 745, sysinfo())),
                 Mode::SysinfoLate if s.sysinfo_asks == 1 => s.due_ms.push((now_ms() + 2500, sysinfo())),
                 Mode::SysinfoSecond if s.sysinfo_asks == 1 => {}
                 Mode::SysinfoSecond => s.due_ms.push((now_ms() + 770, sysinfo())),
@@ -493,6 +518,7 @@ pub fn install(mode: Mode) -> String {
         taps: Vec::new(),
         reads: 0,
         reads_high: 0,
+        app_at: None,
         busy: (0, 0),
         nacks: 0,
         due_ms: Vec::new(),
