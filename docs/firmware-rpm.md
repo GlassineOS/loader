@@ -5,13 +5,17 @@ pm660l LDO3, belongs to the RPM, the SoC's resource power manager. An operating 
 switches it by sending the RPM a request; it doesn't write the PMIC itself. Linux does
 this through `qcom_smd-regulator` over the RPM's glink channel `rpm_requests`. The
 firmware has its own client for that channel and installs protocols on top of it. The
-loader's touch driver (spec 005, `touch_rpm`) uses them to switch LDO3 on as Linux does.
+loader's touch driver (spec 005 FR-018) uses them to switch LDO3 on as Linux does,
+whenever it finds LDO3 off; the record's `touch_rpm` stops it at an earlier stage for a
+diagnostic run.
 
 This page describes those protocols in this project's own words and types, as far as the
 loader needs them. It is derived from how the firmware's own drivers call them. Nothing
 here is the firmware's code or data, and nothing comes from other parties' headers: no
 public header with a licence this project can use describes these protocols.
-**Unverified on the device** until the runs listed in spec 005 have been made.
+On the device the vote (`ldob` id 3, `swen` on, then off) was made and answered, LDO3
+read on after it and off after its withdrawal; the rest stays unverified until the runs
+listed in spec 005 have been made.
 
 All calls use the platform's C calling convention (`efiapi` on arm64) and return an
 `EFI_STATUS`.

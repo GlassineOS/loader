@@ -63,6 +63,9 @@ pub fn open_write(rec: &InUse) -> Vec<(&'static str, String)> {
     }
     ch.push(("unmarked", plan::unmarked(rec).saturating_add(1).to_string()));
     ch.push(("drew", "1".into()));
+    if !rec.rec.get("deploy_once").is_empty() {
+        ch.push(("deploy_once", String::new()));
+    }
     ch
 }
 
@@ -88,7 +91,27 @@ fn set_of(cur: &InUse, key: &str) -> Option<Boot> {
 /// the PC's [`plan::start`] makes it for the other picks: the previous kernel counted with
 /// `started_why=choice`, the recovery not counted, a deployment the ordinary start with
 /// `glassine.deploy.once=<id>`. `request=menu` is no request here.
+///
+/// Under a parent that passes no command line (`parent_cmdline=no`, the board's
+/// `LOADER_PARENT_CMDLINE`, boot `docs/handback.md`) the deployment goes into the
+/// record instead: `deploy_once=<id>` in the pick's write, the answer without
+/// `cmdline_add`; the initramfs takes it from there and clears it. Any other pick
+/// clears a `deploy_once` the record still holds.
 pub fn decide(cur: &InUse, choice: &Choice) -> Decision {
+    let mut d = decide_args(cur, choice);
+    if cur.rec.get("parent_cmdline") == "no" {
+        if let Some(w) = d.answer.cmdline_add.take() {
+            d.changes.push(("deploy_once", w.trim_start_matches("glassine.deploy.once=").into()));
+            return d;
+        }
+    }
+    if !cur.rec.get("deploy_once").is_empty() {
+        d.changes.push(("deploy_once", String::new()));
+    }
+    d
+}
+
+fn decide_args(cur: &InUse, choice: &Choice) -> Decision {
     let request = if cur.both_valid { cur.rec.get("request") } else { "" };
     let n = plan::unmarked(cur);
     let mut changes: Vec<(&'static str, String)> = Vec::new();

@@ -42,6 +42,9 @@ enum Fail {
     LinuxTrace,
     /// The interrupt never asserted.
     IrqStuck,
+    /// The device's launch (every boot since the application wait): one size-0 frame
+    /// 16 ms after launch-app, then nothing until the descriptor is asked for.
+    DeviceLaunch,
     /// pm660l LDO3 off (3.3 V set).
     RailOff,
     /// pm660l LDO3 off, set to 1.0 V (not the expected supply).
@@ -78,6 +81,8 @@ struct Fake {
     rpm_raw: bool,
     rpm_drop: bool,
     rpm_ids: u32,
+    /// Each write's register and time.
+    write_at: Vec<(u16, u64)>,
 }
 
 impl Fake {
@@ -104,6 +109,7 @@ impl Fake {
             rpm_raw: false,
             rpm_drop: false,
             rpm_ids: 0,
+            write_at: Vec::new(),
             rails: vec![((0, 3), (true, 1000)), ((1, 3), (fail != Fail::RailOff && fail != Fail::RailOdd, if fail == Fail::RailOdd { 1000 } else { 3008 })), ((0, 11), (true, 1800))],
         };
         if found_on {
@@ -212,12 +218,6 @@ impl Hw for Fake {
     fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), S> {
         self.rails.iter().find(|r| r.0 == (pmic, ldo)).map(|r| r.1).ok_or_else(|| "INVALID_PARAMETER".into())
     }
-    fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), S> {
-        self.ops.push(format!("rail-en{pmic}.{ldo}={}", on as u8));
-        let r = self.rails.iter_mut().find(|r| r.0 == (pmic, ldo)).ok_or("INVALID_PARAMETER")?;
-        r.1.0 = on;
-        Ok(())
-    }
     fn rpm_locate(&mut self) -> RpmFound {
         self.ops.push("rpm-locate".into());
         RpmFound { npa: Proto::Ok, svc: if self.rpm_svc { Proto::Ok } else { Proto::Absent }, raw: if self.rpm_raw { Proto::Ok } else { Proto::Absent } }
@@ -282,6 +282,7 @@ impl Hw for Fake {
         self.longest_call = self.longest_call.max(t);
         self.now += 1;
         self.ops.push(format!("wr{reg:04x}:{}", crate::hex(data)));
+        self.write_at.push((reg, self.now));
         if self.fail == Fail::Write {
             return Err("0x8002".into());
         }
@@ -313,6 +314,11 @@ impl Hw for Fake {
                 };
                 match self.fail {
                     Fail::EarlySentinel => self.due.push((self.now + 15, vec![0, 0])),
+                    Fail::DeviceLaunch => {
+                        self.due.push((self.now + 16, vec![0, 0]));
+                        self.launched = true;
+                        return Ok(());
+                    }
                     Fail::LinuxTrace => {}
                     _ => self.due.push((answer, vec![0x0b, 0, 0x30, 0, 0x01, 0, 0, 0, 0, 0, 0x17])),
                 }
@@ -566,7 +572,7 @@ fn reads_only_with_the_interrupt_asserted() {
 fn the_report_descriptor_from_the_hid_descriptor() {
     let mut f = Fake::new(Fail::None, false);
     f.open = true;
-    let mut up = Up::new(false);
+    let mut up = Up::new();
     up.opened = true;
     let d = desc(0x0100);
     let le = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
@@ -643,41 +649,13 @@ fn the_supplies_are_read_and_the_pins_released_as_inputs() {
     assert!(up.ok(), "{:?}", up.lines);
     assert_eq!(line(&up, "touch.rail.l3b"), "on 3008 mV");
     assert_eq!(line(&up, "touch.rail.l11a"), "on 1800 mV");
-    assert!(line(&up, "touch.rail.on").is_empty() && !f.ops.iter().any(|o| o.starts_with("rail-")));
+    // LDO3 on already: no RPM call at all.
+    assert_eq!(line(&up, "touch.rpm"), "skipped l3b on 3008 mV");
+    assert!(rpm_ops(&f).is_empty());
     // After the switches low: the three driven pins back to inputs.
     let n = f.ops.len();
     assert_eq!(&f.ops[n - 6..], ["out66=0", "out62=0", "out61=0", "in66", "in62", "in61"]);
     assert_eq!(line(&up, "touch.release"), "inputs: 66, 62, 61");
-}
-
-#[test]
-fn touch_rail_turns_on_what_is_off_and_off_again() {
-    let mut f = Fake::new(Fail::RailOff, false);
-    let up = bring_up_with(&mut f, false, true);
-    assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.l3b"), "off 3008 mV");
-    assert_eq!(line(&up, "touch.rail.on"), "l3b turned on on 3008 mV, l11a already on 1800 mV");
-    let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
-    // Only the enable: no level is ever set.
-    assert_eq!(f.ops.iter().filter(|o| o.starts_with("rail-")).collect::<Vec<_>>(), ["rail-en1.3=1", "rail-en1.3=0"]);
-    assert!(at("rail-en1.3=1") < at("out61=1"));
-    assert!(at("out61=0") < at("rail-en1.3=0") && at("rail-en1.3=0") < at("in66"));
-    assert_eq!(line(&up, "touch.rail.off"), "l3b off");
-    assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
-    // Not the expected supply: left alone.
-    let mut f = Fake::new(Fail::RailOdd, false);
-    let up = bring_up_with(&mut f, false, true);
-    assert_eq!(line(&up, "touch.rail.on"), "l3b refused 1000 mV, l11a already on 1800 mV");
-    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")) && line(&up, "touch.rail.off").is_empty());
-    // Found powered: no supply touched.
-    let mut f = Fake::new(Fail::RailOff, true);
-    let up = bring_up_with(&mut f, false, true);
-    assert_eq!(line(&up, "touch.rail.on"), "skipped found on");
-    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
-    // Without touch_rail: nothing written even with the supply off.
-    let mut f = Fake::new(Fail::RailOff, false);
-    bring_up(&mut f, false);
-    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
 }
 
 fn rpm_ops(f: &Fake) -> Vec<&str> {
@@ -687,80 +665,120 @@ fn rpm_ops(f: &Fake) -> Vec<&str> {
 #[test]
 fn touch_rpm_stages_up_to_kvp_send_no_message() {
     let mut f = Fake::new(Fail::RailOff, false);
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Locate));
+    let up = bring_up_rpm(&mut f, false, Some(RpmStage::Locate));
     assert_eq!(rpm_ops(&f), ["rpm-locate"]);
     assert_eq!(line(&up, "touch.rpm.found"), "npa=ok svc=ok raw=absent");
     assert!(line(&up, "touch.rpm.install").is_empty() && line(&up, "touch.rpm.uninstall").is_empty());
     let mut f = Fake::new(Fail::RailOff, false);
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Install));
+    let up = bring_up_rpm(&mut f, false, Some(RpmStage::Install));
     assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-install=0"]);
     assert_eq!(line(&up, "touch.rpm.install"), "ours ok");
     assert_eq!(line(&up, "touch.rpm.uninstall"), "ok");
     let mut f = Fake::new(Fail::RailOff, false);
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    let up = bring_up_rpm(&mut f, false, Some(RpmStage::Kvp));
     assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "rpm-install=0"]);
     assert_eq!(line(&up, "touch.rpm.kvp"), "ok");
-    // The bring-up itself goes on as without the key (LDO3 stays off).
+    // The bring-up itself goes on without a vote (LDO3 stays off).
     assert!(up.ok() && f.ops.iter().any(|o| o == "out61=1"), "{:?}", up.lines);
+    // A diagnostic stage runs with LDO3 on too.
+    let mut f = Fake::new(Fail::None, false);
+    bring_up_rpm(&mut f, false, Some(RpmStage::Locate));
+    assert_eq!(rpm_ops(&f), ["rpm-locate"]);
     // Found installed: used, not uninstalled.
     let mut f = Fake::new(Fail::RailOff, false);
     f.rpm_raw = true;
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    let up = bring_up_rpm(&mut f, false, Some(RpmStage::Kvp));
     assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-kvp"]);
     assert_eq!(line(&up, "touch.rpm.install"), "found installed");
     // No services: stopped, the bring-up not failed below vote.
     let mut f = Fake::new(Fail::RailOff, false);
     f.rpm_svc = false;
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    let up = bring_up_rpm(&mut f, false, Some(RpmStage::Kvp));
     assert_eq!(rpm_ops(&f), ["rpm-locate"]);
     assert_eq!(line(&up, "touch.rpm.stopped"), "svc absent");
     assert!(up.ok());
+    // touch_rpm=off: no RPM call, the bring-up as with LDO3 as found.
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_rpm(&mut f, false, None);
+    assert!(rpm_ops(&f).is_empty() && up.ok());
+    assert_eq!(line(&up, "touch.rpm"), "off");
 }
 
 #[test]
-fn touch_rpm_vote_switches_ldo3_on_and_takes_the_vote_back() {
+fn the_rpm_vote_is_the_power_path_when_ldo3_reads_off() {
     let mut f = Fake::new(Fail::RailOff, false);
-    let up = bring_up_rpm(&mut f, false, true, Some(RpmStage::Vote));
+    let up = bring_up(&mut f, false);
     assert!(up.ok(), "{:?}", up.lines);
-    assert_eq!(line(&up, "touch.rail.on"), "ignored touch_rpm");
     assert_eq!(line(&up, "touch.rpm.vote"), "id=1 l3b on 3008 mV");
     assert_eq!(line(&up, "touch.rpm.off"), "id=2 l3b off 3008 mV");
     assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "wdog", "rpm-vote=1", "wdog", "rpm-vote=0", "rpm-install=0"]);
     let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
-    // The PMIC protocol never written; the vote before the switches, taken back after.
-    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
+    // The vote before the switches, taken back after.
     assert!(at("rpm-vote=1") < at("out61=1"));
     assert!(at("out61=0") < at("rpm-vote=0") && at("rpm-install=0") < at("in66"));
     assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
+    // Kept for the tap source: the vote stands until the power-down.
+    let mut f = Fake::new(Fail::RailOff, false);
+    let mut up = bring_up(&mut f, true);
+    assert!(up.ok() && up.rpm_voted);
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "wdog", "rpm-vote=1"]);
+    power_down(&mut f, &mut up);
+    assert_eq!(rpm_ops(&f)[5..], ["wdog", "rpm-vote=0", "rpm-install=0"]);
+    // Found powered with LDO3 off: the vote all the same (LDO3 feeds 61).
+    let mut f = Fake::new(Fail::RailOff, true);
+    let up = bring_up(&mut f, false);
+    assert_eq!(line(&up, "touch.rpm.vote"), "id=1 l3b on 3008 mV");
 }
 
 #[test]
-fn touch_rpm_vote_goes_on_only_with_ldo3_read_back_on() {
+fn the_rpm_vote_goes_on_only_with_ldo3_read_back_on() {
     // The RPM acknowledges but nothing switches: no power switch driven, the vote taken
     // back, the protocol uninstalled.
     let mut f = Fake::new(Fail::RailOff, false);
     f.rpm_drop = true;
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    let up = bring_up(&mut f, false);
     assert_eq!(up.result, Err("rpm: l3b not on 3008 mV".to_string()), "{:?}", up.lines);
     assert!(!f.ops.iter().any(|o| o.starts_with("out")), "{:?}", f.ops);
     assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "wdog", "rpm-vote=1", "wdog", "rpm-vote=0", "rpm-install=0"]);
     // On, but not the expected supply: the same.
     let mut f = Fake::new(Fail::RailOdd, false);
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    let up = bring_up(&mut f, false);
     assert_eq!(up.result, Err("rpm: l3b out of range 1000 mV".to_string()));
     assert!(!f.ops.iter().any(|o| o.starts_with("out")));
-    // Already on: no vote, nothing to take back.
-    let mut f = Fake::new(Fail::None, false);
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
-    assert!(up.ok());
-    assert_eq!(line(&up, "touch.rpm.vote"), "skipped already on 3008 mV");
-    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "rpm-install=0"]);
-    // No services: the vote stage fails before any pin.
+    // No services: the vote fails before any pin.
     let mut f = Fake::new(Fail::RailOff, false);
     f.rpm_svc = false;
-    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    let up = bring_up(&mut f, false);
     assert_eq!(up.result, Err("rpm: svc absent".to_string()));
     assert!(!f.ops.iter().any(|o| o.starts_with("out")));
+    // LDO3 not readable (no regulator protocol): no RPM call, the bring-up goes on.
+    let mut f = Fake::new(Fail::None, false);
+    f.rails.retain(|r| r.0 != (1, 3));
+    let up = bring_up(&mut f, false);
+    assert!(up.ok() && rpm_ops(&f).is_empty());
+    assert_eq!(line(&up, "touch.rpm"), "skipped l3b unreadable");
+}
+
+#[test]
+fn without_the_app_sentinel_get_sysinfo_follows_the_descriptor_at_once() {
+    // The device: the only frame after launch-app comes early (dropped), then the
+    // interrupt stays high until the application wait ends; that wait was the pause.
+    let mut f = Fake::new(Fail::DeviceLaunch, false);
+    let up = bring_up(&mut f, false);
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.launch"), "no sentinel dropped=1");
+    let w: Vec<(u16, u64)> = f.write_at.iter().copied().filter(|w| w.0 != 0x0004 || f.write_at.iter().position(|x| x == w) != Some(0)).collect();
+    let hid = w.iter().find(|w| w.0 == REG_HID_DESC).unwrap().1;
+    let si = w.iter().rev().find(|w| w.0 == REG_OUTPUT).unwrap().1;
+    assert!(si > hid && si - hid < SYSINFO_PAUSE_MS, "{w:?}");
+    // With the application's sentinel, the pause still counts from it.
+    let mut f = Fake::new(Fail::None, false);
+    let up = bring_up(&mut f, false);
+    assert!(line(&up, "touch.launch").starts_with("app sentinel"));
+    let w = &f.write_at;
+    let hid = w.iter().find(|w| w.0 == REG_HID_DESC).unwrap().1;
+    let si = w.iter().rev().find(|w| w.0 == REG_OUTPUT).unwrap().1;
+    assert!(si - hid >= SYSINFO_PAUSE_MS - 20, "{w:?}");
 }
 
 #[test]

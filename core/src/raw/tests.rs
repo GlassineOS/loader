@@ -250,6 +250,21 @@ fn an_ordinary_start_counts_and_answers_the_baseline() {
 }
 
 #[test]
+fn a_deploy_once_left_by_an_earlier_pick_is_cleared_by_a_start_without_the_menu() {
+    // A pick's write set it; that start never reached the initramfs (a reset, a power
+    // cut): this start's count write clears it, the answer is the ordinary one.
+    let mut d = disk(both(&[("deploy_once", "20261116-120000"), ("parent_cmdline", "no")]));
+    let (a, after) = answer(&mut d);
+    assert_eq!((a.boot, a.why, a.cmdline_add), (Boot::Baseline, "default", None));
+    let after = after.unwrap();
+    assert_eq!((after.rec.get("deploy_once"), after.rec.get("unmarked")), ("", "1"));
+    // a record without one gets no deploy_once line
+    let mut d = disk(both(&[]));
+    let (_, after) = answer(&mut d);
+    assert!(!after.unwrap().rec.has("deploy_once"));
+}
+
+#[test]
 fn a_named_default_set_is_answered_by_id() {
     let rec = "ab".repeat(32);
     let mut d = disk(both(&[("default", SET1), ("default_rec", &rec)]));
