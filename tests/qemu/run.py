@@ -2028,7 +2028,14 @@ def handback_epd_fw_override_removed_before_drawn():
 # ---- the start menu (spec 004) -------------------------------------------------------
 
 POINTER_RANGE = (4095, 3071)  # the stand-in's max_x, max_y (min 0)
-ROW_H = 144  # loader/src/epdmenu.rs
+# The menu's cards (loader/c/shim.c, the boards in GlassineOS/ui designs/startmenu): the
+# first at y 400, 176 high, 200 apart.
+CARDS_Y, CARD_H, CARD_PITCH = 400, 176, 200
+
+
+def card_v(i):
+    """The portrait y of the middle of card i."""
+    return CARDS_Y + i * CARD_PITCH + CARD_H // 2
 
 
 def tap_xy(u, v):
@@ -2044,7 +2051,7 @@ def tap_xy(u, v):
 def row_tap(i, after):
     """A tap in the middle of menu row i (0 the first entry), once the loader has made
     `after` refreshes."""
-    x, y = tap_xy(PORTRAIT[0] // 2, ROW_H * (i + 2) + ROW_H // 2)
+    x, y = tap_xy(PORTRAIT[0] // 2, card_v(i))
     return f"{after}:{x}:{y}"
 
 
@@ -2161,10 +2168,10 @@ def menu_on_request_each_entry_by_tap():
         assert "MENU_INPUT firmware-pointer" in log and "TOUCH_SKIPPED the console splitter's pointer" in log, name
         rects = menu_rects(log)
         assert rects[0] == FULL and rects[-1] == FULL, (name, rects)
-        # A tap that moves the focus refreshes only the rows it changed (none for the
-        # entry already focused); a new list refreshes the whole panel.
+        # A tap refreshes only its card (the default's too); a new list refreshes the
+        # whole panel.
         partial = [r for r in rects[1:-1] if r != FULL]
-        assert all(r[2] < PANEL[0] for r in partial) and (bool(partial) == (n != "glassineos")), (name, rects)
+        assert partial and all(r[2] < PANEL[0] // 4 for r in partial), (name, rects)
         seq, r, _ = d.record()
         assert seq == 3, (name, seq, "the menu write and the pick's write")
         assert (r["request"], r["unmarked"], r["drew"], r["started"], r["started_why"]) == ("", unmarked, "", started, why), (name, r)
@@ -2216,7 +2223,7 @@ TOUCH_RES = (1872, 1404)  # the touch stand-in's system information
 def touch_tap(i, after):
     """A tap of the touch stand-in in the middle of menu row i: the inverse of the loader's
     mapping (src/touch.rs ORIENT: native y flipped) at the controller's resolution."""
-    u, v = PORTRAIT[0] // 2, ROW_H * (i + 2) + ROW_H // 2
+    u, v = PORTRAIT[0] // 2, card_v(i)
     nw, nh = PANEL
     nx, ny = nw - 1 - v, nh - 1 - u
     up = lambda n, span, out: min((n * span + out - 2) // (out - 1), span)
@@ -2259,6 +2266,23 @@ def menu_lists_every_deployment_of_the_record():
                            "3 Previous kernel", "4 Recovery", "0 Candidate: f00dcafe 2026-11-18",
                            "1 Failed: f00dcafe 2026-11-16", "2 Kept: e4ffb6ec 2026-11-01", "3 Back"], entries
     assert d.record()[1].get("deploy_once", "") == "", d.record()
+
+
+@case("x86_64", "aarch64")
+def menu_more_deployments_than_fit_keeps_back():
+    """004 FR-008: with more deployments than six cards, More shows the first five and
+    Back; Back is tapped where it is drawn and returns to the first list."""
+    keys = dict(MENU_REC)
+    keys.update(DEPLOY_LIST)
+    extra = ["20261028-080000 kept e4ffb6ec 2026-10-28", "20261020-080000 kept d31a7700 2026-10-20",
+             "20261012-080000 kept d31a7700 2026-10-12", "20261002-080000 kept c0ffee11 2026-10-02"]
+    keys.update(deploys=str(4 + len(extra)), **{f"deploy{5 + i}": v for i, v in enumerate(extra)})
+    d = menu_disk("menu-many", [row_tap(2, 1), row_tap(5, 3), row_tap(4, 5)], **keys)
+    log, boot, ans = menu_run("menu-many", d)
+    frames(d, "menu-many")
+    assert "MENU_SHOWN Deployments (8 entries)" in log and "MENU_CUT 6 of 8 entries shown" in log, log[-2000:]
+    assert "MENU_PICK more 7 Back" in log and ans.startswith("format=1 boot=recovery"), (ans, log[-2000:])
+    golden("menu-many", crcs(log))
 
 
 @case("x86_64", "aarch64")
@@ -2338,6 +2362,11 @@ def touch_on_without_the_protocols_or_with_a_failed_bring_up():
     assert "TOUCH_SKIPPED gpio none" in log and "MENU_NO_INPUT why=request" in log, log[-800:]
     d, log, boot, ans = touch_menu("touch-menu-fail", [touch_tap(4, 1)], mode="nodesc")
     assert "TOUCH bring-up failed: no taps" in log and "MENU_TIMEOUT" in log, log[-1500:]
+    # 004 FR-008: the cards that can't be picked drawn as such, in one refresh after
+    # the menu's first; then the default's card at the timeout, then the splash.
+    assert "MENU_NO_TOUCH" in log and len(menu_rects(log)) in (3, 4), menu_rects(log)
+    frames(d, "touch-menu-fail")
+    golden("touch-menu-fail", crcs(log))
     assert ans.startswith(f"format=1 boot=set:{SET_A} "), ans
     c = faketouch_calls(log)
     assert c["powered"] == "0" and c["open_now"] == "0", c
@@ -2369,6 +2398,8 @@ def menu_after_an_unmarked_start_only():
     assert log.index("SPLASH_DRAWN") < log.rindex("WRITE slot="), "drew cleared before the draw"
     log, boot, ans = menu_run("menu-unmarked-2", d)
     assert "MENU_OPEN why=unmarked" in log, log[-600:]
+    frames(d, "menu-unmarked-2")
+    golden("menu-unmarked-2", crcs(log))
     assert ans.startswith("format=1 boot=baseline why=default"), ans
     seq, r, _ = d.record()
     assert (seq, r["unmarked"], r["drew"]) == (5, "2", ""), (seq, r)
@@ -2398,7 +2429,9 @@ def menu_timeout_takes_the_default_under_the_watchdog():
     ans = re.findall(r"HANDBACK_ANSWER ([^\r\n]*)", log)[-1]
     keys = re.findall(r"KEY scan=0x([0-9a-f]{4}) char=0x([0-9a-f]{4})", log)
     assert keys == [("0002", "0000"), ("0002", "0000"), ("0000", "000d")], keys
-    assert "MENU_PICK" not in log and len(menu_rects(log)) == 2, menu_rects(log)
+    # The menu, the default's card turned black when the minute is up, the splash.
+    assert "MENU_PICK" not in log and len(menu_rects(log)) == 3, menu_rects(log)
+    assert menu_rects(log)[1] != FULL, menu_rects(log)
     assert "MENU_TIMEOUT 60 s: GlassineOS" in log, log[-600:]
     assert ans.startswith(f"format=1 boot=set:{SET_A}") and boot == "baseline", ans
     t0 = int(re.search(r"\[loader +(\d+)\] MENU_OPEN", log).group(1))

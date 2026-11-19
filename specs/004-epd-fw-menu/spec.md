@@ -45,8 +45,9 @@ in 003.
 
 ### Scenario 3 – A tap picks an entry (Priority: P1)
 
-The person taps an entry. The tapped row turns black (one refresh of the rows that
-changed; none when it was already the focused one), the splash is drawn (one full refresh), the pick's write is made and the answer given:
+The person taps an entry. The tapped entry turns black (one refresh of that entry, the
+default's too), the splash is drawn (one full refresh), the pick's write is made and the
+answer given:
 
 | Entry | Answer | The pick's write |
 |---|---|---|
@@ -80,7 +81,8 @@ recovery case.
 ### Scenario 4 – No input (Priority: P1)
 
 No tap for 60 seconds (keys count for nothing): the loader takes the GlassineOS pick, logs
-`MENU_TIMEOUT`, and answers as Scenario 3 does. Throughout, the firmware's watchdog
+`MENU_TIMEOUT`, turns the default's entry black as a tap would (one refresh of that entry;
+none in the second list, which has no default), and answers as Scenario 3 does. Throughout, the firmware's watchdog
 never fires: the loader re-arms it for 30 seconds before each refresh and at least every
 10 seconds while it waits, and leaves it armed for 30 seconds when it answers.
 
@@ -163,11 +165,20 @@ writes `display_failed=1`.
 - **FR-007**: A start without the menu that draws (003) also writes once more after its
   refresh returned, clearing `drew`; a failure of that write changes nothing but is
   logged. So `drew=1` at entry means only that a draw never returned.
-- **FR-008**: The menu is drawn in the portrait mode of 003 (`H`×`W`), white with black
-  text, rows at least 120 pixels high across the panel, the text at least 40 pixels; no
-  animation, no pressed-state style, no scrolling effect. The focused or tapped row is
-  shown inverted (white text on black). The first frame is one refresh of the whole
-  panel.
+- **FR-008**: The menu is drawn in the portrait mode of 003 (`H`×`W`), as the start
+  menu's boards give it (GlassineOS/ui `designs/startmenu`): black and white with at most
+  two flat greys, no animation, no pressed-state style, no scrolling effect, no
+  countdown. A title and one line saying why the menu opened (asked for, or the last
+  start didn't finish), in plain words. Each entry is a card at least 120 pixels high
+  across the panel with a mark of its own, its name and one plain line about what it
+  does, the text at least 40 pixels. The default (the entry the timeout takes) is told
+  apart by its shape, not only by a grey. A tapped entry, and the default when the
+  timeout takes it, is shown inverted (white on black). A list longer than the panel
+  holds shows its first entries and "Back", and says that the others are kept. When
+  the tap source fails while the menu is open (its bring-up or a read), every entry but
+  the default is drawn as one that can't be picked, and the default's line and the
+  foot say that the menu waits for the default. The first frame is one refresh of the
+  whole panel.
 - **FR-009**: Refreshes. After the first, a refresh waits until the picture has stayed
   unchanged for 100 ms and no touch is down, then covers the bounding box of the area
   redrawn since the last refresh, mapped to the native rectangle (the portrait rectangle

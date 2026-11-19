@@ -71,7 +71,8 @@ levels) to the partition. The QEMU cases run it under a stand-in parent
   slot write.
 - `loader/`: the EFI program. `src/arch/` holds what depends on the processor (clock,
   serial log); `src/display/` the displays, with the firmware's graphics output as one
-  backend; `c/` the LVGL shim and configuration.
+  backend; `c/` the LVGL shim and configuration, the start menu's fonts (`c/fonts/`,
+  written by `tools/menu-fonts.sh`) and its icons (`c/menu_art.c`, by `tools/menu-art.py`).
 - `tools/gspl-encode/`: the host tool every writer of a splash shares (the running
   system, the release images, the tests): a PNM picture or raw framebuffer pixels to an
   image of format 2, in the layout the target's display takes (`--layout grey8` for a
@@ -136,7 +137,15 @@ GPL-2.0-or-later (see `LICENSE`).
 - LVGL (MIT) is fetched, not committed. Compiled in: LVGL core, its TLSF allocator
   (BSD-3-Clause) and the built-in font `lv_font_montserrat_20`, converted by LVGL from
   Montserrat and Font Awesome 5 symbols (both SIL OFL 1.1 upstream; a release carries
-  the OFL notices in `NOTICES-<arch>.txt`).
+  the OFL notices in `NOTICES-<arch>.txt`), and the start menu's two fonts
+  `glassine_sans_semibold_56` and `glassine_sans_regular_40` (`loader/c/fonts/`): IBM Plex
+  Sans 1.1.0 (SIL OFL 1.1, Reserved Font Name "Plex") converted to LVGL bitmaps of the
+  menu's glyphs by `tools/menu-fonts.sh` (lv_font_conv 1.5.3); as a Modified Version
+  they don't carry the name Plex. Their source and checksums are in
+  `loader/c/fonts/SOURCES`, the licence in `loader/c/fonts/OFL.txt`.
+- The start menu's icons and the GlassineOS mark (`loader/c/menu_art.c`) are drawn by
+  `tools/menu-art.py` from the shapes of the boards in GlassineOS/ui
+  `designs/startmenu` (GPL-2.0-or-later, as the loader).
 - Crates: `uefi`, `uefi-raw`, `sha2` (MIT OR Apache-2.0), `lz4_flex` (MIT, the splash's
   LZ4 decoder).
 - `tests/golden/pc-boot/` is copied from GlassineOS/installer (GPL-2.0-or-later).

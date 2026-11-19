@@ -1,0 +1,8 @@
+IBM Plex Sans 1.1.0: https://registry.npmjs.org/@ibm/plex-sans/-/plex-sans-1.1.0.tgz
+  tarball sha256 c3818979c2a2c82927ea3e7c485e389a18de0b7462887dd4f7acc9a525568962
+  fff45f420f0d026b4a39f99b3bfc47dfc06561c598c8db825cfce5fd706bda7a  IBMPlexSans-SemiBold.woff
+  b731cf56514a4bd711ab2f9acf641f9311707f4386772eb306d25c2b29b73b1a  IBMPlexSans-Regular.woff
+converter: lv_font_conv@1.5.3 (npm), node:24-alpine
+glyphs: 0x20-0x7E,0xB7,0x2013,0x2019,0x2026; bpp 4, uncompressed, kerning as converted
+glassine_sans_semibold_56: IBMPlexSans-SemiBold.woff at 56 px
+glassine_sans_regular_40: IBMPlexSans-Regular.woff at 40 px
