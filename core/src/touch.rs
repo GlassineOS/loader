@@ -108,17 +108,13 @@ pub trait Hw {
     /// back in the same transfer.
     fn read_reg(&mut self, reg: u16, buf: &mut [u8], timeout_ms: u32) -> Result<(), String>;
     /// A regulator of PMIC `pmic` (LDO `ldo`, numbered from 1): whether it is enabled
-    /// and its level in mV (read only). Without the firmware's regulator protocol, an
-    /// error.
+    /// and its level in mV (read only: the loader never writes a regulator through the
+    /// firmware's PMIC protocol, both its writes ended the device's firmware). Without
+    /// that protocol, an error.
     fn rail_get(&mut self, _pmic: u32, _ldo: u32) -> Result<(bool, u32), String> {
         Err("none".into())
     }
-    /// Enables or disables it.
-    fn rail_enable(&mut self, _pmic: u32, _ldo: u32, _on: bool) -> Result<(), String> {
-        Err("none".into())
-    }
-    /// `touch_rpm` (stage `locate`): the firmware's three RPM protocols looked up and
-    /// checked, read only.
+    /// The firmware's three RPM protocols looked up and checked, read only.
     fn rpm_locate(&mut self) -> RpmFound {
         RpmFound::default()
     }
@@ -141,9 +137,10 @@ pub trait Hw {
     fn watchdog(&mut self) {}
 }
 
-/// `touch_rpm=<stage>`: how far the driver goes with the firmware's RPM request
-/// protocols (each stage includes the ones before it). Opt-in; without the key none of
-/// them is looked up.
+/// How far the driver goes with the firmware's RPM request protocols (each stage
+/// includes the ones before it). [`RpmStage::Vote`] is the power path (the default);
+/// the others are the diagnostic stages of `touch_rpm=<stage>`, which stop before any
+/// message and run whatever LDO3 reads.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum RpmStage {
     /// The three protocols looked up and checked (no call).
@@ -153,7 +150,7 @@ pub enum RpmStage {
     /// A KVP set created, filled and destroyed (no message).
     Kvp,
     /// pm660l LDO3 switched on by an RPM vote (`swen`=1, no level) before the power
-    /// switches, and the vote taken back (`swen`=0) at the power-down.
+    /// switches when it reads off, and the vote taken back (`swen`=0) at the power-down.
     Vote,
 }
 
@@ -206,11 +203,9 @@ pub const RPM_KEY_SWEN: u32 = 0x6e65_7773;
 /// After the vote is acknowledged, before LDO3 is read back (Linux: a 250 µs ramp).
 pub const RPM_SETTLE_MS: u64 = 5;
 
-/// A supply behind the controller's power switches (`touch_rail=on` enables it when
-/// off): its name, PMIC index and LDO, and the range its set level must already be in
-/// (the controller's supply range). The loader never sets a level: the firmware's
-/// set-level call hung on the device (900E), so only the enable call is made, and only
-/// on a level already in range.
+/// A supply behind the controller's power switches, read before them: its name, PMIC
+/// index and LDO, and the controller's supply range (LDO3 must read back in it after
+/// the RPM vote).
 pub struct Rail {
     pub name: &'static str,
     pub pmic: u32,
@@ -225,8 +220,6 @@ pub const RAILS: [Rail; 2] = [
     Rail { name: "l3b", pmic: 1, ldo: 3, expect: (2700, 3600) },
     Rail { name: "l11a", pmic: 0, ldo: 11, expect: (1650, 1950) },
 ];
-/// After turning a supply on, before the power switches.
-pub const RAIL_SETTLE_MS: u64 = 5;
 
 /// The CRC the controller's bootloader commands carry (CRC-16/CCITT, MSB first, as
 /// Linux's `crc_itu_t`).
@@ -452,11 +445,8 @@ pub struct Up {
     pub lines: Vec<(&'static str, String)>,
     /// The interrupt was seen asserted (from then on no fallback reads).
     pub irq_seen: bool,
-    /// `touch_rail=on`: the supplies turned on when off.
-    pub rail: bool,
-    /// The supplies the loader turned on (turned off again at the power-down).
-    pub rails_on: Vec<(u32, u32)>,
-    /// `touch_rpm`: the stage asked for.
+    /// The RPM stage asked for: [`RpmStage::Vote`] by default, `None` with
+    /// `touch_rpm=off` or after a menu that never closed.
     pub rpm: Option<RpmStage>,
     /// The loader installed the raw RPM protocol (uninstalled at the power-down).
     pub rpm_installed: bool,
@@ -465,7 +455,7 @@ pub struct Up {
 }
 
 impl Up {
-    pub fn new(rail: bool) -> Up {
+    pub fn new() -> Up {
         Up {
             found: Vec::new(),
             found_on: false,
@@ -475,8 +465,6 @@ impl Up {
             result: Ok(()),
             lines: Vec::new(),
             irq_seen: false,
-            rail,
-            rails_on: Vec::new(),
             rpm: None,
             rpm_installed: false,
             rpm_voted: false,
@@ -487,26 +475,20 @@ impl Up {
     }
 }
 
-/// The bring-up (FR-005 to FR-008). With `keep`, the bus stays open and the controller
-/// powered for the tap source; else (or after a failure) both are released by
-/// [`power_down`] before this returns.
+/// The bring-up (FR-005 to FR-008) with the RPM vote as the power path. With `keep`,
+/// the bus stays open and the controller powered for the tap source; else (or after a
+/// failure) both are released by [`power_down`] before this returns.
 pub fn bring_up<H: Hw>(hw: &mut H, keep: bool) -> Up {
-    bring_up_with(hw, keep, false)
+    bring_up_rpm(hw, keep, Some(RpmStage::Vote))
 }
 
-/// [`bring_up`]; with `rail` (`touch_rail=on`) the supplies ([`RAILS`]) are turned on
-/// first when off.
-pub fn bring_up_with<H: Hw>(hw: &mut H, keep: bool, rail: bool) -> Up {
-    bring_up_rpm(hw, keep, rail, None)
-}
-
-/// [`bring_up_with`]; with `rpm` (`touch_rpm`) the RPM stages run after the supplies
-/// are read, before the power switches, and `rail` is not used (`touch.rail.on`
-/// says so).
-pub fn bring_up_rpm<H: Hw>(hw: &mut H, keep: bool, rail: bool, rpm: Option<RpmStage>) -> Up {
+/// [`bring_up`] with the RPM stage `rpm` (FR-018): with [`RpmStage::Vote`], LDO3 voted
+/// on when it reads off, after the supplies are read and before the power switches;
+/// a diagnostic stage runs and stops before any message; `None`, no RPM call.
+pub fn bring_up_rpm<H: Hw>(hw: &mut H, keep: bool, rpm: Option<RpmStage>) -> Up {
     let start = hw.now_ms();
     let deadline = start + DEADLINE_MS;
-    let mut up = Up::new(rail);
+    let mut up = Up::new();
     up.rpm = rpm;
     let r = steps(hw, &mut up, deadline);
     up.result = r;
@@ -535,15 +517,15 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
         return Err("found: a pin can't be read".into());
     }
     up.found_on = up.found[0] == Ok(true) && up.found[1] == Ok(true);
-    rails_read(hw, up);
-    if let Some(stage) = up.rpm {
-        if up.rail {
-            up.lines.push(("touch.rail.on", "ignored touch_rpm".into()));
-        }
-        rpm_steps(hw, up, stage)?;
-    } else if up.rail {
-        let v = if up.found_on { "skipped found on".into() } else { rails_on(hw, up) };
-        up.lines.push(("touch.rail.on", v));
+    let l3b = rails_read(hw, up);
+    match up.rpm {
+        None => up.lines.push(("touch.rpm", "off".into())),
+        Some(RpmStage::Vote) => match l3b {
+            Some((false, _)) => rpm_steps(hw, up, RpmStage::Vote)?,
+            Some((true, mv)) => up.lines.push(("touch.rpm", format!("skipped l3b on {mv} mV"))),
+            None => up.lines.push(("touch.rpm", "skipped l3b unreadable".into())),
+        },
+        Some(stage) => rpm_steps(hw, up, stage)?,
     }
     if up.found_on {
         up.lines.push(("touch.power", "found on: left as found".into()));
@@ -569,9 +551,11 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     // The reset sentinel (length 0); anything before it is dropped.
     let t = hw.now_ms();
     wait(hw, up, "touch.wait.reset", RESET_WAIT_MS, deadline, t, |f, _| (f == Frame::Sentinel).then_some(()));
-    let l = launch(hw, up, deadline, "touch.wait.app");
+    let (l, sentinel) = launch(hw, up, deadline, "touch.wait.app");
     up.lines.push(("touch.launch", l));
-    let settled = hw.now_ms();
+    // The pause before GET_SYSINFO counts from the application's sentinel; when none
+    // came, the wait for it was the pause (the controller quiet for all of it).
+    let settled = if sentinel { hw.now_ms() } else { 0 };
     // The HID descriptor; its packet id tells the mode. Still in the bootloader:
     // launch-app again, then the descriptor again.
     let mut desc = hid_desc(hw, up, deadline)?;
@@ -579,7 +563,7 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
         Some(PACKET_APP) => set(up, "touch.mode", "app".into()),
         Some(PACKET_BL) => {
             set(up, "touch.mode", "bl".into());
-            let l = launch(hw, up, deadline, "touch.wait.app.bl");
+            let (l, _) = launch(hw, up, deadline, "touch.wait.app.bl");
             up.lines.push(("touch.launch.bl", l));
             desc = hid_desc(hw, up, deadline)?;
             let m = match desc.get(2).copied() {
@@ -652,9 +636,9 @@ fn set(up: &mut Up, key: &'static str, v: String) {
 /// least [`APP_EARLY_MS`] after the write (frames before that, and any other frame, are
 /// read and dropped), then the frames still waiting drained. Not fatal: without a
 /// sentinel the bring-up goes on (a controller already in its application).
-fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, key: &'static str) -> String {
+fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, key: &'static str) -> (String, bool) {
     if let Err(e) = write_retry(hw, REG_OUTPUT, &launch_app_cmd(), deadline) {
-        return format!("write failed {e}");
+        return (format!("write failed {e}"), false);
     }
     let start = hw.now_ms();
     let max = if up.irq_seen { APP_WAIT_MS } else { APP_WAIT_NO_IRQ_MS };
@@ -671,9 +655,9 @@ fn launch<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64, key: &'static str) -> S
     match got {
         Some(at) => {
             let n = drain(hw, deadline);
-            format!("app sentinel {at} ms drained={n}{dropped}")
+            (format!("app sentinel {at} ms drained={n}{dropped}"), true)
         }
-        None => format!("no sentinel{dropped}"),
+        None => (format!("no sentinel{dropped}"), false),
     }
 }
 
@@ -723,53 +707,27 @@ fn hid_desc<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<Vec<u8>, St
 }
 
 /// The supplies' state, read only (`touch.rail.<name>`: `on|off <mV> mV`, or
-/// `error <why>`).
-fn rails_read<H: Hw>(hw: &mut H, up: &mut Up) {
+/// `error <why>`). Gives LDO3's, when it could be read.
+fn rails_read<H: Hw>(hw: &mut H, up: &mut Up) -> Option<(bool, u32)> {
+    let mut l3b = None;
     for r in &RAILS {
         let v = match hw.rail_get(r.pmic, r.ldo) {
-            Ok((on, mv)) => format!("{} {mv} mV", if on { "on" } else { "off" }),
+            Ok((on, mv)) => {
+                if r.ldo == 3 {
+                    l3b = Some((on, mv));
+                }
+                format!("{} {mv} mV", if on { "on" } else { "off" })
+            }
             Err(e) => format!("error {e}"),
         };
         up.lines.push((if r.ldo == 3 { "touch.rail.l3b" } else { "touch.rail.l11a" }, v));
     }
+    l3b
 }
 
-fn rail_name(pmic: u32, ldo: u32) -> &'static str {
-    RAILS.iter().find(|r| (r.pmic, r.ldo) == (pmic, ldo)).map_or("other", |r| r.name)
-}
-
-/// `touch_rail=on`: each supply in [`RAILS`] that is off and whose set level is already
-/// in its range is enabled, nothing else (recorded for the power-down). One already
-/// on, or not readable, or out of range is left alone. Never fatal.
-fn rails_on<H: Hw>(hw: &mut H, up: &mut Up) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for r in &RAILS {
-        let v = match hw.rail_get(r.pmic, r.ldo) {
-            Err(e) => format!("{} error {e}", r.name),
-            Ok((true, mv)) => format!("{} already on {mv} mV", r.name),
-            Ok((false, mv)) if mv < r.expect.0 || mv > r.expect.1 => format!("{} refused {mv} mV", r.name),
-            Ok((false, _)) => match hw.rail_enable(r.pmic, r.ldo, true) {
-                Err(e) => format!("{} failed {e}", r.name),
-                Ok(()) => {
-                    up.rails_on.push((r.pmic, r.ldo));
-                    match hw.rail_get(r.pmic, r.ldo) {
-                        Ok((on, mv)) => format!("{} turned on {} {mv} mV", r.name, if on { "on" } else { "off" }),
-                        Err(e) => format!("{} turned on, read error {e}", r.name),
-                    }
-                }
-            },
-        };
-        out.push(v);
-    }
-    if !up.rails_on.is_empty() {
-        hw.stall_ms(RAIL_SETTLE_MS);
-    }
-    out.join(", ")
-}
-
-/// The `touch_rpm` stages (each logged in `touch.rpm.*`). Up to `kvp` nothing fails
-/// the bring-up; `vote` goes on to the power switches only with LDO3 read back on and
-/// in its range.
+/// The RPM stages (each logged in `touch.rpm.*`). Up to `kvp` nothing fails the
+/// bring-up; `vote` (run only with LDO3 read off) goes on to the power switches only
+/// with LDO3 read back on and in its range.
 fn rpm_steps<H: Hw>(hw: &mut H, up: &mut Up, stage: RpmStage) -> Result<(), String> {
     let vote = stage == RpmStage::Vote;
     let stop = |up: &mut Up, why: String| -> Result<(), String> {
@@ -812,14 +770,6 @@ fn rpm_steps<H: Hw>(hw: &mut H, up: &mut Up, stage: RpmStage) -> Result<(), Stri
         return Ok(());
     }
     let l3b = &RAILS[0];
-    match hw.rail_get(l3b.pmic, l3b.ldo) {
-        Ok((true, mv)) => {
-            up.lines.push(("touch.rpm.vote", format!("skipped already on {mv} mV")));
-            return Ok(());
-        }
-        Ok((false, _)) => {}
-        Err(e) => return stop(up, format!("l3b read {e}")),
-    }
     hw.watchdog();
     let id = match hw.rpm_vote(1) {
         Ok(id) => id,
@@ -875,10 +825,10 @@ fn rpm_release<H: Hw>(hw: &mut H, up: &mut Up) {
 }
 
 /// Releases what the bring-up took (FR-008): the bus closed; the controller powered
-/// down when the loader powered it (reset low, 62 low, 61 low), then the supplies the
-/// loader turned on turned off, then the three pins it drove configured as inputs (the
-/// firmware's protocol can't read a pin's configuration to restore it); found on, the
-/// power left and the reset high.
+/// down when the loader powered it (reset low, 62 low, 61 low), then the RPM vote taken
+/// back, then the three pins it drove configured as inputs (the firmware's protocol
+/// can't read a pin's configuration to restore it); found on, the power left and the
+/// reset high.
 pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
     if up.opened {
         hw.close();
@@ -893,16 +843,6 @@ pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
         }
         up.powered = false;
         up.lines.push(("touch.down", if errs.is_empty() { "off: 66, 62, 61".into() } else { format!("errors {}", errs.join(", ")) }));
-        if !up.rails_on.is_empty() {
-            let mut v: Vec<String> = Vec::new();
-            for (pmic, ldo) in core::mem::take(&mut up.rails_on).into_iter().rev() {
-                v.push(match hw.rail_enable(pmic, ldo, false) {
-                    Ok(()) => format!("{} off", rail_name(pmic, ldo)),
-                    Err(e) => format!("{} error {e}", rail_name(pmic, ldo)),
-                });
-            }
-            up.lines.push(("touch.rail.off", v.join(", ")));
-        }
         rpm_release(hw, up);
         let mut v: Vec<String> = Vec::new();
         for p in [PIN_RESET, PIN_VDDIO, PIN_VDD] {

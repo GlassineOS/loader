@@ -256,6 +256,9 @@ fn show(epd: &mut EpdFw, keys: &mut Keys, title: &str, items: &[&str]) -> Shown 
     let foot = c(FOOT);
     unsafe { shim_epd_menu(ct.as_ptr(), ptrs.as_ptr(), ptrs.len() as i32, ROW_H, foot.as_ptr()) };
     log!("MENU_SHOWN {} ({} entries)", title, items.len());
+    for (i, it) in items.iter().enumerate() {
+        log!("MENU_ENTRY {} {}", i, it);
+    }
     let mut rearmed = crate::arch::now_ms();
     let mut drawn = 0u64;
     let r = loop {

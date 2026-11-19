@@ -68,7 +68,9 @@ fn name(d: &Deployment) -> String {
 }
 
 /// The first list (010 FR-039): GlassineOS, the previous deployment, "More", the
-/// previous kernel, the recovery. An entry with nothing behind it is left out. `rec` is
+/// previous kernel, the recovery. An entry with nothing behind it is left out, and the
+/// previous kernel under a parent that can't boot a kernel set (`parent_sets=no`, the
+/// board's `LOADER_PARENT_SETS`, boot `docs/handback.md`). `rec` is
 /// the record in use, if any. The firmware's set-up of FR-039 is not offered: it needs
 /// a firmware variable written at a start, which 010 FR-031 rules out.
 pub fn main_list(rec: Option<&Record>) -> Vec<Entry> {
@@ -82,7 +84,7 @@ pub fn main_list(rec: Option<&Record>) -> Vec<Entry> {
         if ds.iter().any(|d| d.state != "previous") {
             out.push(e("More deployments".into(), Action::More));
         }
-        if !r.get("previous").is_empty() {
+        if !r.get("previous").is_empty() && r.get("parent_sets") != "no" {
             out.push(e("Previous kernel".into(), Action::PreviousKernel));
         }
     }
@@ -146,6 +148,9 @@ mod tests {
         assert!(list(&rec("deploys=x\ndeploy1=d1 kept x\n")).is_empty());
         let m = main_list(Some(&rec("previous=\ndeploys=0\n")));
         assert_eq!(m.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["GlassineOS", "Recovery"]);
+        // A parent that can't boot a kernel set: no "Previous kernel".
+        let r = rec("previous=0123456789abcdef\nparent_sets=no\ndeploys=0\n");
+        assert!(!main_list(Some(&r)).iter().any(|x| x.action == Action::PreviousKernel));
         let m = main_list(None);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].action, Action::Recovery);

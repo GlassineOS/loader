@@ -104,8 +104,8 @@ controller is powered down before the answer.
 - **FR-004**: Before its first GPIO or I2C call the loader writes the record with `touch`
   cleared; when the write fails the bring-up doesn't run (`TOUCH_SKIPPED not-written`).
 - **FR-005**: The sequence: read the four pins (the state found; `touch.found`); read the
-  supplies, read only (FR-017; `touch.rail.l3b`, `touch.rail.l11a`), and with `touch_rail=on` turn
-  them on (FR-017); when
+  supplies, read only (FR-017; `touch.rail.l3b`, `touch.rail.l11a`); with LDO3 read off,
+  the RPM vote (FR-018); when
   61 and 62 don't both read high, power up: 61 high, 5 ms, 62 high, 5 ms (each pin: its
   level set, configured as an output, its level set again); reset low, at least 1 ms,
   high, 20 ms; 67 configured as an input; open instance 3 (`touch.open`); wait up to
@@ -121,7 +121,10 @@ controller is powered down before the answer.
   `bl`; in `bl` launch-app again, `touch.launch.bl`, and the descriptor again,
   `touch.mode.bl`); no report descriptor read (Linux's cyttsp5 doesn't put one on the
   wire; the code is kept, off); `GET_SYSINFO` sent no sooner than 100 ms after the
-  drain (Linux's first send, before the application's sentinels, is lost) and waited
+  drain (Linux's first send, before the application's sentinels, is lost), or at once
+  after the descriptor when no application sentinel came (the controller's start is
+  then spent in the descriptor's wait: on the device the descriptor answers about
+  1 s after launch-app, as in Linux's trace, and a pause after it only adds), and waited
   for up to 3 s, as Linux does (the application answers about 750 ms later), sent
   again after 100 ms when no answer or one that isn't the system information (one
   shorter than 49 bytes) came, at most 3 sends (`touch.sysinfo`, `touch.res`); close
@@ -142,7 +145,7 @@ controller is powered down before the answer.
   re-armed (30 s) just before it. Every wait and retry ends at
   it and each I2C call's timeout is at most 100 ms and never past it. Polls every 5 ms.
 - **FR-008**: Power down when the loader powered the controller: reset low, 62 low, 61
-  low (`touch.down`); then the supplies it turned on (FR-017) off (`touch.rail.off`); then
+  low (`touch.down`); then the RPM vote taken back (FR-018); then
   66, 62 and 61 configured as inputs (`touch.release`: the firmware's protocol can't read
   a pin's configuration to restore the one found, and inputs leave the pins to the
   next owner); also after a failure. Found powered: the power pins are left alone, reset ends
@@ -179,40 +182,43 @@ controller is powered down before the answer.
   empty= sentinels= frames= ids=<id>:<n>,... errors=`), then the power-down's lines
   (`TOUCH_DOWN <key>=<value>`).
 
-### The supplies (`touch_rail`)
+### The supplies
 
 - **FR-017**: At every bring-up the loader reads, through the PMIC regulator protocol
   when it passes its checks (else `error none`), the two supplies: status and level,
   nothing written (`touch.rail.l3b`, `touch.rail.l11a`: `on|off <mV> mV` or
-  `error <status>`). Only with the record's `touch_rail=on`, and only when the
-  controller wasn't found powered, it enables the supplies behind the power switches
-  before them: pm660l LDO3 (index 1, behind 61) and pm660 LDO11 (index 0, behind 62).
-  A supply already on is left alone; one whose set level is outside the controller's
-  range (2.7–3.6 V, 1.65–1.95 V) is refused; else only the enable call is made, then
-  5 ms (`touch.rail.on`). **No level is ever set** (the set-level call hung inside the
-  firmware on the device). None of it is fatal. What it turned on is turned off at the
-  power-down (FR-008). No other regulator is ever switched; every regulator call is
-  logged (`TOUCH_PMIC`).
+  `error <status>`). **The loader never writes the PMIC regulator protocol**: on the
+  device both writes to pm660l LDO3, set level and then the enable alone, ended in the
+  SoC's crash-dump mode. LDO3 is switched through the RPM (FR-018); pm660 LDO11 is
+  only read. Every regulator call is logged (`TOUCH_PMIC`).
 
 ### The RPM vote (`touch_rpm`)
 
-- **FR-018**: With the record's `touch_rpm=<stage>`, the loader runs the stages below at
-  the bring-up (`touch=probe`, or the tap source's with `touch=on`). They run after the
-  supplies are read (FR-017) and before the power switches, through the firmware's RPM
-  protocols (`docs/firmware-rpm.md`). Each stage includes the ones before it. Every call
-  is logged before and after (`TOUCH_RPM`).
-  - The key is cleared before the first RPM call: in `touch=probe`'s clearing write
-    (FR-004), or in the menu write for the tap source. A hang therefore doesn't repeat.
-    If the write fails, no RPM call is made.
-  - With `touch_rpm`, `touch_rail` is not used (`touch.rail.on=ignored touch_rpm`).
-  - An unknown value means no stage (logged).
+- **FR-018**: The RPM vote is the power path: at every bring-up (`touch=probe`, or the
+  tap source's with `touch=on`, also the menu's after a failed start) where pm660l LDO3
+  reads off, the loader runs the stages below up to `vote`. They run after the supplies
+  are read (FR-017) and before the power switches, through the firmware's RPM protocols
+  (`docs/firmware-rpm.md`). Each stage includes the ones before it. Every call is logged
+  before and after (`TOUCH_RPM`). LDO3 read on: no RPM call (`touch.rpm=skipped l3b on
+  <mV> mV`); not readable: none either (`skipped l3b unreadable`).
+  - The record's `touch_rpm` is a diagnostic for a device run: `locate`, `install` or
+    `kvp` runs the stages up to that one whatever LDO3 reads, and no vote; `off` makes
+    no RPM call (`touch.rpm=off`); empty, `vote` or an unknown value (logged) is the
+    power path. The key is cleared before the first RPM call: in `touch=probe`'s
+    clearing write (FR-004), or in the menu write for the tap source. If the write
+    fails, no RPM call is made.
+  - A hang inside the vote is a watchdog reset that doesn't repeat at the next start:
+    `touch=probe` is cleared before it (FR-004); for the tap source the menu write
+    holds `touch_voting=1` and the pick's write clears it. A menu that finds
+    `touch_voting=1` at entry makes no RPM call (`TOUCH_RPM touch_voting=1`) and
+    clears it, so at worst every other menu votes.
 
   | Stage | What it does | `touch.rpm.*` |
   |---|---|---|
   | `locate` | The NPA protocol, the RPM services and the raw request protocol looked up and checked (revision, calls inside one image); no call | `found=npa=… svc=… raw=…` (`ok`, `absent`, `bad:<why>`) |
   | `install` | The raw protocol, when absent, installed by the services (and looked up and checked again); when found installed, used and left | `install=ours ok` / `found installed` / `ours failed …` |
   | `kvp` | A KVP set created, cleared, `swen`=1 put in, destroyed; no message | `kvp=ok` / `failed …` |
-  | `vote` | With pm660l LDO3 off: the watchdog re-armed (30 s), one active-set request to `ldob` id 3 with only `swen`=1 (no level, no load), churned; after 5 ms LDO3 read back through the PMIC protocol's read-only calls. The bring-up goes on to the power switches only when LDO3 reads on and in 2.7–3.6 V; else it fails (`rpm: …`). LDO3 already on: no request | `vote=id=<n> l3b on <mV> mV` / `skipped already on …` |
+  | `vote` | With pm660l LDO3 off: the watchdog re-armed (30 s), one active-set request to `ldob` id 3 with only `swen`=1 (no level, no load), churned; after 5 ms LDO3 read back through the PMIC protocol's read-only calls. The bring-up goes on to the power switches only when LDO3 reads on and in 2.7–3.6 V; else it fails (`rpm: …`) | `vote=id=<n> l3b on <mV> mV` |
 
   - Below `vote`, a stage that can't run stops the stages (`touch.rpm.stopped`), and
     the bring-up goes on as without the key. At `vote` it fails the bring-up before any

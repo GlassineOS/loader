@@ -51,11 +51,23 @@ changed; none when it was already the focused one), the splash is drawn (one ful
 | Entry | Answer | The pick's write |
 |---|---|---|
 | GlassineOS | what the start answers without the menu (by the count; `baseline` when `default` is empty) | as that start's: counted, `started_why=default` (or `limit`) |
-| Previous deployment, a deployment under "More" | the same, with `cmdline_add=glassine.deploy.once=<id>` | the same as GlassineOS |
-| Previous kernel (only when `previous` is set) | `set:<previous>` | counted, `started=<previous>`, `started_why=choice` |
+| Previous deployment, a deployment under "More" | the same, with `cmdline_add=glassine.deploy.once=<id>`; with `parent_cmdline=no` the same without it | the same as GlassineOS; with `parent_cmdline=no` also `deploy_once=<id>` |
+| Previous kernel (only when `previous` is set and `parent_sets` isn't `no`) | `set:<previous>` | counted, `started=<previous>`, `started_why=choice` |
 | Recovery | `recovery` | not counted: `unmarked` as it was at entry |
 
-Every pick's write also clears `drew`.
+Every pick's write also clears `drew`. Only a deployment's pick under
+`parent_cmdline=no` writes `deploy_once`; every other write of the loader (the menu
+write, a start without the menu, any other pick) clears one the record holds, so a pick
+whose start never reached the initramfs doesn't come back.
+
+A parent that passes no command line (the Note Air's ABL ignores `cmdline_add` and
+boots `boot_b`) says so through the record's `parent_cmdline=no`, written from the
+board's `LOADER_PARENT_CMDLINE=no` (boot `docs/handback.md`, "The start menu"): the
+deployment then goes into the record as `deploy_once=<id>`, and the boot's initramfs
+takes it, clears it and starts that deployment once. One that boots no kernel set says
+`parent_sets=no` (`LOADER_PARENT_SETS=no`): the first list leaves "Previous kernel" out,
+since its `set:` answer would boot the baseline. On a PC neither key is set and nothing
+changes.
 
 **Acceptance**: a QEMU case per entry: the scripted tap at the entry's centre gives that
 answer and that record; "More" opens the second list and "Back" returns.

@@ -534,7 +534,9 @@ pub fn handback<S: RecordStore + Log>(p: &mut S, rec: Option<InUse>, pick_recove
 
 /// [`handback`] with loader-owned keys added to its writes: `any` to every write it
 /// makes, `counted` only to the write that counts the start (the default or the
-/// previous set). The decision is the same.
+/// previous set). The decision is the same. A `deploy_once` the record holds (a start
+/// menu's pick whose start never reached the initramfs) is cleared by every write: only
+/// the pick's own write sets it (boot `docs/handback.md`).
 pub fn handback_with<S: RecordStore + Log>(
     p: &mut S,
     rec: Option<InUse>,
@@ -542,9 +544,13 @@ pub fn handback_with<S: RecordStore + Log>(
     any: &[(&str, &str)],
     counted: &[(&str, &str)],
 ) -> Answer {
+    let stale_once = rec.as_ref().is_some_and(|c| !c.rec.get("deploy_once").is_empty());
     let write = |p: &mut S, cur: &mut InUse, ch: &[(&str, &str)], count: bool| {
         let mut all: Vec<(&str, &str)> = ch.to_vec();
         all.extend_from_slice(any);
+        if stale_once {
+            all.push(("deploy_once", ""));
+        }
         if count {
             all.extend_from_slice(counted);
         }
