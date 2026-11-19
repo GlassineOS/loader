@@ -72,6 +72,12 @@ struct Fake {
     app_at: Option<u64>,
     /// The regulators: (pmic, ldo) → (on, mV).
     rails: Vec<((u32, u32), (bool, u32))>,
+    /// The RPM protocols: the services there, the raw request protocol installed, a
+    /// vote the RPM drops (acknowledged, nothing switched), the message ids given.
+    rpm_svc: bool,
+    rpm_raw: bool,
+    rpm_drop: bool,
+    rpm_ids: u32,
 }
 
 impl Fake {
@@ -94,6 +100,10 @@ impl Fake {
             reads_high: 0,
             rdesc_reads: Vec::new(),
             app_at: None,
+            rpm_svc: true,
+            rpm_raw: false,
+            rpm_drop: false,
+            rpm_ids: 0,
             rails: vec![((0, 3), (true, 1000)), ((1, 3), (fail != Fail::RailOff && fail != Fail::RailOdd, if fail == Fail::RailOdd { 1000 } else { 3008 })), ((0, 11), (true, 1800))],
         };
         if found_on {
@@ -207,6 +217,30 @@ impl Hw for Fake {
         let r = self.rails.iter_mut().find(|r| r.0 == (pmic, ldo)).ok_or("INVALID_PARAMETER")?;
         r.1.0 = on;
         Ok(())
+    }
+    fn rpm_locate(&mut self) -> RpmFound {
+        self.ops.push("rpm-locate".into());
+        RpmFound { npa: Proto::Ok, svc: if self.rpm_svc { Proto::Ok } else { Proto::Absent }, raw: if self.rpm_raw { Proto::Ok } else { Proto::Absent } }
+    }
+    fn rpm_install(&mut self, on: bool) -> Result<(), S> {
+        self.ops.push(format!("rpm-install={}", on as u8));
+        self.rpm_raw = on;
+        Ok(())
+    }
+    fn rpm_kvp(&mut self) -> Result<(), S> {
+        self.ops.push("rpm-kvp".into());
+        if self.rpm_raw { Ok(()) } else { Err("NOT_FOUND".into()) }
+    }
+    fn rpm_vote(&mut self, swen: u32) -> Result<u32, S> {
+        self.ops.push(format!("rpm-vote={swen}"));
+        self.rpm_ids += 1;
+        if !self.rpm_drop {
+            self.rails.iter_mut().find(|r| r.0 == (1, 3)).unwrap().1.0 = swen == 1;
+        }
+        Ok(self.rpm_ids)
+    }
+    fn watchdog(&mut self) {
+        self.ops.push("wdog".into());
     }
     fn open(&mut self) -> Result<(), S> {
         self.ops.push("open".into());
@@ -644,4 +678,94 @@ fn touch_rail_turns_on_what_is_off_and_off_again() {
     let mut f = Fake::new(Fail::RailOff, false);
     bring_up(&mut f, false);
     assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
+}
+
+fn rpm_ops(f: &Fake) -> Vec<&str> {
+    f.ops.iter().filter(|o| o.starts_with("rpm-") || *o == "wdog").map(|o| o.as_str()).collect()
+}
+
+#[test]
+fn touch_rpm_stages_up_to_kvp_send_no_message() {
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Locate));
+    assert_eq!(rpm_ops(&f), ["rpm-locate"]);
+    assert_eq!(line(&up, "touch.rpm.found"), "npa=ok svc=ok raw=absent");
+    assert!(line(&up, "touch.rpm.install").is_empty() && line(&up, "touch.rpm.uninstall").is_empty());
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Install));
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-install=0"]);
+    assert_eq!(line(&up, "touch.rpm.install"), "ours ok");
+    assert_eq!(line(&up, "touch.rpm.uninstall"), "ok");
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "rpm-install=0"]);
+    assert_eq!(line(&up, "touch.rpm.kvp"), "ok");
+    // The bring-up itself goes on as without the key (LDO3 stays off).
+    assert!(up.ok() && f.ops.iter().any(|o| o == "out61=1"), "{:?}", up.lines);
+    // Found installed: used, not uninstalled.
+    let mut f = Fake::new(Fail::RailOff, false);
+    f.rpm_raw = true;
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-kvp"]);
+    assert_eq!(line(&up, "touch.rpm.install"), "found installed");
+    // No services: stopped, the bring-up not failed below vote.
+    let mut f = Fake::new(Fail::RailOff, false);
+    f.rpm_svc = false;
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Kvp));
+    assert_eq!(rpm_ops(&f), ["rpm-locate"]);
+    assert_eq!(line(&up, "touch.rpm.stopped"), "svc absent");
+    assert!(up.ok());
+}
+
+#[test]
+fn touch_rpm_vote_switches_ldo3_on_and_takes_the_vote_back() {
+    let mut f = Fake::new(Fail::RailOff, false);
+    let up = bring_up_rpm(&mut f, false, true, Some(RpmStage::Vote));
+    assert!(up.ok(), "{:?}", up.lines);
+    assert_eq!(line(&up, "touch.rail.on"), "ignored touch_rpm");
+    assert_eq!(line(&up, "touch.rpm.vote"), "id=1 l3b on 3008 mV");
+    assert_eq!(line(&up, "touch.rpm.off"), "id=2 l3b off 3008 mV");
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "wdog", "rpm-vote=1", "wdog", "rpm-vote=0", "rpm-install=0"]);
+    let at = |o: &str| f.ops.iter().position(|x| x == o).unwrap_or_else(|| panic!("{o}: {:?}", f.ops));
+    // The PMIC protocol never written; the vote before the switches, taken back after.
+    assert!(!f.ops.iter().any(|o| o.starts_with("rail-")));
+    assert!(at("rpm-vote=1") < at("out61=1"));
+    assert!(at("out61=0") < at("rpm-vote=0") && at("rpm-install=0") < at("in66"));
+    assert!(!f.rails.iter().find(|r| r.0 == (1, 3)).unwrap().1.0);
+}
+
+#[test]
+fn touch_rpm_vote_goes_on_only_with_ldo3_read_back_on() {
+    // The RPM acknowledges but nothing switches: no power switch driven, the vote taken
+    // back, the protocol uninstalled.
+    let mut f = Fake::new(Fail::RailOff, false);
+    f.rpm_drop = true;
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    assert_eq!(up.result, Err("rpm: l3b not on 3008 mV".to_string()), "{:?}", up.lines);
+    assert!(!f.ops.iter().any(|o| o.starts_with("out")), "{:?}", f.ops);
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "wdog", "rpm-vote=1", "wdog", "rpm-vote=0", "rpm-install=0"]);
+    // On, but not the expected supply: the same.
+    let mut f = Fake::new(Fail::RailOdd, false);
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    assert_eq!(up.result, Err("rpm: l3b out of range 1000 mV".to_string()));
+    assert!(!f.ops.iter().any(|o| o.starts_with("out")));
+    // Already on: no vote, nothing to take back.
+    let mut f = Fake::new(Fail::None, false);
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    assert!(up.ok());
+    assert_eq!(line(&up, "touch.rpm.vote"), "skipped already on 3008 mV");
+    assert_eq!(rpm_ops(&f), ["rpm-locate", "rpm-install=1", "rpm-kvp", "rpm-install=0"]);
+    // No services: the vote stage fails before any pin.
+    let mut f = Fake::new(Fail::RailOff, false);
+    f.rpm_svc = false;
+    let up = bring_up_rpm(&mut f, false, false, Some(RpmStage::Vote));
+    assert_eq!(up.result, Err("rpm: svc absent".to_string()));
+    assert!(!f.ops.iter().any(|o| o.starts_with("out")));
+}
+
+#[test]
+fn touch_rpm_stage_names() {
+    assert_eq!(RpmStage::parse("vote"), Some(RpmStage::Vote));
+    assert_eq!(RpmStage::parse("locate"), Some(RpmStage::Locate));
+    assert_eq!(RpmStage::parse("on"), None);
 }

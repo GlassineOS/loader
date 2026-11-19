@@ -243,12 +243,31 @@ pub fn run(opts: Opts) -> ! {
 /// the write fails the controller isn't touched.
 fn touch_probe<S: RecordStore + Log>(store: &mut S, rec: &mut Option<InUse>) -> Option<Vec<String>> {
     let cur = rec.as_mut().filter(|r| r.rec.get("touch") == "probe")?;
-    if !plan::write_changes(store, cur, &[("touch", "")]) {
+    let rpm = touch_rpm(cur);
+    let mut clear = alloc::vec![("touch", "")];
+    if !cur.rec.get("touch_rpm").is_empty() {
+        clear.push(("touch_rpm", ""));
+    }
+    if !plan::write_changes(store, cur, &clear) {
         log!("TOUCH_SKIPPED not-written");
         return Some(alloc::vec![String::from("touch.result=skipped not-written")]);
     }
     crate::touch::set_rail(cur.rec.get("touch_rail") == "on");
+    crate::touch::set_rpm(rpm);
     Some(crate::touch::probe())
+}
+
+/// The record's `touch_rpm` stage (spec 005): an unknown value is logged and none.
+fn touch_rpm(r: &InUse) -> Option<glassine_loader_core::touch::RpmStage> {
+    let v = r.rec.get("touch_rpm");
+    if v.is_empty() {
+        return None;
+    }
+    let s = glassine_loader_core::touch::RpmStage::parse(v);
+    if s.is_none() {
+        log!("TOUCH_RPM unknown touch_rpm={}: none", v);
+    }
+    s
 }
 
 /// Whether the record asks for the firmware-refreshed display (`display=epd-fw`).
@@ -273,6 +292,8 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
         if rec.as_ref().is_some_and(|r| r.rec.get("request") == "menu") { alloc::vec![("request", String::new())] } else { Vec::new() };
     crate::touch::set_on(rec.as_ref().is_some_and(|r| r.rec.get("touch") == "on"));
     crate::touch::set_rail(rec.as_ref().is_some_and(|r| r.rec.get("touch_rail") == "on"));
+    // Used only by the menu's tap source, after the menu write cleared the key.
+    crate::touch::set_rpm(None);
     if !wants_epd(rec.as_ref()) {
         return (plan::handback_with(store, rec, pick_recovery, &pairs(&clear_menu), &[]), false);
     }
@@ -341,10 +362,17 @@ fn start_menu<S: RecordStore + plan::SplashStore + Log>(
     let mut cur = entry.clone();
     let mut w1 = ep.any.clone();
     w1.extend(menu::open_write(entry));
+    // `touch_rpm` cleared in the menu write, before the tap source's first RPM call (a
+    // hang inside the firmware doesn't repeat).
+    let rpm = touch_rpm(entry);
+    if !entry.rec.get("touch_rpm").is_empty() {
+        w1.push(("touch_rpm", String::new()));
+    }
     if !plan::write_changes(store, &mut cur, &pairs(&w1)) {
         log!("MENU_NOT_OPENED the menu write failed");
         return None;
     }
+    crate::touch::set_rpm(rpm);
     log!("MENU_OPEN why={} partial={} {}", why.name(), epd.partial as u8, epd.describe());
     let choice = crate::epdmenu::run(epd, entry, src);
     log!("MENU_CLOSED {:?}", choice);
