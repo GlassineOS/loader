@@ -93,7 +93,11 @@ GUID and the call layout are used here, in this project's words):
 - **get level** gives µV on the Note Air (pm660l LDO3 read `3008000`); the loader takes
   a value below 100 000 as mV.
 - The firmware's display driver locates the protocol but makes no call to it, so no
-  firmware precedent exists for a write; the enable call is unproven on the device.
+  firmware precedent exists for a write. On the device **both writes to pm660l LDO3
+  ended in the SoC's crash-dump mode**: set level, then the enable call alone. LDO3
+  belongs to the RPM, and the firmware's RPM-side resources don't include it. The
+  loader switches it through the RPM instead (`docs/firmware-rpm.md`, spec 005
+  `touch_rpm`); this protocol is then used only to read it back.
 - **`Status`**, 20 bytes: four `u32` (pull-down on, the switching mode, pin control on,
   software enable on: 1 = on), then one byte, 1 when the regulator reports its output
   good. The loader passes a zeroed 32-byte buffer.

@@ -117,7 +117,94 @@ pub trait Hw {
     fn rail_enable(&mut self, _pmic: u32, _ldo: u32, _on: bool) -> Result<(), String> {
         Err("none".into())
     }
+    /// `touch_rpm` (stage `locate`): the firmware's three RPM protocols looked up and
+    /// checked, read only.
+    fn rpm_locate(&mut self) -> RpmFound {
+        RpmFound::default()
+    }
+    /// The RPM services' install (`true`) or uninstall (`false`) of the raw RPM request
+    /// protocol; after an install, the raw protocol looked up and checked again.
+    fn rpm_install(&mut self, _on: bool) -> Result<(), String> {
+        Err("none".into())
+    }
+    /// A KVP set created, `swen`=1 put in, destroyed: no message.
+    fn rpm_kvp(&mut self) -> Result<(), String> {
+        Err("none".into())
+    }
+    /// One active-set request to pm660l LDO3 ([`RPM_LDOB`], id [`RPM_L3B_ID`]) with
+    /// only `swen` = `swen`, then waited for until the RPM acknowledges it (the
+    /// firmware's wait has no timeout). The message id.
+    fn rpm_vote(&mut self, _swen: u32) -> Result<u32, String> {
+        Err("none".into())
+    }
+    /// The firmware watchdog re-armed for its full period.
+    fn watchdog(&mut self) {}
 }
+
+/// `touch_rpm=<stage>`: how far the driver goes with the firmware's RPM request
+/// protocols (each stage includes the ones before it). Opt-in; without the key none of
+/// them is looked up.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum RpmStage {
+    /// The three protocols looked up and checked (no call).
+    Locate,
+    /// The raw request protocol installed by the RPM services when absent (no message).
+    Install,
+    /// A KVP set created, filled and destroyed (no message).
+    Kvp,
+    /// pm660l LDO3 switched on by an RPM vote (`swen`=1, no level) before the power
+    /// switches, and the vote taken back (`swen`=0) at the power-down.
+    Vote,
+}
+
+impl RpmStage {
+    pub fn parse(v: &str) -> Option<RpmStage> {
+        Some(match v {
+            "locate" => RpmStage::Locate,
+            "install" => RpmStage::Install,
+            "kvp" => RpmStage::Kvp,
+            "vote" => RpmStage::Vote,
+            _ => return None,
+        })
+    }
+}
+
+/// One of the RPM protocols as looked up.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum Proto {
+    #[default]
+    Absent,
+    Ok,
+    /// Found, but a check failed (why).
+    Bad(String),
+}
+
+impl Proto {
+    fn text(&self) -> String {
+        match self {
+            Proto::Absent => "absent".into(),
+            Proto::Ok => "ok".into(),
+            Proto::Bad(w) => format!("bad:{w}"),
+        }
+    }
+}
+
+/// The NPA protocol, the RPM services, the raw RPM request protocol.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RpmFound {
+    pub npa: Proto,
+    pub svc: Proto,
+    pub raw: Proto,
+}
+
+/// The RPM's resource type of pm660l's LDOs ("ldob" as a little-endian word) and LDO3's
+/// id: Linux's `QCOM_SMD_RPM_LDOB` and `rpm_pm660l_regulators` "l3".
+pub const RPM_LDOB: u32 = 0x626f_646c;
+pub const RPM_L3B_ID: u32 = 3;
+/// The software-enable key, "swen".
+pub const RPM_KEY_SWEN: u32 = 0x6e65_7773;
+/// After the vote is acknowledged, before LDO3 is read back (Linux: a 250 µs ramp).
+pub const RPM_SETTLE_MS: u64 = 5;
 
 /// A supply behind the controller's power switches (`touch_rail=on` enables it when
 /// off): its name, PMIC index and LDO, and the range its set level must already be in
@@ -369,11 +456,31 @@ pub struct Up {
     pub rail: bool,
     /// The supplies the loader turned on (turned off again at the power-down).
     pub rails_on: Vec<(u32, u32)>,
+    /// `touch_rpm`: the stage asked for.
+    pub rpm: Option<RpmStage>,
+    /// The loader installed the raw RPM protocol (uninstalled at the power-down).
+    pub rpm_installed: bool,
+    /// The loader's vote for LDO3 stands (taken back at the power-down).
+    pub rpm_voted: bool,
 }
 
 impl Up {
     pub fn new(rail: bool) -> Up {
-        Up { found: Vec::new(), found_on: false, powered: false, opened: false, sysinfo: None, result: Ok(()), lines: Vec::new(), irq_seen: false, rail, rails_on: Vec::new() }
+        Up {
+            found: Vec::new(),
+            found_on: false,
+            powered: false,
+            opened: false,
+            sysinfo: None,
+            result: Ok(()),
+            lines: Vec::new(),
+            irq_seen: false,
+            rail,
+            rails_on: Vec::new(),
+            rpm: None,
+            rpm_installed: false,
+            rpm_voted: false,
+        }
     }
     pub fn ok(&self) -> bool {
         self.result.is_ok()
@@ -390,9 +497,17 @@ pub fn bring_up<H: Hw>(hw: &mut H, keep: bool) -> Up {
 /// [`bring_up`]; with `rail` (`touch_rail=on`) the supplies ([`RAILS`]) are turned on
 /// first when off.
 pub fn bring_up_with<H: Hw>(hw: &mut H, keep: bool, rail: bool) -> Up {
+    bring_up_rpm(hw, keep, rail, None)
+}
+
+/// [`bring_up_with`]; with `rpm` (`touch_rpm`) the RPM stages run after the supplies
+/// are read, before the power switches, and `rail` is not used (`touch.rail.on`
+/// says so).
+pub fn bring_up_rpm<H: Hw>(hw: &mut H, keep: bool, rail: bool, rpm: Option<RpmStage>) -> Up {
     let start = hw.now_ms();
     let deadline = start + DEADLINE_MS;
     let mut up = Up::new(rail);
+    up.rpm = rpm;
     let r = steps(hw, &mut up, deadline);
     up.result = r;
     let el = hw.now_ms().saturating_sub(start);
@@ -421,7 +536,12 @@ fn steps<H: Hw>(hw: &mut H, up: &mut Up, deadline: u64) -> Result<(), String> {
     }
     up.found_on = up.found[0] == Ok(true) && up.found[1] == Ok(true);
     rails_read(hw, up);
-    if up.rail {
+    if let Some(stage) = up.rpm {
+        if up.rail {
+            up.lines.push(("touch.rail.on", "ignored touch_rpm".into()));
+        }
+        rpm_steps(hw, up, stage)?;
+    } else if up.rail {
         let v = if up.found_on { "skipped found on".into() } else { rails_on(hw, up) };
         up.lines.push(("touch.rail.on", v));
     }
@@ -647,6 +767,113 @@ fn rails_on<H: Hw>(hw: &mut H, up: &mut Up) -> String {
     out.join(", ")
 }
 
+/// The `touch_rpm` stages (each logged in `touch.rpm.*`). Up to `kvp` nothing fails
+/// the bring-up; `vote` goes on to the power switches only with LDO3 read back on and
+/// in its range.
+fn rpm_steps<H: Hw>(hw: &mut H, up: &mut Up, stage: RpmStage) -> Result<(), String> {
+    let vote = stage == RpmStage::Vote;
+    let stop = |up: &mut Up, why: String| -> Result<(), String> {
+        up.lines.push(("touch.rpm.stopped", why.clone()));
+        if vote { Err(format!("rpm: {why}")) } else { Ok(()) }
+    };
+    let f = hw.rpm_locate();
+    up.lines.push(("touch.rpm.found", format!("npa={} svc={} raw={}", f.npa.text(), f.svc.text(), f.raw.text())));
+    if stage == RpmStage::Locate {
+        return Ok(());
+    }
+    match (&f.svc, &f.raw) {
+        (_, Proto::Ok) => up.lines.push(("touch.rpm.install", "found installed".into())),
+        (_, Proto::Bad(w)) => return stop(up, format!("raw {w}")),
+        (Proto::Ok, Proto::Absent) => {
+            let r = hw.rpm_install(true);
+            // Whatever the result, the install may have happened: undone at the end.
+            up.rpm_installed = true;
+            match r {
+                Ok(()) => up.lines.push(("touch.rpm.install", "ours ok".into())),
+                Err(e) => {
+                    up.lines.push(("touch.rpm.install", format!("ours failed {e}")));
+                    return stop(up, "install".into());
+                }
+            }
+        }
+        (s, Proto::Absent) => return stop(up, format!("svc {}", s.text())),
+    }
+    if stage == RpmStage::Install {
+        return Ok(());
+    }
+    match hw.rpm_kvp() {
+        Ok(()) => up.lines.push(("touch.rpm.kvp", "ok".into())),
+        Err(e) => {
+            up.lines.push(("touch.rpm.kvp", format!("failed {e}")));
+            return stop(up, "kvp".into());
+        }
+    }
+    if !vote {
+        return Ok(());
+    }
+    let l3b = &RAILS[0];
+    match hw.rail_get(l3b.pmic, l3b.ldo) {
+        Ok((true, mv)) => {
+            up.lines.push(("touch.rpm.vote", format!("skipped already on {mv} mV")));
+            return Ok(());
+        }
+        Ok((false, _)) => {}
+        Err(e) => return stop(up, format!("l3b read {e}")),
+    }
+    hw.watchdog();
+    let id = match hw.rpm_vote(1) {
+        Ok(id) => id,
+        Err(e) => {
+            up.lines.push(("touch.rpm.vote", format!("failed {e}")));
+            return stop(up, "vote".into());
+        }
+    };
+    up.rpm_voted = true;
+    hw.stall_ms(RPM_SETTLE_MS);
+    match hw.rail_get(l3b.pmic, l3b.ldo) {
+        Ok((true, mv)) if mv >= l3b.expect.0 && mv <= l3b.expect.1 => {
+            up.lines.push(("touch.rpm.vote", format!("id={id} l3b on {mv} mV")));
+            Ok(())
+        }
+        Ok((on, mv)) => {
+            up.lines.push(("touch.rpm.vote", format!("id={id} l3b {} {mv} mV", if on { "on" } else { "off" })));
+            stop(up, format!("l3b {} {mv} mV", if on { "out of range" } else { "not on" }))
+        }
+        Err(e) => {
+            up.lines.push(("touch.rpm.vote", format!("id={id} read error {e}")));
+            stop(up, "l3b read".into())
+        }
+    }
+}
+
+/// What the RPM stages left: the vote taken back (`swen`=0, LDO3 read back), then the
+/// raw protocol uninstalled when the loader installed it. Once.
+fn rpm_release<H: Hw>(hw: &mut H, up: &mut Up) {
+    if up.rpm_voted {
+        up.rpm_voted = false;
+        hw.watchdog();
+        let v = match hw.rpm_vote(0) {
+            Err(e) => format!("failed {e}"),
+            Ok(id) => {
+                hw.stall_ms(RPM_SETTLE_MS);
+                match hw.rail_get(RAILS[0].pmic, RAILS[0].ldo) {
+                    Ok((on, mv)) => format!("id={id} l3b {} {mv} mV", if on { "on" } else { "off" }),
+                    Err(e) => format!("id={id} read error {e}"),
+                }
+            }
+        };
+        up.lines.push(("touch.rpm.off", v));
+    }
+    if up.rpm_installed {
+        up.rpm_installed = false;
+        let v = match hw.rpm_install(false) {
+            Ok(()) => "ok".into(),
+            Err(e) => format!("failed {e}"),
+        };
+        up.lines.push(("touch.rpm.uninstall", v));
+    }
+}
+
 /// Releases what the bring-up took (FR-008): the bus closed; the controller powered
 /// down when the loader powered it (reset low, 62 low, 61 low), then the supplies the
 /// loader turned on turned off, then the three pins it drove configured as inputs (the
@@ -676,6 +903,7 @@ pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
             }
             up.lines.push(("touch.rail.off", v.join(", ")));
         }
+        rpm_release(hw, up);
         let mut v: Vec<String> = Vec::new();
         for p in [PIN_RESET, PIN_VDDIO, PIN_VDD] {
             if let Err(e) = hw.pin_in(p) {
@@ -689,6 +917,7 @@ pub fn power_down<H: Hw>(hw: &mut H, up: &mut Up) {
         }
         up.lines.push(("touch.down", if errs.is_empty() { "left powered".into() } else { format!("errors {}", errs.join(", ")) }));
     }
+    rpm_release(hw, up);
 }
 
 #[cfg(test)]

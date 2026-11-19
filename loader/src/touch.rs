@@ -7,14 +7,14 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use glassine_loader_core::menu::{self, Range};
-use glassine_loader_core::touch::{self, Hw, I2C_ADDRESS, I2C_INSTANCE, I2C_KHZ, ORIENT, REG_INPUT, RES};
+use glassine_loader_core::touch::{self, Hw, I2C_ADDRESS, I2C_INSTANCE, I2C_KHZ, ORIENT, Proto, REG_INPUT, RES, RpmFound, RpmStage};
 use uefi::Status;
 
 use crate::epdmenu::TapSource;
-use crate::fwbus::{self, Bus, GPIO, Gpio, I2C, I2c, VREG, Vreg};
+use crate::fwbus::{self, Bus, GPIO, Gpio, I2C, I2c, NPA, RPM, RPM_SVC, Rpm, VREG, Vreg};
 use crate::log;
 
 /// Both protocols, found and checked (FR-001), and the bus once open.
@@ -25,6 +25,8 @@ pub struct Fw {
     /// The PMIC regulator protocol, when found and passing its checks (else the rail
     /// calls give an error and nothing is touched).
     vreg: Option<Vreg>,
+    /// The RPM services and raw request protocol, once looked up (`touch_rpm`).
+    rpm: Option<Rpm>,
     /// Log every I2C read (the bring-up) or only failed ones (the tap source's polls).
     pub quiet_reads: bool,
     /// Reads not logged: input-register reads with nothing waiting (`02 00`), interrupt
@@ -52,7 +54,7 @@ impl Fw {
                 None
             }
         };
-        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, vreg, quiet_reads: false, empty_reads: 0, irq_reads: 0 })
+        Ok(Fw { gpio: Gpio::new(&g).ok_or("gpio unusable")?, i2c: I2c::new(&i).ok_or("i2c unusable")?, bus: None, vreg, rpm: None, quiet_reads: false, empty_reads: 0, irq_reads: 0 })
     }
 }
 
@@ -121,6 +123,48 @@ impl Hw for Fw {
     fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), String> {
         st(self.vreg.as_ref().ok_or("none")?.enable(pmic, ldo, on))
     }
+    fn rpm_locate(&mut self) -> RpmFound {
+        let ram = crate::fwgop::Ram::read();
+        let images = crate::fwgop::Images::read(&ram);
+        let (npa, _) = fwbus::proto(NPA, &ram, &images);
+        let (svc, svc_iface) = fwbus::proto(RPM_SVC, &ram, &images);
+        let (raw, raw_iface) = fwbus::proto(RPM, &ram, &images);
+        log!("TOUCH_RPM locate npa={:?} svc={:?} raw={:?}", npa, svc, raw);
+        self.rpm = svc_iface.map(|s| Rpm { svc: s, raw: raw_iface });
+        if self.rpm.is_none() && raw_iface.is_some() {
+            self.rpm = Some(Rpm { svc: 0, raw: raw_iface });
+        }
+        RpmFound { npa, svc, raw }
+    }
+    fn rpm_install(&mut self, on: bool) -> Result<(), String> {
+        let r = self.rpm.as_mut().filter(|r| r.svc != 0).ok_or("no services")?;
+        if !on {
+            r.raw = None;
+            return st(r.uninstall());
+        }
+        st(r.install())?;
+        let ram = crate::fwgop::Ram::read();
+        let images = crate::fwgop::Images::read(&ram);
+        let (raw, iface) = fwbus::proto(RPM, &ram, &images);
+        log!("TOUCH_RPM relocate raw={:?}", raw);
+        match raw {
+            Proto::Ok => {
+                r.raw = iface;
+                Ok(())
+            }
+            other => Err(format!("raw {other:?}")),
+        }
+    }
+    fn rpm_kvp(&mut self) -> Result<(), String> {
+        st(self.rpm.as_ref().ok_or("none")?.kvp_check())
+    }
+    fn rpm_vote(&mut self, swen: u32) -> Result<u32, String> {
+        self.rpm.as_ref().ok_or("none")?.vote(swen).map_err(|s| format!("{s:?}"))
+    }
+    fn watchdog(&mut self) {
+        log!("TOUCH_RPM watchdog re-armed");
+        crate::watchdog::arm();
+    }
     fn irq_asserted(&mut self) -> Result<bool, String> {
         self.irq_reads += 1;
         self.gpio.read_quiet(touch::PIN_IRQ).map(|l| l == 0).map_err(|s| format!("{s:?}"))
@@ -149,7 +193,7 @@ pub fn probe() -> Vec<String> {
     log!("TOUCH_START probe");
     // The bring-up takes up to its deadline (10 s): a full watchdog period ahead of it.
     crate::watchdog::arm();
-    let up = touch::bring_up_with(&mut fw, false, RAIL.load(Ordering::Relaxed));
+    let up = touch::bring_up_rpm(&mut fw, false, RAIL.load(Ordering::Relaxed), rpm());
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
     log!("TOUCH_QUIET empty_reads={} irq_reads={}", fw.empty_reads, fw.irq_reads);
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
@@ -169,6 +213,18 @@ static RAIL: AtomicBool = AtomicBool::new(false);
 
 pub fn set_rail(on: bool) {
     RAIL.store(on, Ordering::Relaxed);
+}
+
+/// The record's `touch_rpm` stage (0: none), set by the hand-back after the write that
+/// clears the key.
+static RPM_STAGE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_rpm(stage: Option<RpmStage>) {
+    RPM_STAGE.store(stage.map_or(0, |s| s as u8 + 1), Ordering::Relaxed);
+}
+
+fn rpm() -> Option<RpmStage> {
+    [RpmStage::Locate, RpmStage::Install, RpmStage::Kvp, RpmStage::Vote].get((RPM_STAGE.load(Ordering::Relaxed) as usize).checked_sub(1)?).copied()
 }
 
 /// What the tap source saw while the menu was open (spec 005 FR-016), logged at the
@@ -313,7 +369,7 @@ impl TapSource for Source {
             log!("TOUCH_START menu");
             crate::watchdog::arm();
             self.fw.quiet_reads = false;
-            let up = touch::bring_up_with(&mut self.fw, true, RAIL.load(Ordering::Relaxed));
+            let up = touch::bring_up_rpm(&mut self.fw, true, RAIL.load(Ordering::Relaxed), rpm());
             self.fw.quiet_reads = true;
             self.seen.empty_at_up = self.fw.empty_reads;
             for (k, v) in &up.lines {

@@ -194,6 +194,37 @@ controller is powered down before the answer.
   power-down (FR-008). No other regulator is ever switched; every regulator call is
   logged (`TOUCH_PMIC`).
 
+### The RPM vote (`touch_rpm`)
+
+- **FR-018**: With the record's `touch_rpm=<stage>`, the loader runs the stages below at
+  the bring-up (`touch=probe`, or the tap source's with `touch=on`). They run after the
+  supplies are read (FR-017) and before the power switches, through the firmware's RPM
+  protocols (`docs/firmware-rpm.md`). Each stage includes the ones before it. Every call
+  is logged before and after (`TOUCH_RPM`).
+  - The key is cleared before the first RPM call: in `touch=probe`'s clearing write
+    (FR-004), or in the menu write for the tap source. A hang therefore doesn't repeat.
+    If the write fails, no RPM call is made.
+  - With `touch_rpm`, `touch_rail` is not used (`touch.rail.on=ignored touch_rpm`).
+  - An unknown value means no stage (logged).
+
+  | Stage | What it does | `touch.rpm.*` |
+  |---|---|---|
+  | `locate` | The NPA protocol, the RPM services and the raw request protocol looked up and checked (revision, calls inside one image); no call | `found=npa=… svc=… raw=…` (`ok`, `absent`, `bad:<why>`) |
+  | `install` | The raw protocol, when absent, installed by the services (and looked up and checked again); when found installed, used and left | `install=ours ok` / `found installed` / `ours failed …` |
+  | `kvp` | A KVP set created, cleared, `swen`=1 put in, destroyed; no message | `kvp=ok` / `failed …` |
+  | `vote` | With pm660l LDO3 off: the watchdog re-armed (30 s), one active-set request to `ldob` id 3 with only `swen`=1 (no level, no load), churned; after 5 ms LDO3 read back through the PMIC protocol's read-only calls. The bring-up goes on to the power switches only when LDO3 reads on and in 2.7–3.6 V; else it fails (`rpm: …`). LDO3 already on: no request | `vote=id=<n> l3b on <mV> mV` / `skipped already on …` |
+
+  - Below `vote`, a stage that can't run stops the stages (`touch.rpm.stopped`), and
+    the bring-up goes on as without the key. At `vote` it fails the bring-up before any
+    pin is driven.
+  - At the power-down (FR-008), after the switches are low and before the pins are
+    released, the vote is taken back. This happens whenever a request was made, also
+    after a failed bring-up: the watchdog re-armed, `swen`=0, LDO3 read back
+    (`touch.rpm.off`). Then a raw protocol the loader installed is uninstalled
+    (`touch.rpm.uninstall`).
+  - The services' own request (their first call) and the NPA protocol's calls are
+    never made.
+
 ## Device scope and risk
 
 Unverified on hardware, each checked by a device run with the person's go:
@@ -203,9 +234,12 @@ Unverified on hardware, each checked by a device run with the person's go:
 - whether the 3.3 V and 1.8 V regulators behind the switches are on when the loader
   runs (a device run: the bring-up works, the panel never reports a touch;
   FR-017 reads them: pm660l LDO3 off at 3.008 V, LDO11 on); whether the enable call
-  is safe from the loader (the set-level call wasn't: it hung, 900E; the firmware's
-  display driver never writes a regulator, so there is no precedent); the PMIC
-  indexes are the display driver's (A = 0, B = 1);
+  is safe from the loader (it wasn't: on the device the set-level call and then the
+  enable call alone both ended in 900E; LDO3 belongs to the RPM); the PMIC indexes are
+  the display driver's (A = 0, B = 1);
+- whether the raw RPM protocol is absent at the loader's start and installs cleanly;
+  whether the RPM acknowledges the `swen` vote and LDO3 reads back on at 3.008 V;
+  whether the firmware watchdog ends a churn that never returns (FR-018);
 - whether the pins configured as inputs after the power-down hold the switches off;
 - whether an output pin reads back its driven level;
 - whether the bootloader answers launch-app and how long the application takes to
@@ -216,8 +250,8 @@ Unverified on hardware, each checked by a device run with the person's go:
 
 ## Out of scope
 
-Interrupts; multi-touch, gestures, the pen; any PMIC call but FR-017's, any clock
-call; touch on a PC.
+Interrupts; multi-touch, gestures, the pen; any PMIC call but FR-017's, any RPM
+request but FR-018's, any clock call; touch on a PC.
 
 ## Success criteria
 

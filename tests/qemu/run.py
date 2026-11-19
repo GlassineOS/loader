@@ -1606,6 +1606,101 @@ def touch_on_with_touch_rail_taps_a_panel_that_needs_ldo3():
     assert not [x for x in faketouch_vreg(log)[0] if x.startswith(("set", "ctl-bad"))], faketouch_vreg(log)
 
 
+def faketouch_rpm(log):
+    """The stand-in RPM protocols' calls, whether the raw protocol ended installed and
+    whether pm660l LDO3 ended on."""
+    m = re.findall(r"PARENT_FAKETOUCH rpm ?([^\r\n]*)", log)
+    assert m, "the stand-in RPM protocols reported nothing"
+    w = m[-1].split()
+    return w[:-2], w[-2] == "raw=1", w[-1] == "l3b=1"
+
+
+@case("x86_64", "aarch64")
+def touch_rpm_stages_up_to_kvp_send_no_message():
+    """005 FR-018: touch=probe touch_rpm=kvp with LDO3 off: the key cleared in the
+    clearing write before the first RPM call; the three protocols looked up (the raw
+    one absent), installed by the services' word 2, a KVP set created, filled with
+    swen=1 and destroyed, no message; uninstalled at the end. touch_rpm=locate: only
+    looked up."""
+    rec = hb_record(touch="probe", touch_rpm="kvp")
+    d, log, keys, c, seq = touch_run("touch-rpm-kvp", "rail-off", record=rec)
+    assert d.record()[1].get("touch_rpm", "") == "", d.record()
+    assert log.index("WRITE slot=") < log.index("TOUCH_RPM"), "an RPM call before the clearing write"
+    assert keys["touch.rpm.found"] == "npa=ok svc=ok raw=absent", keys
+    assert keys["touch.rpm.install"] == "ours ok" and keys["touch.rpm.kvp"] == "ok", keys
+    assert keys["touch.rpm.uninstall"] == "ok" and "touch.rpm.vote" not in keys, keys
+    calls, raw, l3b = faketouch_rpm(log)
+    assert calls == ["install", "create:0", "clear", "put:swen=1", "destroy", "uninstall"], calls
+    assert not raw and not l3b, (calls, raw, l3b)
+    # Every call logged before and after.
+    for a, b in (("install call", "install -> SUCCESS"), ("kvp_create call", "kvp_create -> SUCCESS"),
+                 ("kvp_clear call", "kvp_clear -> SUCCESS"), ("kvp_put swen=1 call", "kvp_put -> SUCCESS"),
+                 ("kvp_destroy call", "kvp_destroy -> SUCCESS"), ("uninstall call", "uninstall -> SUCCESS")):
+        assert log.index(f"TOUCH_RPM {a}") < log.index(f"TOUCH_RPM {b}"), (a, log[-3000:])
+    d, log, keys, c, seq = touch_run("touch-rpm-locate", "rail-off", record=hb_record(touch="probe", touch_rpm="locate"))
+    assert keys["touch.rpm.found"] == "npa=ok svc=ok raw=absent" and "touch.rpm.install" not in keys, keys
+    assert faketouch_rpm(log)[0] == [], faketouch_rpm(log)
+
+
+@case("x86_64", "aarch64")
+def touch_rpm_vote_switches_ldo3_and_takes_it_back():
+    """005 FR-018: touch=probe touch_rpm=vote touch_rail=on with LDO3 off: the PMIC
+    protocol never written; the watchdog re-armed, one active-set request to ldob id 3
+    with only swen=1, churned; LDO3 read back on before the power switches; the bring-up
+    ok; at the power-down swen=0, LDO3 read back off, the raw protocol uninstalled."""
+    rec = hb_record(touch="probe", touch_rpm="vote", touch_rail="on")
+    d, log, keys, c, seq = touch_run("touch-rpm-vote", "rail-off", record=rec)
+    assert keys["touch.rail.on"] == "ignored touch_rpm", keys
+    assert keys["touch.rpm.vote"] == "id=1 l3b on 3008 mV" and keys["touch.rpm.off"] == "id=2 l3b off 3008 mV", keys
+    calls, raw, l3b = faketouch_rpm(log)
+    assert calls == ["install", "create:0", "clear", "put:swen=1", "destroy",
+                     "create:0", "clear", "put:swen=1", "post:active:ldob:3:swen=1:id=1", "churn:1", "destroy",
+                     "create:0", "clear", "put:swen=0", "post:active:ldob:3:swen=0:id=2", "churn:2", "destroy",
+                     "uninstall"], calls
+    assert not raw and not l3b, (raw, l3b)
+    assert not [x for x in faketouch_vreg(log)[0] if x[:3] in ("set", "ctl")], faketouch_vreg(log)
+    post = log.index("TOUCH_RPM post set=active")
+    assert log.rindex("PARENT_WATCHDOG 30", 0, post) > log.rindex("TOUCH_RPM kvp_destroy", 0, post), log[-3000:]
+    assert log.index("TOUCH_RPM churn -> ") < log.index("TOUCH_GPIO set 61 1"), log[-3000:]
+    assert log.rindex("TOUCH_GPIO set 61 0") < log.rindex("TOUCH_RPM post set=active"), log[-3000:]
+    assert keys["touch.result"].startswith("ok"), keys
+
+
+@case("x86_64", "aarch64")
+def touch_on_with_touch_rpm_taps_a_panel_that_needs_ldo3():
+    """005 FR-018: touch=on touch_rpm=vote request=menu: touch_rpm cleared in the menu
+    write before the tap source's first RPM call; LDO3 voted on, the menu's taps come
+    through; the vote taken back and the protocol uninstalled when the menu closes."""
+    d, log, boot, got = touch_menu("touch-menu-rpm", [touch_tap(4, 1)], mode="rail-off", touch_rpm="vote")
+    assert got and got.startswith("format=1 boot=recovery"), (got, log[-2000:])
+    assert d.record()[1].get("touch_rpm", "") == "", d.record()
+    assert log.index("MENU_OPEN") < log.index("TOUCH_RPM"), log[-3000:]
+    assert "TOUCH_UP touch.rpm.vote=id=1 l3b on 3008 mV" in log, log[-3000:]
+    assert "TOUCH_DOWN touch.rpm.off=id=2 l3b off 3008 mV" in log and "TOUCH_DOWN touch.rpm.uninstall=ok" in log, log[-3000:]
+    calls, raw, l3b = faketouch_rpm(log)
+    assert not raw and not l3b and not [x for x in calls if "bad" in x], calls
+    m = re.search(r"TOUCH_MENU polls=\d+ irq_low=\d+ irq_changes=\d+ empty=\d+ sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
+    assert m and int(m[1]) == 6, log[-2000:]
+
+
+@case("x86_64", "aarch64")
+def touch_rpm_a_churn_that_never_returns_ends_in_the_watchdog():
+    """005 FR-018, FR-004: the RPM never acknowledges (the firmware's wait has no
+    timeout): the watchdog, re-armed for 30 s before the post, resets the machine; the
+    record has touch and touch_rpm cleared, and the next start makes no RPM call."""
+    d = hb_disk("touch-rpm-hang", hb_record(touch="probe", touch_rpm="vote"), cfg="parent.faketouch=rpm-hang")
+    vm = VM("touch-rpm-hang", d)
+    vm.finish(timeout=150)
+    log = vm.log()
+    assert "PARENT_FAKETOUCH_HANG" in log and "PARENT_POWEROFF" not in log, log[-800:]
+    hang = log.index("PARENT_FAKETOUCH_HANG")
+    assert log.rindex("PARENT_WATCHDOG 30", 0, hang) > log.rindex("TOUCH_RPM kvp_destroy", 0, hang), log[-2000:]
+    r = d.record()[1]
+    assert r.get("touch", "") == "" and r.get("touch_rpm", "") == "", r
+    log, boot, floor, _ = parent_run("touch-rpm-hang-2", d)
+    assert boot == "baseline" and "TOUCH_RPM" not in log, (boot, log[-800:])
+
+
 @case("x86_64", "aarch64")
 def touch_probe_a_hang_is_not_repeated():
     """005 Scenario 3, FR-004: an I2C read that never returns: the machine is reset; the
