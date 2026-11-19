@@ -186,7 +186,9 @@ fn wait_for_key(ms: u64, drawn: bool) -> bool {
 
 /// The list and its "More" list (010 FR-039, FR-040). Returns the person's choice.
 fn run_list(rec: Option<&InUse>) -> Choice {
-    let main = deploys::main_list(rec.map(|r| &r.rec));
+    // A PC has no parent and no other system: no such entry (handback.md, "The other
+    // system").
+    let main = deploys::main_list(rec.map(|r| &r.rec), None);
     loop {
         let names: Vec<&str> = main.iter().map(|e| e.label.as_str()).collect();
         let Some(i) = ui::list("Start options", &names) else {
@@ -199,7 +201,7 @@ fn run_list(rec: Option<&InUse>) -> Choice {
             Action::Deploy(id) => return Choice::Deploy(id.clone()),
             Action::PreviousKernel => return Choice::PreviousKernel,
             Action::Recovery => return Choice::Recovery,
-            Action::Back => {}
+            Action::Other(_) | Action::Back => {}
             Action::More => {
                 let Some(r) = rec else { continue };
                 let more = deploys::more_list(&r.rec);

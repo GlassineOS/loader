@@ -25,6 +25,9 @@ use crate::log;
 pub struct Opts {
     pub serial: bool,
     pub pick_recovery: bool,
+    /// The `boot=` forms the parent acts on besides `baseline` (`glassine.answers=`,
+    /// `docs/handback.md`, "Load options"); empty for a parent that passes no such word.
+    pub answers: Vec<String>,
 }
 
 fn get<P: uefi::proto::ProtocolPointer + ?Sized>(h: Handle) -> uefi::Result<ScopedProtocol<P>> {
@@ -40,7 +43,16 @@ pub fn options() -> Option<Opts> {
     if !words.contains(&"glassine.handback=1") {
         return None;
     }
-    Some(Opts { serial: words.contains(&"glassine.log=serial"), pick_recovery: words.contains(&"glassine.pick=recovery") })
+    let answers = words
+        .iter()
+        .find_map(|w| w.strip_prefix("glassine.answers="))
+        .map(|v| v.split(',').filter(|f| !f.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+    Some(Opts {
+        serial: words.contains(&"glassine.log=serial"),
+        pick_recovery: words.contains(&"glassine.pick=recovery"),
+        answers,
+    })
 }
 
 /// The partition's block I/O. Reads and writes go through a buffer aligned as the
@@ -187,7 +199,8 @@ const PROBE_FILE: &str = "\\glassine\\probe.txt";
 /// it uses up no override (boot spec 012 FR-015a); with `display=epd-fw` it is used as
 /// on a PC (spec 003).
 pub fn run(opts: Opts) -> ! {
-    log!("HANDBACK start serial={} pick_recovery={}", opts.serial as u8, opts.pick_recovery as u8);
+    log!("HANDBACK start serial={} pick_recovery={} answers={}", opts.serial as u8, opts.pick_recovery as u8, opts.answers.join(","));
+    let answers: Vec<&str> = opts.answers.iter().map(String::as_str).collect();
     let answer = match open() {
         Err(why) => {
             log!("HANDBACK {}: the baseline", why);
@@ -205,7 +218,7 @@ pub fn run(opts: Opts) -> ! {
             if probe {
                 write(&mut d);
             }
-            let (a, menu) = decide_then_draw(&mut d, rec, opts.pick_recovery);
+            let (a, menu) = decide_then_draw(&mut d, rec, opts.pick_recovery, &answers);
             // Again after the menu (or MENU_NO_INPUT), so its log holds those lines (004
             // FR-014).
             if probe && menu {
@@ -225,7 +238,7 @@ pub fn run(opts: Opts) -> ! {
             if probe {
                 write(&mut v);
             }
-            let (a, menu) = decide_then_draw(&mut v, rec, opts.pick_recovery);
+            let (a, menu) = decide_then_draw(&mut v, rec, opts.pick_recovery, &answers);
             if probe && menu {
                 write(&mut v);
             }
@@ -286,7 +299,12 @@ fn pairs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
 /// drew and never came back sets the sticky `display_failed`, which only the running
 /// system clears. Returns the answer and whether the menu was shown or would have been
 /// but for a tap source.
-fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec: Option<InUse>, pick_recovery: bool) -> (Answer, bool) {
+fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(
+    store: &mut S,
+    rec: Option<InUse>,
+    pick_recovery: bool,
+    answers: &[&str],
+) -> (Answer, bool) {
     // A `request=menu` that opens no menu is cleared in the start's first write (004
     // FR-002).
     let clear_menu: Vec<(&'static str, String)> =
@@ -308,7 +326,7 @@ fn decide_then_draw<S: RecordStore + plan::SplashStore + Log>(store: &mut S, rec
                 let (w, h) = epd.size_native();
                 match crate::epdmenu::tap_source(w, h) {
                     Some(src) => {
-                        if let Some(a) = start_menu(store, epd, entry, &ep, why, src) {
+                        if let Some(a) = start_menu(store, epd, entry, &ep, why, src, answers) {
                             return (a, true);
                         }
                     }
@@ -357,6 +375,7 @@ fn start_menu<S: RecordStore + plan::SplashStore + Log>(
     ep: &plan::EpdPlan,
     why: menu::Why,
     src: alloc::boxed::Box<dyn crate::epdmenu::TapSource>,
+    answers: &[&str],
 ) -> Option<Answer> {
     epd.partial = entry.rec.get("display_partial") != "0";
     let mut cur = entry.clone();
@@ -388,7 +407,12 @@ fn start_menu<S: RecordStore + plan::SplashStore + Log>(
     }
     crate::touch::set_rpm(rpm);
     log!("MENU_OPEN why={} partial={} {}", why.name(), epd.partial as u8, epd.describe());
-    let choice = crate::epdmenu::run(epd, entry, src);
+    // The other system's entry only when the record and the parent both name it.
+    let other = glassine_loader_core::deploys::other_offered(&entry.rec, answers);
+    if !entry.rec.get("other").is_empty() {
+        log!("MENU_OTHER record={} offered={}", entry.rec.get("other"), other.as_deref().unwrap_or("-"));
+    }
+    let choice = crate::epdmenu::run(epd, entry, src, other.as_deref());
     log!("MENU_CLOSED {:?}", choice);
     epd_splash(store, epd);
     let d = menu::decide(entry, &choice);

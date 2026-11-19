@@ -343,6 +343,9 @@ pub enum Choice {
     Deploy(String),
     PreviousKernel,
     Recovery,
+    /// The parent's other system, by name (only under a parent that announced it; boot
+    /// `docs/handback.md`, "The other system").
+    Other(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

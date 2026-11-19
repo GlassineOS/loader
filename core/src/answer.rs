@@ -23,6 +23,14 @@ pub enum Boot {
     Recovery,
     /// A kernel set: its id and the `_rec` value the record names for it.
     Set { id: String, rec: String },
+    /// The parent's other system, by name, for this start only (`docs/handback.md`,
+    /// "The other system"). Answered only when the parent announced it.
+    Other(String),
+}
+
+/// A name of the other system: lower-case letters, digits and `-`, 1 to 31 bytes.
+pub fn is_other_name(n: &str) -> bool {
+    (1..=31).contains(&n.len()) && n.bytes().all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +54,7 @@ impl Answer {
             Boot::Baseline => t.push_str("boot=baseline\n"),
             Boot::Recovery => t.push_str("boot=recovery\n"),
             Boot::Set { id, rec } => t.push_str(&format!("boot=set:{id}\nset_rec={rec}\n")),
+            Boot::Other(name) => t.push_str(&format!("boot=other:{name}\n")),
         }
         if let Some(c) = &self.cmdline_add {
             t.push_str(&format!("cmdline_add={c}\n"));
@@ -139,8 +148,9 @@ pub fn parse(data: &[u8]) -> Result<Answer, Floor> {
     let boot = match boot.ok_or(Floor::NoBoot)? {
         "baseline" => Boot::Baseline,
         "recovery" => Boot::Recovery,
-        v => match v.strip_prefix("set:") {
-            Some(id) if hex_n(id, 16) => Boot::Set { id: id.into(), rec: rec.into() },
+        v => match (v.strip_prefix("set:"), v.strip_prefix("other:")) {
+            (Some(id), _) if hex_n(id, 16) => Boot::Set { id: id.into(), rec: rec.into() },
+            (_, Some(n)) if is_other_name(n) => Boot::Other(n.into()),
             _ => return Err(Floor::UnknownBoot),
         },
     };
@@ -162,9 +172,10 @@ mod tests {
 
     /// The bytes the ABL's host test (GlassineOS/abl `glassine/test/handback-test.c`,
     /// `Shared`) checks too: both parsers read the same answers.
-    pub(crate) const SHARED: [&str; 2] = [
+    pub(crate) const SHARED: [&str; 3] = [
         "format=1\nboot=recovery\nwhy=limit\ncrc32=a84aa7ed\n",
         "format=1\nboot=set:0123456789abcdef\nset_rec=\nwhy=request\ncrc32=1fee18ad\n",
+        "format=1\nboot=other:android\nwhy=choice\ncrc32=62dcfe05\n",
     ];
 
     #[test]
@@ -174,6 +185,8 @@ mod tests {
         assert_eq!(set.text(), SHARED[1].as_bytes());
         assert_eq!(parse(&data(SHARED[0])).unwrap().boot, Boot::Recovery);
         assert_eq!(parse(&data(SHARED[1])).unwrap().boot, set.boot);
+        assert_eq!(Answer::new(Boot::Other("android".into()), "choice").text(), SHARED[2].as_bytes());
+        assert_eq!(parse(&data(SHARED[2])).unwrap().boot, Boot::Other("android".into()));
     }
 
     fn data(answer_text: &str) -> Vec<u8> {
@@ -193,6 +206,7 @@ mod tests {
             Answer::new(Boot::Recovery, "limit"),
             Answer::new(Boot::Set { id: "0123456789abcdef".into(), rec: "ab".repeat(32) }, "request"),
             Answer { boot: Boot::Baseline, cmdline_add: Some("glassine.deploy.once=d-2".into()), why: "default" },
+            Answer::new(Boot::Other("android".into()), "choice"),
         ] {
             let got = parse(&a.exit_data()).unwrap();
             assert_eq!((got.boot, got.cmdline_add), (a.boot.clone(), a.cmdline_add.clone()));
@@ -227,7 +241,21 @@ mod tests {
         assert_eq!(parse(&data(&crc_line("boot=baseline\nformat=1\n"))), Err(Floor::NotFormat1));
         assert_eq!(parse(&data(&crc_line("format=1\nboot=baseline\nboot=recovery\n"))), Err(Floor::Repeated));
         assert_eq!(parse(&data(&crc_line("format=1\nwhy=x\n"))), Err(Floor::NoBoot));
-        for b in ["reboot", "set:", "set:0123", "set:0123456789ABCDEF", "set:0123456789abcdefg", "Baseline", ""] {
+        for b in [
+            "reboot",
+            "set:",
+            "set:0123",
+            "set:0123456789ABCDEF",
+            "set:0123456789abcdefg",
+            "Baseline",
+            "",
+            "other:",
+            "other",
+            "other:Android",
+            "other:an droid",
+            "other:a_b",
+            "other:0123456789012345678901234567890x",
+        ] {
             assert_eq!(parse(&data(&crc_line(&format!("format=1\nboot={b}\n")))), Err(Floor::UnknownBoot), "{b}");
         }
         assert_eq!(parse(&data(&crc_line("format=1\nboot=baseline\r\n"))), Err(Floor::NotText));
