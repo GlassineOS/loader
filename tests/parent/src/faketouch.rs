@@ -44,6 +44,16 @@
 //!   hung on the device); an enable outside the firmware's convention is recorded
 //!   `ctl-bad`. Every call recorded (`vreg ...`).
 //!
+//! - The RPM protocols (`docs/firmware-rpm.md`): the NPA protocol (revision 0x10002,
+//!   never called), the RPM services (revision 0x10002: word 2 installs the raw request
+//!   protocol on a handle of its own, word 3 uninstalls it, word 1 must never be
+//!   called) and the raw request protocol (revision 0x10001), absent until installed.
+//!   Its KVP calls keep the pairs put; a post of anything but the active set, `ldob`,
+//!   id 3 with exactly `swen` 0 or 1 is recorded `bad` and sends nothing (id 0); the
+//!   churn of a posted id applies it (LDO3 on or off). `rpm-hang`: LDO3 off and the
+//!   churn never returns (the firmware's wait has no timeout). Every call recorded
+//!   (`rpm ...`).
+//!
 //! After the loader returns, [`report`] prints the counts and the call sequence.
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -81,6 +91,7 @@ pub enum Mode {
     LinuxTrace,
     IrqStuck,
     RailOff,
+    RpmHang,
 }
 
 impl Mode {
@@ -105,6 +116,7 @@ impl Mode {
             "linux-trace" => Mode::LinuxTrace,
             "irq-stuck" => Mode::IrqStuck,
             "rail-off" => Mode::RailOff,
+            "rpm-hang" => Mode::RpmHang,
             _ => return None,
         })
     }
@@ -117,6 +129,12 @@ struct State {
     /// The regulators: (pmic, regulator id) → (on, mV); the calls made.
     rails: Vec<((u32, u32), (bool, u32))>,
     vreg_seq: Vec<String>,
+    rpm_seq: Vec<String>,
+    /// The raw request protocol's handle and interface while installed.
+    rpm_raw: Option<(uefi::Handle, u64)>,
+    /// Message ids given, and the posted (id, swen) not yet churned.
+    rpm_ids: u32,
+    rpm_pending: Vec<(u32, u32)>,
     /// Per pin: Some(level) when an output.
     out: [Option<bool>; 128],
     /// The latched output level per pin (set before configure).
@@ -602,8 +620,12 @@ pub fn install(mode: Mode) -> String {
         reads: 0,
         reads_high: 0,
         app_at: None,
-        rails: alloc::vec![((1, 2), (mode != Mode::RailOff, 3008)), ((0, 10), (true, 1800))],
+        rails: alloc::vec![((1, 2), (!matches!(mode, Mode::RailOff | Mode::RpmHang), 3008)), ((0, 10), (true, 1800))],
         vreg_seq: Vec::new(),
+        rpm_seq: Vec::new(),
+        rpm_raw: None,
+        rpm_ids: 0,
+        rpm_pending: Vec::new(),
         busy: (0, 0),
         nacks: 0,
         due_ms: Vec::new(),
@@ -651,6 +673,10 @@ pub fn install(mode: Mode) -> String {
         boot::install_protocol_interface(None, &VREG_GUID, leak(vreg) as *const c_void).expect("install vreg");
         boot::install_protocol_interface(None, &GPIO_GUID, leak(gpio) as *const c_void).expect("install gpio");
         boot::install_protocol_interface(None, &I2C_GUID, leak(i2c) as *const c_void).expect("install i2c");
+        let npa: [u64; 53] = core::array::from_fn(|i| if i == 0 { 0x10002 } else { npa_other as *const () as u64 });
+        boot::install_protocol_interface(None, &NPA_GUID, leak(npa) as *const c_void).expect("install npa");
+        let svc: [u64; 4] = [0x10002, svc_misc as *const () as u64, svc_install as *const () as u64, svc_uninstall as *const () as u64];
+        boot::install_protocol_interface(None, &RPM_SVC_GUID, leak(svc) as *const c_void).expect("install rpm services");
     }
     String::from("PARENT_FAKETOUCH installed")
 }
@@ -716,5 +742,141 @@ pub fn report() -> Vec<String> {
         ),
         format!("PARENT_FAKETOUCH seq {}", s.seq.join(" ")),
         format!("PARENT_FAKETOUCH vreg {} l3b={}", s.vreg_seq.join(" "), sensing(s) as u8),
+        format!("PARENT_FAKETOUCH rpm {} raw={} l3b={}", s.rpm_seq.join(" "), s.rpm_raw.is_some() as u8, sensing(s) as u8),
     ]
+}
+
+// ---- the RPM protocols ------------------------------------------------------------------
+
+const NPA_GUID: Guid = guid!("79d6c870-725e-489e-a0a1-27e7a5d0cb35");
+const RPM_SVC_GUID: Guid = guid!("276732ab-bb39-4dce-b5d9-2746cdd6d518");
+const RPM_GUID: Guid = guid!("1bbb8f8e-4a4e-44a0-acf7-35fd849fd900");
+const LDOB: u32 = 0x626f_646c;
+const SWEN: u32 = 0x6e65_7773;
+
+unsafe extern "efiapi" fn npa_other() -> Status {
+    st().rpm_seq.push(String::from("npa-bad"));
+    Status::UNSUPPORTED
+}
+
+/// The services' word 1 (a request of the firmware's own): never the loader's.
+unsafe extern "efiapi" fn svc_misc() -> Status {
+    st().rpm_seq.push(String::from("svc-misc-bad"));
+    Status::UNSUPPORTED
+}
+
+unsafe extern "efiapi" fn svc_install() -> Status {
+    let s = st();
+    if s.rpm_raw.is_some() {
+        s.rpm_seq.push(String::from("install-again"));
+        return Status::INVALID_PARAMETER;
+    }
+    let raw: [u64; 7] = [
+        0x10001,
+        kvp_destroy as *const () as u64,
+        kvp_put as *const () as u64,
+        kvp_clear as *const () as u64,
+        kvp_create as *const () as u64,
+        rpm_post as *const () as u64,
+        rpm_churn as *const () as u64,
+    ];
+    let iface = leak(raw);
+    match unsafe { boot::install_protocol_interface(None, &RPM_GUID, iface as *const c_void) } {
+        Ok(h) => {
+            s.rpm_raw = Some((h, iface));
+            s.rpm_seq.push(String::from("install"));
+            Status::SUCCESS
+        }
+        Err(e) => e.status(),
+    }
+}
+
+unsafe extern "efiapi" fn svc_uninstall() -> Status {
+    let s = st();
+    let Some((h, iface)) = s.rpm_raw.take() else {
+        s.rpm_seq.push(String::from("uninstall-none"));
+        return Status::NOT_FOUND;
+    };
+    s.rpm_seq.push(String::from("uninstall"));
+    match unsafe { boot::uninstall_protocol_interface(h, &RPM_GUID, iface as *const c_void) } {
+        Ok(()) => Status::SUCCESS,
+        Err(e) => e.status(),
+    }
+}
+
+type Pairs = Vec<(u32, u32, u32)>;
+
+unsafe extern "efiapi" fn kvp_create(size: u32, out: *mut *mut Pairs) -> Status {
+    st().rpm_seq.push(format!("create:{size}"));
+    unsafe { *out = Box::into_raw(Box::new(Pairs::new())) };
+    Status::SUCCESS
+}
+
+unsafe extern "efiapi" fn kvp_clear(k: *mut Pairs) -> Status {
+    st().rpm_seq.push(String::from("clear"));
+    unsafe { (*k).clear() };
+    Status::SUCCESS
+}
+
+fn key_name(k: u32) -> String {
+    k.to_le_bytes().iter().filter(|&&b| b != 0).map(|&b| b as char).collect()
+}
+
+unsafe extern "efiapi" fn kvp_put(k: *mut Pairs, key: u32, len: u32, v: *const u32) -> Status {
+    let val = if len == 4 { unsafe { *v } } else { u32::MAX };
+    st().rpm_seq.push(format!("put:{}={}", key_name(key), val));
+    unsafe { (*k).push((key, len, val)) };
+    Status::SUCCESS
+}
+
+unsafe extern "efiapi" fn kvp_destroy(k: *mut Pairs) -> Status {
+    st().rpm_seq.push(String::from("destroy"));
+    drop(unsafe { Box::from_raw(k) });
+    Status::SUCCESS
+}
+
+unsafe extern "efiapi" fn rpm_post(set: u32, ty: u32, id: u32, k: *mut Pairs, out: *mut u32) -> Status {
+    let s = st();
+    let pairs = unsafe { &*k };
+    let swen = match pairs.as_slice() {
+        [(SWEN, 4, v)] if *v <= 1 => Some(*v),
+        _ => None,
+    };
+    let msg = match (set, ty, id, swen) {
+        (0, LDOB, 3, Some(v)) => {
+            s.rpm_ids += 1;
+            s.rpm_pending.push((s.rpm_ids, v));
+            s.rpm_seq.push(format!("post:active:ldob:3:swen={v}:id={}", s.rpm_ids));
+            s.rpm_ids
+        }
+        _ => {
+            s.rpm_seq.push(format!("post-bad:{set}:{}:{id}:{pairs:?}", key_name(ty)));
+            0
+        }
+    };
+    if !out.is_null() {
+        unsafe { *out = msg };
+    }
+    Status::SUCCESS
+}
+
+unsafe extern "efiapi" fn rpm_churn(id: u32) -> Status {
+    let s = st();
+    s.rpm_seq.push(format!("churn:{id}"));
+    if s.mode == Mode::RpmHang {
+        crate::say("PARENT_FAKETOUCH_HANG");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    match s.rpm_pending.iter().position(|p| p.0 == id) {
+        Some(i) => {
+            let (_, v) = s.rpm_pending.remove(i);
+            if let Some(r) = rail(s, 1, 2) {
+                r.0 = v == 1;
+            }
+        }
+        None => s.rpm_seq.push(String::from("churn-bad")),
+    }
+    Status::SUCCESS
 }

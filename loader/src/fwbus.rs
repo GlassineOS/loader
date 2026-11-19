@@ -325,3 +325,146 @@ impl Vreg {
         st
     }
 }
+
+// ---- the RPM request protocols ----------------------------------------------------------
+
+/// The firmware's NPA protocol, its RPM services and the raw RPM request protocol the
+/// services install on demand (`docs/firmware-rpm.md`; spec 005 `touch_rpm`). Only
+/// their first words are read and checked.
+pub const NPA_GUID: Guid = guid!("79d6c870-725e-489e-a0a1-27e7a5d0cb35");
+pub const RPM_SVC_GUID: Guid = guid!("276732ab-bb39-4dce-b5d9-2746cdd6d518");
+pub const RPM_GUID: Guid = guid!("1bbb8f8e-4a4e-44a0-acf7-35fd849fd900");
+pub const NPA: Kind = Kind { key: "npa", guid: NPA_GUID, words: 6, revision: 0x10002 };
+pub const RPM_SVC: Kind = Kind { key: "rpm_svc", guid: RPM_SVC_GUID, words: 4, revision: 0x10002 };
+pub const RPM: Kind = Kind { key: "rpm", guid: RPM_GUID, words: 7, revision: 0x10001 };
+
+/// A protocol as the touch driver's `touch_rpm` stages see it.
+pub fn proto(k: Kind, ram: &Ram, images: &Images) -> (glassine_loader_core::touch::Proto, Option<u64>) {
+    use glassine_loader_core::touch::Proto;
+    match find(k, ram, images) {
+        None => (Proto::Absent, None),
+        Some(f) => match f.check {
+            Ok(()) => (Proto::Ok, f.iface),
+            Err(e) => (Proto::Bad(e), None),
+        },
+    }
+}
+
+/// The RPM services (installs and uninstalls the raw protocol; words 2 and 3, no
+/// arguments) and, once installed and checked, the raw request protocol.
+pub struct Rpm {
+    pub svc: u64,
+    pub raw: Option<u64>,
+}
+
+type Kvp = *mut c_void;
+
+impl Rpm {
+    fn svc_call(&self, word: u64, what: &str) -> Status {
+        type F = unsafe extern "efiapi" fn() -> Status;
+        let f: F = unsafe { core::mem::transmute(rd64_at(self.svc, word) as usize) };
+        log!("TOUCH_RPM {} call", what);
+        let st = unsafe { f() };
+        log!("TOUCH_RPM {} -> {:?}", what, st);
+        st
+    }
+
+    /// Word 2: the raw protocol installed.
+    pub fn install(&self) -> Status {
+        self.svc_call(2, "install")
+    }
+
+    /// Word 3: the raw protocol uninstalled.
+    pub fn uninstall(&self) -> Status {
+        self.svc_call(3, "uninstall")
+    }
+
+    fn raw_word(&self, i: u64) -> Result<u64, Status> {
+        self.raw.map(|r| rd64_at(r, i)).ok_or(Status::NOT_FOUND)
+    }
+
+    /// A KVP set: create (word 4, initial size 0), then clear (word 3), as the
+    /// firmware's own requests start.
+    fn create(&self) -> Result<Kvp, Status> {
+        type Create = unsafe extern "efiapi" fn(u32, *mut Kvp) -> Status;
+        type Clear = unsafe extern "efiapi" fn(Kvp) -> Status;
+        let fc: Create = unsafe { core::mem::transmute(self.raw_word(4)? as usize) };
+        let fl: Clear = unsafe { core::mem::transmute(self.raw_word(3)? as usize) };
+        let mut k: Kvp = core::ptr::null_mut();
+        log!("TOUCH_RPM kvp_create call");
+        let st = unsafe { fc(0, &mut k) };
+        log!("TOUCH_RPM kvp_create -> {:?} kvp={:p}", st, k);
+        if st != Status::SUCCESS || k.is_null() {
+            return Err(if st == Status::SUCCESS { Status::OUT_OF_RESOURCES } else { st });
+        }
+        log!("TOUCH_RPM kvp_clear call");
+        let st = unsafe { fl(k) };
+        log!("TOUCH_RPM kvp_clear -> {:?}", st);
+        Ok(k)
+    }
+
+    /// Word 2: the key `swen`, four bytes, `swen`.
+    fn put_swen(&self, k: Kvp, swen: u32) -> Status {
+        type Put = unsafe extern "efiapi" fn(Kvp, u32, u32, *const c_void) -> Status;
+        let Ok(w) = self.raw_word(2) else { return Status::NOT_FOUND };
+        let f: Put = unsafe { core::mem::transmute(w as usize) };
+        let v = swen;
+        log!("TOUCH_RPM kvp_put swen={} call", swen);
+        let st = unsafe { f(k, glassine_loader_core::touch::RPM_KEY_SWEN, 4, &v as *const u32 as *const c_void) };
+        log!("TOUCH_RPM kvp_put -> {:?}", st);
+        st
+    }
+
+    /// Word 1.
+    fn destroy(&self, k: Kvp) {
+        type Destroy = unsafe extern "efiapi" fn(Kvp) -> Status;
+        let Ok(w) = self.raw_word(1) else { return };
+        let f: Destroy = unsafe { core::mem::transmute(w as usize) };
+        log!("TOUCH_RPM kvp_destroy call");
+        let st = unsafe { f(k) };
+        log!("TOUCH_RPM kvp_destroy -> {:?}", st);
+    }
+
+    /// Create, put `swen`=1, destroy: no message.
+    pub fn kvp_check(&self) -> Status {
+        let k = match self.create() {
+            Ok(k) => k,
+            Err(st) => return st,
+        };
+        let st = self.put_swen(k, 1);
+        self.destroy(k);
+        st
+    }
+
+    /// One active-set request to pm660l LDO3 with only `swen` (post, word 5), waited
+    /// for (churn, word 6; no timeout in the firmware). The message id; id 0: nothing
+    /// was sent, nothing waited for.
+    pub fn vote(&self, swen: u32) -> Result<u32, Status> {
+        use glassine_loader_core::touch::{RPM_L3B_ID, RPM_LDOB};
+        type Post = unsafe extern "efiapi" fn(u32, u32, u32, Kvp, *mut u32) -> Status;
+        type Churn = unsafe extern "efiapi" fn(u32) -> Status;
+        let fp: Post = unsafe { core::mem::transmute(self.raw_word(5)? as usize) };
+        let fc: Churn = unsafe { core::mem::transmute(self.raw_word(6)? as usize) };
+        let k = self.create()?;
+        let st = self.put_swen(k, swen);
+        if st != Status::SUCCESS {
+            self.destroy(k);
+            return Err(st);
+        }
+        let mut id = 0u32;
+        log!("TOUCH_RPM post set=active type=0x{:08x} id={} swen={} call", RPM_LDOB, RPM_L3B_ID, swen);
+        let st = unsafe { fp(0, RPM_LDOB, RPM_L3B_ID, k, &mut id) };
+        log!("TOUCH_RPM post -> {:?} msg_id={}", st, id);
+        if st == Status::SUCCESS && id != 0 {
+            log!("TOUCH_RPM churn msg_id={} call", id);
+            let st = unsafe { fc(id) };
+            log!("TOUCH_RPM churn -> {:?}", st);
+        }
+        self.destroy(k);
+        match (st, id) {
+            (Status::SUCCESS, 0) => Err(Status::NOT_STARTED),
+            (Status::SUCCESS, id) => Ok(id),
+            (st, _) => Err(st),
+        }
+    }
+}
