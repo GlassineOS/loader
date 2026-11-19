@@ -20,7 +20,7 @@ GlassineOS/boot owns the contract:
   options, the answer, the probe report, format 1).
 
 This spec says how the loader meets them. It pins boot at commit
-`c7d1d10de12b9db6acd7c6db95bc69b4069a5b89`. Where the documents and
+`fe79402b2741c82d7b99498e13c262e6de427b7b`. Where the documents and
 this spec differ, the documents win and this spec is corrected.
 
 ## User scenarios
@@ -106,9 +106,6 @@ handle.
   parent didn't announce where the list decides an entry: today only the other system's
   (`other:<name>`, spec 004 FR-004a). Without the word the list is empty: a parent from
   before it (the Note Air's `v3.3-handback`) gets no such answer.
-  This requirement, the record's `other` and the `other:<name>` answer follow boot at
-  `fe79402b2741c82d7b99498e13c262e6de427b7b` (handback.md, "The other system"); the rest
-  of this spec stays at the pin above.
 - **FR-007**: `glassine.log=serial` sends the log to the serial line; without it the
   loader writes to no console. The log is also kept in memory (24 KiB at most) for the
   probe report.
