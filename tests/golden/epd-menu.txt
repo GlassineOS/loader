@@ -1,5 +1,6 @@
 # The stand-in's CRC-32 of the whole framebuffer after each refresh of a start-menu
 # case (tests/qemu/run.py, golden()); the same on every arch and firmware.
+menu-android b80d4716 547d3eab 39c73611
 menu-full 5bc8bd79 a89d136d 39c73611
 menu-glassineos 5bc8bd79 39c73611
 menu-more 5bc8bd79 1141039b cec88ffb 39c73611

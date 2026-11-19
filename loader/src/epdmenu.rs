@@ -297,7 +297,7 @@ fn show(epd: &mut EpdFw, keys: &mut Keys, title: &str, items: &[&str]) -> Shown 
 
 /// Runs the menu on `epd` over the record read at entry (`rec`) and returns the pick.
 /// The caller has made the menu write; the splash and the pick's write follow.
-pub fn run(epd: &mut EpdFw, rec: &InUse, src: Box<dyn TapSource>) -> Choice {
+pub fn run(epd: &mut EpdFw, rec: &InUse, src: Box<dyn TapSource>, other: Option<&str>) -> Choice {
     let (w, h) = epd.size_native();
     unsafe {
         log!("MENU_INPUT {}", src.name());
@@ -314,7 +314,7 @@ pub fn run(epd: &mut EpdFw, rec: &InUse, src: Box<dyn TapSource>) -> Choice {
     ui::start(d, white);
     unsafe { shim_epd_pointer(pointer_read) };
 
-    let main = deploys::main_list(Some(&rec.rec));
+    let main = deploys::main_list(Some(&rec.rec), other);
     let pick = loop {
         let names: Vec<&str> = main.iter().map(|e| e.label.as_str()).collect();
         let i = match show(epd, &mut keys, "Start GlassineOS", &names) {
@@ -330,6 +330,7 @@ pub fn run(epd: &mut EpdFw, rec: &InUse, src: Box<dyn TapSource>) -> Choice {
             Action::Deploy(id) => break Choice::Deploy(id.clone()),
             Action::PreviousKernel => break Choice::PreviousKernel,
             Action::Recovery => break Choice::Recovery,
+            Action::Other(n) => break Choice::Other(n.clone()),
             Action::Back => {}
             Action::More => {
                 let more = deploys::more_list(&rec.rec);

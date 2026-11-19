@@ -101,6 +101,11 @@ handle.
   own C parser checked against the same cases.
 - **FR-006**: The exit is `Exit(EFI_ABORTED, size, data)` with the data in pool memory,
   as `docs/handback.md` says.
+- **FR-006a**: `glassine.answers=<form>,…` names the `boot=` forms the parent acts on
+  besides `baseline`; the loader keeps the list and logs it. It never answers a form the
+  parent didn't announce where the list decides an entry: today only the other system's
+  (`other:<name>`, spec 004 FR-004a). Without the word the list is empty: a parent from
+  before it (the Note Air's `v3.3-handback`) gets no such answer.
 - **FR-007**: `glassine.log=serial` sends the log to the serial line; without it the
   loader writes to no console. The log is also kept in memory (24 KiB at most) for the
   probe report.

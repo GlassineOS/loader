@@ -5,7 +5,7 @@
 //! through the region table, header and image checked, in the raw form), starts it from memory
 //! with the partition's device path, `DeviceHandle` set to the partition and the hand-back load
 //! option, under a 30 s watchdog, and reads the answer from the exit data. It prints, on
-//! the firmware's serial line, what it would boot (`PARENT_BOOT baseline|recovery|set:<id>`)
+//! the firmware's serial line, what it would boot (`PARENT_BOOT baseline|recovery|other`)
 //! and why it fell to the baseline (`PARENT_FLOOR <reason>`), then powers off.
 //!
 //! The partition is the one whose GPT unique identity is [`PARTUUID`]. Extra load
@@ -280,6 +280,16 @@ fn main() -> Status {
             // No block-list reader here: a set is reported, then the baseline.
             say(&format!("PARENT_ANSWER set:{id} rec={rec}"));
             say("PARENT_BOOT baseline");
+        }
+        Ok(Boot::Other(name)) => {
+            // As a parent: only a name it announced (handback.md, "The other system").
+            let cfg = extra_options();
+            let announced = cfg
+                .split(' ')
+                .find_map(|w| w.strip_prefix("glassine.answers="))
+                .is_some_and(|v| v.split(',').any(|f| f.strip_prefix("other:") == Some(name.as_str())));
+            say(&format!("PARENT_ANSWER other:{name} announced={}", announced as u8));
+            say(if announced { "PARENT_BOOT other" } else { "PARENT_BOOT baseline" });
         }
         Err(why) => {
             say(&format!("PARENT_FLOOR {why}"));

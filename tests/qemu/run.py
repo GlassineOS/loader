@@ -2178,6 +2178,38 @@ def menu_on_request_each_entry_by_tap():
             assert fakefw_calls(log)["ptr_reset"] == "0", "Reset called on the pointer"
 
 
+ANDROID = "glassine.answers=recovery,other:android"
+
+
+@case("x86_64", "aarch64")
+def menu_android_only_when_the_board_and_the_parent_name_it():
+    """boot handback.md "The other system", 004 FR-004, FR-005: with the record's
+    other=android and the parent's glassine.answers= naming other:android, the menu has
+    an Android entry before the recovery; its tap answers boot=other:android, not
+    counted. With only one of the two there is no entry, and the menu is the one of
+    menu-recovery frame by frame."""
+    d, log, boot, got = menu_case("menu-android", [row_tap(4, 1)], extra=ANDROID, **MENU_REC, other="android")
+    assert got and got.startswith("format=1 boot=other:android why=choice"), got
+    assert boot == "other" and "PARENT_ANSWER other:android announced=1" in log, log[-800:]
+    assert "MENU_SHOWN Start GlassineOS (6 entries)" in log and "MENU_PICK 4 Android" in log
+    assert "MENU_OTHER record=android offered=android" in log
+    seq, r, _ = d.record()
+    assert seq == 3, (seq, "the menu write and the pick's write")
+    assert (r["request"], r["unmarked"], r["drew"], r["started"], r["other"]) == ("", "0", "", "", "android"), r
+    assert crcs(log)[-1] == EPD_GOLDEN_SPLASH, "the splash after the pick"
+    golden("menu-android", crcs(log))
+    # The record names it, the parent doesn't (v3.3-handback passes no glassine.answers=).
+    d, log, boot, got = menu_case("menu-android-noparent", [row_tap(4, 1)], **MENU_REC, other="android")
+    assert "MENU_SHOWN Start GlassineOS (5 entries)" in log and got.startswith("format=1 boot=recovery"), got
+    assert "MENU_OTHER record=android offered=-" in log
+    golden("menu-recovery", crcs(log))
+    # The parent announces it, the record doesn't name it (a board without LOADER_OTHER).
+    d, log, boot, got = menu_case("menu-android-noboard", [row_tap(4, 1)], extra=ANDROID, **MENU_REC)
+    assert "MENU_SHOWN Start GlassineOS (5 entries)" in log and got.startswith("format=1 boot=recovery"), got
+    assert "MENU_OTHER" not in log
+    golden("menu-recovery", crcs(log))
+
+
 TOUCH_RES = (1872, 1404)  # the touch stand-in's system information
 
 
