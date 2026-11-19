@@ -412,7 +412,7 @@ fn start_menu<S: RecordStore + plan::SplashStore + Log>(
     if !entry.rec.get("other").is_empty() {
         log!("MENU_OTHER record={} offered={}", entry.rec.get("other"), other.as_deref().unwrap_or("-"));
     }
-    let choice = crate::epdmenu::run(epd, entry, src, other.as_deref());
+    let choice = crate::epdmenu::run(epd, entry, src, other.as_deref(), why);
     log!("MENU_CLOSED {:?}", choice);
     epd_splash(store, epd);
     let d = menu::decide(entry, &choice);

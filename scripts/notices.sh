@@ -14,6 +14,8 @@
 #   (BSD-3-Clause) and the sprintf of LV_STDLIB_BUILTIN (MIT);
 # - the built-in font lv_font_montserrat_20: Montserrat and Font Awesome 5 Free symbols,
 #   both SIL OFL 1.1 (texts fetched at pinned commits and checked by SHA-256);
+# - the start menu's fonts glassine_sans_*: converted from IBM Plex Sans (SIL OFL 1.1,
+#   Reserved Font Name "Plex"; loader/c/fonts/OFL.txt and SOURCES);
 # - every crate linked into the program (not proc macros or build tools), from its
 #   registry source; MIT OR Apache-2.0 crates are taken under MIT.
 set -eu
@@ -95,6 +97,12 @@ fi
 	cat "$C/montserrat-OFL.txt"
 	section "Font Awesome 5 Free symbols, in lv_font_montserrat_20 (fonts: SIL OFL 1.1), https://fontawesome.com"
 	cat "$C/fontawesome-LICENSE.txt"
+	section "IBM Plex Sans 1.1.0, converted into glassine_sans_semibold_56 and glassine_sans_regular_40 (SIL OFL 1.1), https://github.com/IBM/plex"
+	echo "The start menu's fonts are a Modified Version of IBM Plex Sans (bitmaps of a subset"
+	echo "of its glyphs, made by tools/menu-fonts.sh); under the licence they do not carry the"
+	echo "Reserved Font Name. Source and checksums: loader/c/fonts/SOURCES."
+	echo
+	cat "$P/loader/c/fonts/OFL.txt"
 	crates glassine-loader "$ARCH-unknown-uefi"
 } > "$OUT.tmp"
 mv "$OUT.tmp" "$OUT"

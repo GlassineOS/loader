@@ -58,8 +58,7 @@
 /* Fonts */
 #define LV_FONT_MONTSERRAT_14  0
 #define LV_FONT_MONTSERRAT_20  1
-/* The start menu on an e-ink panel (spec 004): readable at about 230 dpi. */
-#define LV_FONT_MONTSERRAT_40  1
+/* The start menu on an e-ink panel (spec 004) draws with its own fonts (c/fonts). */
 #define LV_FONT_DEFAULT        LV_FONT_DEFAULT_MONTSERRAT_20
 #define LV_USE_FONT_PLACEHOLDER 1
 #define LV_USE_FONT_COMPRESSED 0
