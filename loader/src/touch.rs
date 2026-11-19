@@ -22,10 +22,10 @@ pub struct Fw {
     gpio: Gpio,
     i2c: I2c,
     bus: Option<Bus>,
-    /// The PMIC regulator protocol, when found and passing its checks (else the rail
-    /// calls give an error and nothing is touched).
+    /// The PMIC regulator protocol, when found and passing its checks (else the
+    /// supplies read as an error); only read.
     vreg: Option<Vreg>,
-    /// The RPM services and raw request protocol, once looked up (`touch_rpm`).
+    /// The RPM services and raw request protocol, once looked up (the vote).
     rpm: Option<Rpm>,
     /// Log every I2C read (the bring-up) or only failed ones (the tap source's polls).
     pub quiet_reads: bool,
@@ -120,9 +120,6 @@ impl Hw for Fw {
     fn rail_get(&mut self, pmic: u32, ldo: u32) -> Result<(bool, u32), String> {
         self.vreg.as_ref().ok_or("none")?.get(pmic, ldo).map_err(|s| format!("{s:?}"))
     }
-    fn rail_enable(&mut self, pmic: u32, ldo: u32, on: bool) -> Result<(), String> {
-        st(self.vreg.as_ref().ok_or("none")?.enable(pmic, ldo, on))
-    }
     fn rpm_locate(&mut self) -> RpmFound {
         let ram = crate::fwgop::Ram::read();
         let images = crate::fwgop::Images::read(&ram);
@@ -193,7 +190,7 @@ pub fn probe() -> Vec<String> {
     log!("TOUCH_START probe");
     // The bring-up takes up to its deadline (10 s): a full watchdog period ahead of it.
     crate::watchdog::arm();
-    let up = touch::bring_up_rpm(&mut fw, false, RAIL.load(Ordering::Relaxed), rpm());
+    let up = touch::bring_up_rpm(&mut fw, false, rpm());
     log!("TOUCH_DONE {}", up.lines.last().map(|l| l.1.as_str()).unwrap_or(""));
     log!("TOUCH_QUIET empty_reads={} irq_reads={}", fw.empty_reads, fw.irq_reads);
     up.lines.iter().map(|(k, v)| format!("{k}={v}")).collect()
@@ -207,17 +204,9 @@ pub fn set_on(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// Whether the record asks the driver to turn the controller's supplies on
-/// (`touch_rail=on`), set by the hand-back before a bring-up.
-static RAIL: AtomicBool = AtomicBool::new(false);
-
-pub fn set_rail(on: bool) {
-    RAIL.store(on, Ordering::Relaxed);
-}
-
-/// The record's `touch_rpm` stage (0: none), set by the hand-back after the write that
-/// clears the key.
-static RPM_STAGE: AtomicU8 = AtomicU8::new(0);
+/// The RPM stage of the next bring-up (0: none; the vote by default), set by the
+/// hand-back after the write that clears `touch_rpm`.
+static RPM_STAGE: AtomicU8 = AtomicU8::new(RpmStage::Vote as u8 + 1);
 
 pub fn set_rpm(stage: Option<RpmStage>) {
     RPM_STAGE.store(stage.map_or(0, |s| s as u8 + 1), Ordering::Relaxed);
@@ -369,7 +358,7 @@ impl TapSource for Source {
             log!("TOUCH_START menu");
             crate::watchdog::arm();
             self.fw.quiet_reads = false;
-            let up = touch::bring_up_rpm(&mut self.fw, true, RAIL.load(Ordering::Relaxed), rpm());
+            let up = touch::bring_up_rpm(&mut self.fw, true, rpm());
             self.fw.quiet_reads = true;
             self.seen.empty_at_up = self.fw.empty_reads;
             for (k, v) in &up.lines {

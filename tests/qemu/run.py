@@ -1565,45 +1565,17 @@ def touch_probe_follows_linuxs_probe_on_the_device():
 
 @case("x86_64", "aarch64")
 def touch_probe_reads_the_supplies_and_releases_the_pins():
-    """005 FR-005, FR-008, FR-017: the two supplies read only (status and level, no
-    write) and reported; with touch_rail=on pm660l LDO3, found off at 3.008 V (in the
-    controller's range), only enabled (no set level) before the power switches and
-    disabled after them at the power-down, with the firmware's argument convention;
-    then the three driven pins configured as inputs."""
+    """005 FR-005, FR-008, FR-018: the two supplies read only (status and level, no
+    write) and reported; LDO3 found on: no RPM call; then the three driven pins
+    configured as inputs."""
     d, log, keys, c, seq = touch_run("touch-rails", "1")
     assert keys["touch.rail.l3b"] == "on 3008 mV" and keys["touch.rail.l11a"] == "on 1800 mV", keys
     calls, l3b = faketouch_vreg(log)
     assert calls and all(re.fullmatch(r"(st|lvl)\d\.\d+", x) for x in calls), calls
-    assert "touch.rail.on" not in keys and keys["touch.release"] == "inputs: 66, 62, 61", keys
+    assert keys["touch.rpm"] == "skipped l3b on 3008 mV" and faketouch_rpm(log)[0] == [], (keys, faketouch_rpm(log))
+    assert keys["touch.release"] == "inputs: 66, 62, 61", keys
     last = len(seq) - 1 - seq[::-1].index("set61=0")
     assert seq[last + 1:last + 4] == ["cfg66i", "cfg62i", "cfg61i"], seq
-    # touch_rail=on with LDO3 off: on for the bring-up, off at the end.
-    d, log, keys, c, seq = touch_run("touch-rail-on", "rail-off", record=hb_record(touch="probe", touch_rail="on"))
-    assert keys["touch.rail.l3b"] == "off 3008 mV", keys
-    assert keys["touch.rail.on"] == "l3b turned on on 3008 mV, l11a already on 1800 mV", keys
-    assert keys["touch.rail.off"] == "l3b off", keys
-    calls, l3b = faketouch_vreg(log)
-    # Only the enable, with the firmware's convention (PMIC 1 = pm660l, id 2 = LDO3, a
-    # byte 1 then 0); never set level.
-    assert [x for x in calls if x[:3] in ("set", "ctl")] == ["ctl1.2=1", "ctl1.2=0"] and not l3b, calls
-    assert log.index("TOUCH_PMIC control p1 l3 1") < log.index("TOUCH_GPIO set 61 1"), log[-3000:]
-    assert log.rindex("TOUCH_GPIO set 61 0") < log.index("TOUCH_PMIC control p1 l3 0"), log[-3000:]
-    # Without the key: nothing written.
-    d, log, keys, c, seq = touch_run("touch-rail-off", "rail-off")
-    assert "touch.rail.on" not in keys and not [x for x in faketouch_vreg(log)[0] if x[:3] in ("set", "ctl")], keys
-
-
-@case("x86_64", "aarch64")
-def touch_on_with_touch_rail_taps_a_panel_that_needs_ldo3():
-    """005 FR-016, FR-017: a controller that senses only with pm660l LDO3 on: with
-    touch_rail=on the menu's taps come through, the menu's summary counts the frames
-    by report id, and LDO3 is off again when the menu closes."""
-    d, log, boot, got = touch_menu("touch-menu-rail", [touch_tap(4, 1)], mode="rail-off", touch_rail="on")
-    assert got and got.startswith("format=1 boot=recovery"), (got, log[-2000:])
-    m = re.search(r"TOUCH_MENU polls=(\d+) irq_low=(\d+) irq_changes=(\d+) empty=(\d+) sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
-    assert m and int(m[5]) == 6 and int(m[6]) == 6 and int(m[1]) >= int(m[5]), log[-2000:]
-    assert "TOUCH_DOWN touch.rail.off=l3b off" in log and not faketouch_vreg(log)[1], log[-2000:]
-    assert not [x for x in faketouch_vreg(log)[0] if x.startswith(("set", "ctl-bad"))], faketouch_vreg(log)
 
 
 def faketouch_rpm(log):
@@ -1643,14 +1615,15 @@ def touch_rpm_stages_up_to_kvp_send_no_message():
 
 
 @case("x86_64", "aarch64")
-def touch_rpm_vote_switches_ldo3_and_takes_it_back():
-    """005 FR-018: touch=probe touch_rpm=vote touch_rail=on with LDO3 off: the PMIC
-    protocol never written; the watchdog re-armed, one active-set request to ldob id 3
+def touch_probe_votes_ldo3_on_when_it_reads_off():
+    """005 FR-018: touch=probe with LDO3 off, no other key (an old touch_rail=on is
+    ignored): the PMIC protocol never written; the watchdog re-armed, one active-set
+    request to ldob id 3
     with only swen=1, churned; LDO3 read back on before the power switches; the bring-up
     ok; at the power-down swen=0, LDO3 read back off, the raw protocol uninstalled."""
-    rec = hb_record(touch="probe", touch_rpm="vote", touch_rail="on")
+    rec = hb_record(touch="probe", touch_rail="on")
     d, log, keys, c, seq = touch_run("touch-rpm-vote", "rail-off", record=rec)
-    assert keys["touch.rail.on"] == "ignored touch_rpm", keys
+    assert "touch.rail.on" not in keys and "touch.rpm" not in keys, keys
     assert keys["touch.rpm.vote"] == "id=1 l3b on 3008 mV" and keys["touch.rpm.off"] == "id=2 l3b off 3008 mV", keys
     calls, raw, l3b = faketouch_rpm(log)
     assert calls == ["install", "create:0", "clear", "put:swen=1", "destroy",
@@ -1667,28 +1640,37 @@ def touch_rpm_vote_switches_ldo3_and_takes_it_back():
 
 
 @case("x86_64", "aarch64")
-def touch_on_with_touch_rpm_taps_a_panel_that_needs_ldo3():
-    """005 FR-018: touch=on touch_rpm=vote request=menu: touch_rpm cleared in the menu
-    write before the tap source's first RPM call; LDO3 voted on, the menu's taps come
-    through; the vote taken back and the protocol uninstalled when the menu closes."""
-    d, log, boot, got = touch_menu("touch-menu-rpm", [touch_tap(4, 1)], mode="rail-off", touch_rpm="vote")
+def touch_on_votes_ldo3_and_taps_a_panel_that_needs_it():
+    """005 FR-016, FR-018: touch=on request=menu with LDO3 off, no other key: the menu
+    write sets touch_voting=1 before the tap source's first RPM call; LDO3 voted on, the
+    menu's taps come through, the summary counts the frames by report id; the vote
+    taken back and the protocol uninstalled when the menu closes; the pick's write
+    clears touch_voting."""
+    d, log, boot, got = touch_menu("touch-menu-rpm", [touch_tap(4, 1)], mode="rail-off")
     assert got and got.startswith("format=1 boot=recovery"), (got, log[-2000:])
-    assert d.record()[1].get("touch_rpm", "") == "", d.record()
+    assert d.record()[1].get("touch_voting", "") == "", d.record()
     assert log.index("MENU_OPEN") < log.index("TOUCH_RPM"), log[-3000:]
     assert "TOUCH_UP touch.rpm.vote=id=1 l3b on 3008 mV" in log, log[-3000:]
     assert "TOUCH_DOWN touch.rpm.off=id=2 l3b off 3008 mV" in log and "TOUCH_DOWN touch.rpm.uninstall=ok" in log, log[-3000:]
     calls, raw, l3b = faketouch_rpm(log)
     assert not raw and not l3b and not [x for x in calls if "bad" in x], calls
-    m = re.search(r"TOUCH_MENU polls=\d+ irq_low=\d+ irq_changes=\d+ empty=\d+ sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
-    assert m and int(m[1]) == 6, log[-2000:]
+    assert not [x for x in faketouch_vreg(log)[0] if x[:3] in ("set", "ctl")], faketouch_vreg(log)
+    m = re.search(r"TOUCH_MENU polls=(\d+) irq_low=\d+ irq_changes=\d+ empty=\d+ sentinels=0 frames=(\d+) ids=01:(\d+) errors=0", log)
+    assert m and int(m[2]) == 6 and int(m[3]) == 6 and int(m[1]) >= int(m[2]), log[-2000:]
+    # touch_rpm=off: no RPM call, LDO3 stays off, so no tap senses (the menu's timeout).
+    d, log, boot, got = touch_menu("touch-menu-rpm-off", [], mode="rail-off", touch_rpm="off")
+    assert faketouch_rpm(log)[0] == [] and "TOUCH_UP touch.rpm=off" in log, log[-3000:]
+    assert d.record()[1].get("touch_rpm", "") == "" and d.record()[1].get("touch_voting", "") == "", d.record()
 
 
 @case("x86_64", "aarch64")
 def touch_rpm_a_churn_that_never_returns_ends_in_the_watchdog():
     """005 FR-018, FR-004: the RPM never acknowledges (the firmware's wait has no
-    timeout): the watchdog, re-armed for 30 s before the post, resets the machine; the
-    record has touch and touch_rpm cleared, and the next start makes no RPM call."""
-    d = hb_disk("touch-rpm-hang", hb_record(touch="probe", touch_rpm="vote"), cfg="parent.faketouch=rpm-hang")
+    timeout): the watchdog, re-armed for 30 s before the post, resets the machine. With
+    touch=probe the record has touch cleared and the next start makes no RPM call. In
+    the menu (touch=on) the record keeps touch_voting=1 from the menu write; a menu
+    that finds it makes no RPM call, opens and closes as usual and clears it."""
+    d = hb_disk("touch-rpm-hang", hb_record(touch="probe"), cfg="parent.faketouch=rpm-hang")
     vm = VM("touch-rpm-hang", d)
     vm.finish(timeout=150)
     log = vm.log()
@@ -1696,9 +1678,23 @@ def touch_rpm_a_churn_that_never_returns_ends_in_the_watchdog():
     hang = log.index("PARENT_FAKETOUCH_HANG")
     assert log.rindex("PARENT_WATCHDOG 30", 0, hang) > log.rindex("TOUCH_RPM kvp_destroy", 0, hang), log[-2000:]
     r = d.record()[1]
-    assert r.get("touch", "") == "" and r.get("touch_rpm", "") == "", r
+    assert r.get("touch", "") == "", r
     log, boot, floor, _ = parent_run("touch-rpm-hang-2", d)
     assert boot == "baseline" and "TOUCH_RPM" not in log, (boot, log[-800:])
+    # The menu: the hang, touch_voting=1 left behind.
+    d = menu_disk("touch-menu-hang", extra="parent.nopointer=1 parent.faketouch=rpm-hang", touch="on", **MENU_REC)
+    vm = VM("touch-menu-hang", d)
+    vm.finish(timeout=150)
+    log = vm.log()
+    assert "PARENT_FAKETOUCH_HANG" in log and "PARENT_POWEROFF" not in log, log[-800:]
+    r = d.record()[1]
+    assert r.get("touch_voting") == "1" and r.get("touch") == "on", r
+    # The next menu (request=menu again) with that record: no vote, the menu as usual.
+    d = menu_disk("touch-menu-hang-2", extra="parent.nopointer=1 parent.faketouch=rpm-hang", touch="on", touch_voting="1", **MENU_REC)
+    log, boot, got = menu_run("touch-menu-hang-2", d)
+    assert "PARENT_FAKETOUCH_HANG" not in log and faketouch_rpm(log)[0] == [], log[-2000:]
+    assert "TOUCH_RPM touch_voting=1: the last menu never closed, no vote in this one" in log, log[-2000:]
+    assert "MENU_TIMEOUT" in log and d.record()[1].get("touch_voting", "") == "", (d.record(), log[-1500:])
 
 
 @case("x86_64", "aarch64")
@@ -2200,6 +2196,74 @@ def touch_menu(name, taps, mode="1", **keys):
     d = menu_disk(name, extra=extra, touch="on", **MENU_REC, **keys)
     log, boot, ans = menu_run(name, d)
     return d, log, boot, ans
+
+
+# The deployment list as GlassineOS/boot's glassine-deploy writes it into the record
+# (its test/bootraw checks the same text): previous, candidate, failed, then the kept
+# ones by id, each labelled "<base> <created date>".
+DEPLOY_LIST = dict(deploys="4", deploy1="20261115-102217 previous e4ffb6ec 2026-11-15",
+                   deploy2="20261118-090000 candidate f00dcafe 2026-11-18",
+                   deploy3="20261116-120000 failed f00dcafe 2026-11-16",
+                   deploy4="20261101-080000 kept e4ffb6ec 2026-11-01")
+
+
+@case("x86_64", "aarch64")
+def menu_lists_every_deployment_of_the_record():
+    """004 FR-004, 010 FR-039/FR-040: the record's whole list (previous, candidate,
+    failed, kept) in the menu: the first list names the previous deployment by its label
+    and offers More; More lists the candidate, the failed and the kept one, then Back;
+    a pick there answers with that deployment's glassine.deploy.once."""
+    keys = dict(MENU_REC)
+    keys.update(DEPLOY_LIST)
+    d = menu_disk("menu-deploys", [row_tap(2, 1), row_tap(1, 3)], **keys)
+    log, boot, ans = menu_run("menu-deploys", d)
+    shown = re.findall(r"MENU_SHOWN ([^\r\n]*)", log)
+    assert shown[:2] == ["Start GlassineOS (5 entries)", "Deployments (4 entries)"], shown
+    assert "MENU_PICK 2 More deployments" in log, log[-2000:]
+    assert "MENU_PICK more 1 Failed: f00dcafe 2026-11-16" in log, log[-2000:]
+    assert ans and "cmdline_add=glassine.deploy.once=20261116-120000" in ans, (ans, log[-2000:])
+    entries = re.findall(r"MENU_ENTRY ([^\r\n]*)", log)
+    assert entries[:9] == ["0 GlassineOS", "1 Previous deployment: e4ffb6ec 2026-11-15", "2 More deployments",
+                           "3 Previous kernel", "4 Recovery", "0 Candidate: f00dcafe 2026-11-18",
+                           "1 Failed: f00dcafe 2026-11-16", "2 Kept: e4ffb6ec 2026-11-01", "3 Back"], entries
+    assert d.record()[1].get("deploy_once", "") == "", d.record()
+
+
+@case("x86_64", "aarch64")
+def menu_a_deployment_pick_through_the_record_under_a_parent_without_a_command_line():
+    """004 FR-004/FR-005, boot docs/handback.md: under a parent that passes no command
+    line and boots no kernel set (parent_cmdline=no, parent_sets=no: the Note Air's
+    ABL), a deployment pick writes deploy_once=<id> in the pick's write and answers as
+    the GlassineOS pick, without cmdline_add; "Previous kernel" is not offered. The next
+    menu's other pick clears a deploy_once still there."""
+    keys = dict(MENU_REC)
+    keys.update(DEPLOY_LIST, parent_cmdline="no", parent_sets="no")
+    d = menu_disk("menu-deploy-once", [row_tap(1, 1)], **keys)
+    log, boot, ans = menu_run("menu-deploy-once", d)
+    entries = re.findall(r"MENU_ENTRY ([^\r\n]*)", log)
+    assert entries[:4] == ["0 GlassineOS", "1 Previous deployment: e4ffb6ec 2026-11-15", "2 More deployments", "3 Recovery"], entries
+    assert ans and f"boot=set:{SET_A}" in ans and "cmdline_add" not in ans, (ans, log[-2000:])
+    r = d.record()[1]
+    assert r.get("deploy_once") == "20261115-102217" and r["started_why"] == "default", r
+    keys.update(deploy_once="20261115-102217")
+    d = menu_disk("menu-deploy-once-2", [row_tap(0, 1)], **keys)
+    log, boot, ans = menu_run("menu-deploy-once-2", d)
+    assert ans and "cmdline_add" not in ans and d.record()[1].get("deploy_once", "") == "", (ans, d.record())
+    # The device's record shape: default empty, so the deployment pick answers the
+    # baseline (the parent's own boot, boot_b on the Note Air) and writes deploy_once.
+    keys = dict(MENU_REC)
+    keys.update(DEPLOY_LIST, parent_cmdline="no", parent_sets="no", default="", default_rec="")
+    d = menu_disk("menu-deploy-once-3", [row_tap(1, 1)], **keys)
+    log, boot, ans = menu_run("menu-deploy-once-3", d)
+    assert ans and "boot=baseline" in ans and "cmdline_add" not in ans, (ans, log[-2000:])
+    assert d.record()[1].get("deploy_once") == "20261115-102217", d.record()
+    # A start without the menu that finds one (its start never reached the
+    # initramfs): its count write clears it; the ordinary answer.
+    keys.update(request="", deploy_once="20261115-102217")
+    d = menu_disk("menu-deploy-once-4", **keys)
+    log, boot, ans = menu_run("menu-deploy-once-4", d)
+    assert ans and "boot=baseline" in ans and "MENU_SHOWN" not in log, (ans, log[-2000:])
+    assert d.record()[1].get("deploy_once", "") == "", d.record()
 
 
 @case("x86_64", "aarch64")

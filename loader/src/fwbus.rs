@@ -261,9 +261,9 @@ impl Bus {
 
 // ---- the PMIC regulator protocol --------------------------------------------------------
 
-/// The only regulators the touch driver reads or switches (spec 005): pm660l LDO3
-/// (PMIC 1) and pm660 LDO11 (PMIC 0). It never calls set level (on the device it hung
-/// inside the firmware, 900E).
+/// The only regulators the touch driver reads (spec 005): pm660l LDO3 (PMIC 1) and
+/// pm660 LDO11 (PMIC 0). Read only: both writes of this protocol (set level, enable)
+/// ended the device's firmware (900E); LDO3 is switched by the RPM vote.
 fn vreg_allowed(pmic: u32, ldo: u32) -> bool {
     matches!((pmic, ldo), (1, 3) | (0, 11))
 }
@@ -311,18 +311,6 @@ impl Vreg {
             return Err(st);
         }
         Ok((status[3] == 1, level))
-    }
-
-    /// Enables or disables it (word 1).
-    pub fn enable(&self, pmic: u32, ldo: u32, on: bool) -> Status {
-        if !vreg_allowed(pmic, ldo) {
-            return Status::ACCESS_DENIED;
-        }
-        type Control = unsafe extern "efiapi" fn(u32, u32, u8) -> Status;
-        let f: Control = unsafe { core::mem::transmute(self.word(1) as usize) };
-        let st = unsafe { f(pmic, ldo - 1, on as u8) };
-        log!("TOUCH_PMIC control p{} l{} {} -> {:?}", pmic, ldo, on as u8, st);
-        st
     }
 }
 

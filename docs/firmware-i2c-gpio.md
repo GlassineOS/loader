@@ -97,7 +97,7 @@ GUID and the call layout are used here, in this project's words):
   ended in the SoC's crash-dump mode**: set level, then the enable call alone. LDO3
   belongs to the RPM, and the firmware's RPM-side resources don't include it. The
   loader switches it through the RPM instead (`docs/firmware-rpm.md`, spec 005
-  `touch_rpm`); this protocol is then used only to read it back.
+  FR-018) and never writes this protocol: it only reads the supplies (status, level).
 - **`Status`**, 20 bytes: four `u32` (pull-down on, the switching mode, pin control on,
   software enable on: 1 = on), then one byte, 1 when the regulator reports its output
   good. The loader passes a zeroed 32-byte buffer.

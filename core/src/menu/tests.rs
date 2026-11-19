@@ -164,6 +164,22 @@ fn each_pick_answers_and_writes() {
         vec![("unmarked", "2".into()), ("started", A.into()), ("started_why", "default".into()), ("drew", S::new())]
     );
 
+    // A parent that passes no command line: the deployment into the record
+    // (deploy_once), the same answer without cmdline_add; another pick clears it.
+    let r = rec(&[("request", "menu"), ("default", A), ("default_rec", "aa"), ("parent_cmdline", "no")], true);
+    let d = decide(&r, &Choice::Deploy("d1".into()));
+    assert_eq!((d.answer.boot.clone(), d.answer.cmdline_add.clone()), (Boot::Set { id: A.into(), rec: "aa".into() }, None));
+    assert!(pick_write(&r, &d).contains(&("deploy_once", "d1".into())), "{:?}", pick_write(&r, &d));
+    let r = rec(&[("request", "menu"), ("parent_cmdline", "no"), ("deploy_once", "d1")], true);
+    let d = decide(&r, &Choice::Ordinary);
+    assert_eq!(d.answer, Answer::new(Boot::Baseline, "default"));
+    assert!(pick_write(&r, &d).contains(&("deploy_once", S::new())));
+    let d = decide(&r, &Choice::Recovery);
+    assert!(pick_write(&r, &d).contains(&("deploy_once", S::new())));
+    // The menu write clears a deploy_once left by an earlier pick.
+    let r = rec(&[("request", "menu"), ("deploy_once", "d1")], true);
+    assert!(open_write(&r).contains(&("deploy_once", S::new())));
+    assert!(!open_write(&rec(&[("request", "menu")], true)).iter().any(|(k, _)| *k == "deploy_once"));
     // A deployment at the limit with no previous set: the recovery, no once-word.
     let r = rec(&[("unmarked", "3")], true);
     let d = decide(&r, &Choice::Deploy("d1".into()));
