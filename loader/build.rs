@@ -31,6 +31,8 @@ fn main() {
     let mut srcs = Vec::new();
     collect(&lvgl.join("src"), &mut srcs);
     srcs.push(root.join("c/shim.c"));
+    srcs.push(root.join("c/menu_art.c"));
+    collect(&root.join("c/fonts"), &mut srcs);
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_flags: &[&str] = match arch.as_str() {
@@ -53,6 +55,7 @@ fn main() {
         "-fdata-sections",
         "-Wno-everything",
         "-DLV_CONF_INCLUDE_SIMPLE",
+        "-DLV_LVGL_H_INCLUDE_SIMPLE",
     ]
     .iter())
     .map(|s| s.to_string())

@@ -65,12 +65,24 @@ pub fn other_label(name: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The entry's name in the log and the PC list.
     pub label: String,
     pub action: Action,
+    /// The deployment behind a [`Action::Deploy`] entry, for the start menu's card.
+    pub deploy: Option<Deployment>,
 }
 
 fn e(label: String, action: Action) -> Entry {
-    Entry { label, action }
+    Entry { label, action, deploy: None }
+}
+
+fn d(label: String, dep: &Deployment) -> Entry {
+    Entry { label, action: Action::Deploy(dep.id.clone()), deploy: Some(dep.clone()) }
+}
+
+/// What a deployment is called in a list: its label, else its id.
+pub fn shown_name(d: &Deployment) -> String {
+    name(d)
 }
 
 fn name(d: &Deployment) -> String {
@@ -91,7 +103,7 @@ pub fn main_list(rec: Option<&Record>, other: Option<&str>) -> Vec<Entry> {
         out.push(e("GlassineOS".into(), Action::Continue));
         let ds = list(r);
         if let Some(p) = ds.iter().find(|d| d.state == "previous") {
-            out.push(e(format!("Previous deployment: {}", name(p)), Action::Deploy(p.id.clone())));
+            out.push(d(format!("Previous deployment: {}", name(p)), p));
         }
         if ds.iter().any(|d| d.state != "previous") {
             out.push(e("More deployments".into(), Action::More));
@@ -128,7 +140,7 @@ pub fn more_list(rec: &Record) -> Vec<Entry> {
                 "failed" => "Failed",
                 _ => "Kept",
             };
-            e(format!("{s}: {}", name(d)), Action::Deploy(d.id.to_string()))
+            self::d(format!("{s}: {}", name(d)), d)
         })
         .collect();
     out.push(e("Back".into(), Action::Back));
@@ -157,7 +169,7 @@ mod tests {
         let acts: Vec<&Action> = m.iter().map(|x| &x.action).collect();
         assert_eq!(acts, [&Action::Continue, &Action::Deploy("d1".into()), &Action::More, &Action::PreviousKernel, &Action::Recovery]);
         let m = main_list(Some(&r), Some("android"));
-        assert_eq!(m[4], Entry { label: "Android".into(), action: Action::Other("android".into()) });
+        assert_eq!(m[4], Entry { label: "Android".into(), action: Action::Other("android".into()), deploy: None });
         assert_eq!(m[5].action, Action::Recovery);
         assert_eq!(m[1].label, "Previous deployment: 3.24.1 2026-11-01");
         let more = more_list(&r);

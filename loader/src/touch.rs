@@ -353,6 +353,10 @@ impl TapSource for Source {
         "loader-cyttsp5"
     }
 
+    fn failed(&self) -> bool {
+        matches!(self.state, State::Failed)
+    }
+
     fn poll(&mut self) -> Option<(bool, u32, u32)> {
         if let State::Offered = self.state {
             log!("TOUCH_START menu");
