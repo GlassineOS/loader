@@ -193,6 +193,18 @@ fn each_pick_answers_and_writes() {
 }
 
 #[test]
+fn the_other_system_is_not_counted_and_leaves_a_request() {
+    // boot docs/handback.md, "The other system": answered by name, `unmarked` as read,
+    // `drew` cleared; a request stays for a GlassineOS start.
+    let r = rec(&[("default", A), ("default_rec", "aa"), ("unmarked", "1"), ("request", "recovery")], true);
+    let d = decide(&r, &Choice::Other("android".into()));
+    assert_eq!((d.answer.clone(), d.counted), (Answer::new(Boot::Other("android".into()), "choice"), false));
+    assert_eq!(pick_write(&r, &d), vec![("unmarked", "1".into()), ("drew", S::new())]);
+    // A failed pick's write: the baseline, not the other system.
+    assert_eq!(not_written(&Choice::Other("android".into())), Answer::new(Boot::Baseline, "not-written"));
+}
+
+#[test]
 fn rectangles_merge_and_map_to_aligned_native() {
     let r = |x, y, w, h| Rect { x, y, w, h };
     // Strips of one area become one; far-apart areas stay apart; past four, the box.

@@ -49,8 +49,18 @@ pub enum Action {
     More,
     PreviousKernel,
     Recovery,
+    /// The parent's other system, by name.
+    Other(String),
     /// Back to the first list.
     Back,
+}
+
+/// The label of the other system's entry.
+pub fn other_label(name: &str) -> String {
+    match name {
+        "android" => "Android".into(),
+        n => n.into(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,12 +78,14 @@ fn name(d: &Deployment) -> String {
 }
 
 /// The first list (010 FR-039): GlassineOS, the previous deployment, "More", the
-/// previous kernel, the recovery. An entry with nothing behind it is left out, and the
-/// previous kernel under a parent that can't boot a kernel set (`parent_sets=no`, the
-/// board's `LOADER_PARENT_SETS`, boot `docs/handback.md`). `rec` is
-/// the record in use, if any. The firmware's set-up of FR-039 is not offered: it needs
-/// a firmware variable written at a start, which 010 FR-031 rules out.
-pub fn main_list(rec: Option<&Record>) -> Vec<Entry> {
+/// previous kernel, the other system, the recovery. An entry with nothing behind it is
+/// left out, and the previous kernel under a parent that can't boot a kernel set
+/// (`parent_sets=no`, the board's `LOADER_PARENT_SETS`, boot `docs/handback.md`). `rec` is
+/// the record in use, if any; `other` the parent's other system when both the record and
+/// the parent name it (only under a parent, [`other_offered`]). The firmware's set-up of
+/// FR-039 is not offered: it needs a firmware variable written at a start, which 010
+/// FR-031 rules out.
+pub fn main_list(rec: Option<&Record>, other: Option<&str>) -> Vec<Entry> {
     let mut out = Vec::new();
     if let Some(r) = rec {
         out.push(e("GlassineOS".into(), Action::Continue));
@@ -87,9 +99,21 @@ pub fn main_list(rec: Option<&Record>) -> Vec<Entry> {
         if !r.get("previous").is_empty() && r.get("parent_sets") != "no" {
             out.push(e("Previous kernel".into(), Action::PreviousKernel));
         }
+        if let Some(n) = other {
+            out.push(e(other_label(n), Action::Other(n.into())));
+        }
     }
     out.push(e("Recovery".into(), Action::Recovery));
     out
+}
+
+/// The other system the start menu offers (boot `docs/handback.md`, "The other system"):
+/// the record's `other`, when it is a valid name and the parent announced `other:<name>`
+/// in `glassine.answers=` (`answers`: that word's forms). Else none.
+pub fn other_offered(rec: &Record, answers: &[&str]) -> Option<String> {
+    let n = rec.get("other");
+    let form = format!("other:{n}");
+    (crate::answer::is_other_name(n) && answers.contains(&form.as_str())).then(|| n.to_string())
 }
 
 /// The other deployments (010 FR-040): the candidate, the last failed one and the kept
@@ -129,9 +153,12 @@ mod tests {
         assert_eq!(l.len(), 3);
         assert_eq!(l[0].label, "3.24.1 2026-11-01");
         assert_eq!(l[2], Deployment { id: "d4".into(), state: "kept".into(), label: "".into() });
-        let m = main_list(Some(&r));
+        let m = main_list(Some(&r), None);
         let acts: Vec<&Action> = m.iter().map(|x| &x.action).collect();
         assert_eq!(acts, [&Action::Continue, &Action::Deploy("d1".into()), &Action::More, &Action::PreviousKernel, &Action::Recovery]);
+        let m = main_list(Some(&r), Some("android"));
+        assert_eq!(m[4], Entry { label: "Android".into(), action: Action::Other("android".into()) });
+        assert_eq!(m[5].action, Action::Recovery);
         assert_eq!(m[1].label, "Previous deployment: 3.24.1 2026-11-01");
         let more = more_list(&r);
         assert_eq!(more.len(), 3);
@@ -146,13 +173,25 @@ mod tests {
         let r = rec(&format!("deploys=40\ndeploy1=d1 staged x\ndeploy2=d2 kept {label65}\ndeploy3=d3 kept caf\u{e9}\ndeploy4=d 4 kept\ndeploy33=d33 kept x\n"));
         assert!(list(&r).is_empty(), "{:?}", list(&r));
         assert!(list(&rec("deploys=x\ndeploy1=d1 kept x\n")).is_empty());
-        let m = main_list(Some(&rec("previous=\ndeploys=0\n")));
+        let m = main_list(Some(&rec("previous=\ndeploys=0\n")), None);
         assert_eq!(m.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["GlassineOS", "Recovery"]);
         // A parent that can't boot a kernel set: no "Previous kernel".
         let r = rec("previous=0123456789abcdef\nparent_sets=no\ndeploys=0\n");
-        assert!(!main_list(Some(&r)).iter().any(|x| x.action == Action::PreviousKernel));
-        let m = main_list(None);
+        assert!(!main_list(Some(&r), None).iter().any(|x| x.action == Action::PreviousKernel));
+        let m = main_list(None, Some("android"));
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].action, Action::Recovery);
+    }
+
+    #[test]
+    fn the_other_system_needs_the_record_and_the_parent() {
+        let both = ["recovery", "other:android"];
+        assert_eq!(other_offered(&rec("other=android\n"), &both), Some("android".into()));
+        assert_eq!(other_offered(&rec("other=android\n"), &["recovery"]), None, "the parent doesn't announce it");
+        assert_eq!(other_offered(&rec("other=android\n"), &[]), None, "a parent from before glassine.answers=");
+        assert_eq!(other_offered(&rec(""), &both), None, "the board names none");
+        assert_eq!(other_offered(&rec("other=windows\n"), &both), None, "another name");
+        assert_eq!(other_offered(&rec("other=Android\n"), &["other:Android"]), None, "not a name");
+        assert_eq!(other_label("android"), "Android");
     }
 }

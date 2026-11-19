@@ -134,6 +134,11 @@ fn decide_args(cur: &InUse, choice: &Choice) -> Decision {
         a
     };
     match choice {
+        // Not counted, as the recovery: the other system never marks a GlassineOS start
+        // healthy. A request is left for a GlassineOS start.
+        Choice::Other(name) => {
+            return Decision { answer: Answer::new(Boot::Other(name.clone()), "choice"), changes, counted: false };
+        }
         Choice::Recovery => {
             if request == "recovery" {
                 changes.push(("request", String::new()));
@@ -186,7 +191,8 @@ pub fn pick_write(entry: &InUse, d: &Decision) -> Vec<(&'static str, String)> {
 }
 
 /// The answer when the pick's write fails (FR-005): the recovery for the recovery pick,
-/// else the baseline.
+/// else the baseline (the other system's pick included: the menu write's count and
+/// `drew=1` would stay behind for a system that never marks a GlassineOS start healthy).
 pub fn not_written(choice: &Choice) -> Answer {
     match choice {
         Choice::Recovery => Answer::new(Boot::Recovery, "choice"),

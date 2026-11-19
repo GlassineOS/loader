@@ -47,9 +47,9 @@ region table) with the load option `glassine.handback=1`
 ([boot spec 012](https://github.com/GlassineOS/boot/blob/main/specs/012-device-boot-partition/spec.md),
 [`docs/handback.md`](https://github.com/GlassineOS/boot/blob/main/docs/handback.md); this
 repository's [`specs/002-handback/spec.md`](specs/002-handback/spec.md); pinned at boot
-`c7d1d10d`). Then the loader
+`fe79402b`). Then the loader
 reads its record from the boot partition, counts the start, and exits with its answer
-(`baseline`, `recovery` or a kernel set) in the exit data. It draws nothing, unless the
+(`baseline`, `recovery`, a kernel set, or the other system a parent announces) in the exit data. It draws nothing, unless the
 record has `display=epd-fw` and the firmware's graphics output has a panel refresh: then
 it draws the splash ([`specs/003-epd-fw-display`](specs/003-epd-fw-display/spec.md)),
 and, when the running system asked for it (`request=menu`) or the last start wasn't

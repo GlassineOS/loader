@@ -53,6 +53,7 @@ changed; none when it was already the focused one), the splash is drawn (one ful
 | GlassineOS | what the start answers without the menu (by the count; `baseline` when `default` is empty) | as that start's: counted, `started_why=default` (or `limit`) |
 | Previous deployment, a deployment under "More" | the same, with `cmdline_add=glassine.deploy.once=<id>`; with `parent_cmdline=no` the same without it | the same as GlassineOS; with `parent_cmdline=no` also `deploy_once=<id>` |
 | Previous kernel (only when `previous` is set and `parent_sets` isn't `no`) | `set:<previous>` | counted, `started=<previous>`, `started_why=choice` |
+| Android (FR-004a: the record's `other=android` and the parent's `other:android`) | `other:android` | not counted: `unmarked` as it was at entry |
 | Recovery | `recovery` | not counted: `unmarked` as it was at entry |
 
 Every pick's write also clears `drew`. Only a deployment's pick under
@@ -70,7 +71,11 @@ since its `set:` answer would boot the baseline. On a PC neither key is set and 
 changes.
 
 **Acceptance**: a QEMU case per entry: the scripted tap at the entry's centre gives that
-answer and that record; "More" opens the second list and "Back" returns.
+answer and that record; "More" opens the second list and "Back" returns. The Android
+entry: with the stand-in's `glassine.answers=recovery,other:android` and the record's
+`other=android` it is the row before the recovery and answers `other:android`, not
+counted; with only one of the two there is no entry and the frames are those of the
+recovery case.
 
 ### Scenario 4 – No input (Priority: P1)
 
@@ -137,8 +142,17 @@ writes `display_failed=1`.
 - **FR-004**: The entries are the list of 010 FR-039 and FR-040 as the PC loader builds
   it from the record read at entry: GlassineOS, the previous deployment, "More
   deployments" (the candidate, the last failed and the kept ones, then "Back"), the
-  previous kernel when `previous` is set, the recovery. No other entry: no firmware
-  set-up, no Android.
+  previous kernel when `previous` is set, the other system of FR-004a, the recovery. No
+  other entry: no firmware set-up.
+- **FR-004a**: The other system (boot `docs/handback.md`, "The other system"): an entry
+  named for the record's `other` ("Android" for `android`), before the recovery, only
+  when the record's `other` is a valid name **and** the parent's `glassine.answers=`
+  holds `other:<name>` (spec 002 FR-006a). Its pick answers `boot=other:<name>`,
+  `why=choice`, and is not counted, as the recovery's (`unmarked` as at entry, `drew`
+  cleared); a request in the record stays. When its write fails the answer is
+  `baseline` (FR-005). The PC path has no such entry. On the Note Air the parent that
+  announces `other:android` is the ABL from `v3.4-android-once` (not flashed); under
+  `v3.3-handback` the entry is never shown.
 - **FR-005**: Each pick is answered and written as Scenario 3's table says, the write
   computed from the record read at entry and applied over the menu write, with
   `unmarked` written explicitly and `drew` cleared. When the pick's write fails, the
@@ -215,8 +229,9 @@ nothing and sets `display_failed` (003 FR-010).
 ## Out of scope
 
 A touch driver for the panel's controller (separate work, a tap source behind FR-010);
-keys driving the menu; long press, drag and scrolling; the firmware's set-up; an Android entry; any change to
-the parent; drawing after the answer.
+keys driving the menu; long press, drag and scrolling; the firmware's set-up; how the
+parent starts the other system (the ABL's, GlassineOS/abl `glassine/android-once`); any
+change to the parent; drawing after the answer.
 
 ## Success criteria
 
