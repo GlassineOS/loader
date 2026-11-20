@@ -2251,13 +2251,14 @@ def menu_on_the_devices_shape_logs_what_the_refresh_is_handed():
     """004 FR-008 on the Note Air's shape (parent.fakefw=device: the panel bound by
     DisplaySplashBufferInfo, the touch stand-in, no firmware pointer) with a record as the
     device's: a previous deployment named by a long label, the other system, the
-    recovery. Before each refresh the loader logs the framebuffer's CRC, the same the
-    stand-in computes for the picture it is handed; a long line stays one line, cut."""
+    recovery. With display_crc=1 the loader logs the framebuffer's CRC before each
+    refresh, the same the stand-in computes for the picture it is handed; a long line
+    stays one line, cut."""
     keys = dict(MENU_REC)
     keys.pop("previous")
     keys.pop("previous_rec")
     keys.update(deploys="1", deploy1="20261119-b56f7a79be473e08 previous 20261119-b56f7a79be473e08 2026-11-19",
-                other="android")
+                other="android", display_crc="1")
     extra = f"parent.nopointer=1 parent.faketouch=1 parent.touchtaps= {ANDROID}"
     d = menu_disk("menu-device", extra=extra, fw="device", touch="on", **keys)
     log, boot, ans = menu_run("menu-device", d)
@@ -2455,6 +2456,9 @@ def menu_timeout_takes_the_default_under_the_watchdog():
     assert keys == [("0002", "0000"), ("0002", "0000"), ("0000", "000d")], keys
     # The menu, the default's card turned black when the minute is up, the splash.
     assert "MENU_PICK" not in log and len(menu_rects(log)) == 3, menu_rects(log)
+    # Without display_crc=1 no CRC is read: only the pixels written and three read back.
+    fb = re.findall(r"EPD_FB [^\r\n]*", log)
+    assert len(fb) == 3 and all(" written=" in l and "crc=" not in l for l in fb) and "EPD_FB_CHANGED" not in log, fb
     assert menu_rects(log)[1] != FULL, menu_rects(log)
     assert "MENU_TIMEOUT 60 s: GlassineOS" in log, log[-600:]
     assert ans.startswith(f"format=1 boot=set:{SET_A}") and boot == "baseline", ans
