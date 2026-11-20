@@ -139,7 +139,9 @@ impl EpdFw {
     /// time. The log also gives what the refresh is handed (the framebuffer's CRC, the
     /// pixels written since the last refresh, three of them read back) and the CRC after
     /// it, so a picture that never reaches the panel shows whether it was in the
-    /// framebuffer.
+    /// framebuffer. On the Note Air the firmware's refresh itself writes into the
+    /// framebuffer (`EPD_FB_CHANGED`; the top-left pixel at least): a known behaviour of
+    /// that firmware, not corrected here.
     fn refresh(&mut self, r: Rect) -> Status {
         crate::watchdog::arm();
         let (lw, lh) = self.size();
