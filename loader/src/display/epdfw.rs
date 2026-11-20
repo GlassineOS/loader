@@ -41,6 +41,9 @@ pub struct EpdFw {
     pub refreshes: u32,
     /// Pixels written into the framebuffer since the last refresh, for the log.
     written: u64,
+    /// Log the framebuffer's CRC around each refresh (`display_crc=1`). Off by default:
+    /// each CRC reads the whole framebuffer, about 0.75 s on the Note Air.
+    pub crc_log: bool,
 }
 
 /// The first extended GOP whose framebuffer holds a packed RGB565 panel, or why none.
@@ -75,7 +78,7 @@ pub fn find() -> Result<EpdFw, String> {
             plan::epd_bound(fb, w, h, mode, var)?
         }
     };
-    Ok(EpdFw { gop, fb, w, h, bound, dirty: Vec::new(), partial: true, refreshes: 0, written: 0 })
+    Ok(EpdFw { gop, fb, w, h, bound, dirty: Vec::new(), partial: true, refreshes: 0, written: 0, crc_log: false })
 }
 
 fn rgb565(p: u32) -> u16 {
@@ -136,20 +139,20 @@ impl EpdFw {
     }
 
     /// One refresh of native rectangle `r`, the watchdog re-armed first, logged with its
-    /// time. The log also gives what the refresh is handed (the framebuffer's CRC, the
-    /// pixels written since the last refresh, three of them read back) and the CRC after
-    /// it, so a picture that never reaches the panel shows whether it was in the
-    /// framebuffer. On the Note Air the firmware's refresh itself writes into the
-    /// framebuffer (`EPD_FB_CHANGED`; the top-left pixel at least): a known behaviour of
-    /// that firmware, not corrected here.
+    /// time. Before it the log gives what the refresh is handed: the pixels written since
+    /// the last refresh and three of them read back, and with `crc_log` the framebuffer's
+    /// CRC, then the CRC after the refresh if the refresh changed it. On the Note Air the
+    /// firmware's refresh itself writes into the framebuffer (`EPD_FB_CHANGED`; the
+    /// top-left pixel at least): a known behaviour of that firmware, not corrected here.
     fn refresh(&mut self, r: Rect) -> Status {
         crate::watchdog::arm();
         let (lw, lh) = self.size();
-        let before = self.crc();
+        let before = if self.crc_log { Some(self.crc()) } else { None };
+        let crc = before.map_or(String::new(), |c| alloc::format!("crc={c:08x} "));
         crate::log!(
-            "EPD_FB {} crc={:08x} written={} px(0,0)={:04x} px(mid)={:04x} px(card0)={:04x}",
+            "EPD_FB {} {}written={} px(0,0)={:04x} px(mid)={:04x} px(card0)={:04x}",
             self.refreshes + 1,
-            before,
+            crc,
             self.written,
             self.at(0, 0),
             self.at(lw / 2, lh / 2),
@@ -160,10 +163,12 @@ impl EpdFw {
         let st = fwgop::refresh(&self.gop, self.fb, r.x, r.y, r.w, r.h, self.w).unwrap_or(Status::UNSUPPORTED);
         self.refreshes += 1;
         let ms = crate::arch::now_ms() - t0;
-        let after = self.crc();
         crate::log!("EPD_REFRESH {} x={} y={} w={} h={} status={:?} in {} ms", self.refreshes, r.x, r.y, r.w, r.h, st, ms);
-        if after != before {
-            crate::log!("EPD_FB_CHANGED {} by the refresh crc={:08x}", self.refreshes, after);
+        if let Some(b) = before {
+            let after = self.crc();
+            if after != b {
+                crate::log!("EPD_FB_CHANGED {} by the refresh crc={:08x}", self.refreshes, after);
+            }
         }
         st
     }

@@ -187,7 +187,11 @@ writes `display_failed=1`.
   0)` with `Fb` the framebuffer's base. With `display_partial=0` in the record every
   refresh is (0, 0, W, H). One input gives one refresh at most, plus the splash's when
   it is a pick. Each refresh is logged with its rectangle and how long it took
-  (`EPD_REFRESH`).
+  (`EPD_REFRESH`), and before it with the pixels written since the last one and three
+  read back (`EPD_FB`). With `display_crc=1` in the record the log also gives the
+  framebuffer's CRC-32 when the menu starts, before each refresh and, when the refresh
+  changed it, after (`EPD_FB_CHANGED`): a diagnostic, off by default, since each CRC
+  reads the whole framebuffer.
 - **FR-010**: Taps are the only input, from one tap source: it gives the touch's state,
   pressed or not, at a position on the portrait panel, polled, never waited on. The menu
   depends on nothing else, so a touch driver of the loader's own for the panel's
