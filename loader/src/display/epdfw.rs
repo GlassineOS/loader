@@ -39,6 +39,8 @@ pub struct EpdFw {
     pub partial: bool,
     /// Refreshes made, for the log.
     pub refreshes: u32,
+    /// Pixels written into the framebuffer since the last refresh, for the log.
+    written: u64,
 }
 
 /// The first extended GOP whose framebuffer holds a packed RGB565 panel, or why none.
@@ -73,7 +75,7 @@ pub fn find() -> Result<EpdFw, String> {
             plan::epd_bound(fb, w, h, mode, var)?
         }
     };
-    Ok(EpdFw { gop, fb, w, h, bound, dirty: Vec::new(), partial: true, refreshes: 0 })
+    Ok(EpdFw { gop, fb, w, h, bound, dirty: Vec::new(), partial: true, refreshes: 0, written: 0 })
 }
 
 fn rgb565(p: u32) -> u16 {
@@ -116,17 +118,53 @@ impl EpdFw {
             }
         }
         self.dirty.clear();
+        self.written = u64::from(self.w) * u64::from(self.h);
         self.refresh(Rect { x: 0, y: 0, w: self.w, h: self.h })
     }
 
+    /// The CRC-32 of the whole framebuffer (packed RGB565, the native panel row by row):
+    /// the same value a host test's stand-in computes for the same picture.
+    pub fn crc(&self) -> u32 {
+        let bytes = unsafe { core::slice::from_raw_parts(self.fb as *const u8, (self.w * self.h * 2) as usize) };
+        glassine_loader_core::gspl::crc32(bytes)
+    }
+
+    /// The framebuffer's pixel at portrait (u, v).
+    fn at(&self, u: u32, v: u32) -> u16 {
+        let (x, y) = (self.w - 1 - v, u);
+        unsafe { core::ptr::read_volatile((self.fb as *const u16).add((y * self.w + x) as usize)) }
+    }
+
     /// One refresh of native rectangle `r`, the watchdog re-armed first, logged with its
-    /// time.
+    /// time. The log also gives what the refresh is handed (the framebuffer's CRC, the
+    /// pixels written since the last refresh, three of them read back) and the CRC after
+    /// it, so a picture that never reaches the panel shows whether it was in the
+    /// framebuffer. On the Note Air the firmware's refresh itself writes into the
+    /// framebuffer (`EPD_FB_CHANGED`; the top-left pixel at least): a known behaviour of
+    /// that firmware, not corrected here.
     fn refresh(&mut self, r: Rect) -> Status {
         crate::watchdog::arm();
+        let (lw, lh) = self.size();
+        let before = self.crc();
+        crate::log!(
+            "EPD_FB {} crc={:08x} written={} px(0,0)={:04x} px(mid)={:04x} px(card0)={:04x}",
+            self.refreshes + 1,
+            before,
+            self.written,
+            self.at(0, 0),
+            self.at(lw / 2, lh / 2),
+            self.at(lw / 2, 488)
+        );
+        self.written = 0;
         let t0 = crate::arch::now_ms();
         let st = fwgop::refresh(&self.gop, self.fb, r.x, r.y, r.w, r.h, self.w).unwrap_or(Status::UNSUPPORTED);
         self.refreshes += 1;
-        crate::log!("EPD_REFRESH {} x={} y={} w={} h={} status={:?} in {} ms", self.refreshes, r.x, r.y, r.w, r.h, st, crate::arch::now_ms() - t0);
+        let ms = crate::arch::now_ms() - t0;
+        let after = self.crc();
+        crate::log!("EPD_REFRESH {} x={} y={} w={} h={} status={:?} in {} ms", self.refreshes, r.x, r.y, r.w, r.h, st, ms);
+        if after != before {
+            crate::log!("EPD_FB_CHANGED {} by the refresh crc={:08x}", self.refreshes, after);
+        }
         st
     }
 
@@ -176,6 +214,7 @@ impl super::Display for EpdFw {
             }
         }
         if w > 0 && h > 0 {
+            self.written += u64::from(w) * u64::from(h);
             self.dirty.push(Rect { x, y, w, h });
         }
     }

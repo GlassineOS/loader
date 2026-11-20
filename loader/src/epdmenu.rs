@@ -348,6 +348,9 @@ fn show(epd: &mut EpdFw, keys: &mut Keys, log_title: &str, title: &str, reason: 
 /// The caller has made the menu write; the splash and the pick's write follow.
 pub fn run(epd: &mut EpdFw, rec: &InUse, src: Box<dyn TapSource>, other: Option<&str>, why: Why) -> Choice {
     let (w, h) = epd.size_native();
+    // What the framebuffer holds before the menu draws (the firmware's or the last start's
+    // picture), to compare with the CRCs before each refresh.
+    log!("EPD_FB 0 crc={:08x} at the menu's start", epd.crc());
     unsafe {
         log!("MENU_INPUT {}", src.name());
         TAPS = Some(Taps { src, deb: Debounce::default(), down: false });

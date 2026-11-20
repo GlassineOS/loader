@@ -298,6 +298,8 @@ static lv_obj_t *text(lv_obj_t *parent, const char *s, const lv_font_t *font, in
     lv_obj_set_style_text_line_space(l, lh - font->line_height, 0);
     lv_obj_set_width(l, w);
     lv_label_set_long_mode(l, mode);
+    /* One line, cut with dots: LVGL cuts only at a set height, else the text wraps. */
+    if(mode == LV_LABEL_LONG_MODE_DOTS) lv_obj_set_height(l, font->line_height);
     lv_label_set_text(l, s);
     lv_obj_set_pos(l, x, y + (lh - font->line_height) / 2);
     return l;
