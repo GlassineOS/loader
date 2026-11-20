@@ -2127,11 +2127,11 @@ MENU_REC = dict(display="epd-fw", request="menu", default=SET_A, default_rec="aa
 MENU_SPLASH = None
 
 
-def menu_disk(name, taps=(), extra="", **keys):
+def menu_disk(name, taps=(), extra="", fw="1", **keys):
     global MENU_SPLASH
     if MENU_SPLASH is None:
         MENU_SPLASH = mksplash.encode(portrait_px(600, 800, 0, 0xC0C0C0), 600, 800, PORTRAIT, 0xFFFFFF)
-    cfg = f"parent.fakefw=1 parent.fbdump=1 parent.taps={','.join(taps)} {extra}".strip()
+    cfg = f"parent.fakefw={fw} parent.fbdump=1 parent.taps={','.join(taps)} {extra}".strip()
     return hb_disk(name, hb_record(**keys), cfg=cfg, images={"splash": MENU_SPLASH})
 
 
@@ -2244,6 +2244,30 @@ DEPLOY_LIST = dict(deploys="4", deploy1="20261115-102217 previous e4ffb6ec 2026-
                    deploy2="20261118-090000 candidate f00dcafe 2026-11-18",
                    deploy3="20261116-120000 failed f00dcafe 2026-11-16",
                    deploy4="20261101-080000 kept e4ffb6ec 2026-11-01")
+
+
+@case("x86_64", "aarch64")
+def menu_on_the_devices_shape_logs_what_the_refresh_is_handed():
+    """004 FR-008 on the Note Air's shape (parent.fakefw=device: the panel bound by
+    DisplaySplashBufferInfo, the touch stand-in, no firmware pointer) with a record as the
+    device's: a previous deployment named by a long label, the other system, the
+    recovery. Before each refresh the loader logs the framebuffer's CRC, the same the
+    stand-in computes for the picture it is handed; a long line stays one line, cut."""
+    keys = dict(MENU_REC)
+    keys.pop("previous")
+    keys.pop("previous_rec")
+    keys.update(deploys="1", deploy1="20261119-b56f7a79be473e08 previous 20261119-b56f7a79be473e08 2026-11-19",
+                other="android")
+    extra = f"parent.nopointer=1 parent.faketouch=1 parent.touchtaps= {ANDROID}"
+    d = menu_disk("menu-device", extra=extra, fw="device", touch="on", **keys)
+    log, boot, ans = menu_run("menu-device", d)
+    frames(d, "menu-device")
+    assert "MENU_SHOWN Start GlassineOS (4 entries)" in log and "MENU_TIMEOUT" in log, log[-2000:]
+    logged = re.findall(r"EPD_FB ([1-9]\d*) crc=([0-9a-f]{8}) written=(\d+)", log)
+    assert [c for _, c, _ in logged] == crcs(log), (logged, crcs(log))
+    assert all(int(n) > 0 for _, _, n in logged), logged
+    assert re.search(r"EPD_FB 0 crc=[0-9a-f]{8} at the menu's start", log) and "EPD_FB_CHANGED" not in log, log[-2000:]
+    golden("menu-device", crcs(log))
 
 
 @case("x86_64", "aarch64")
