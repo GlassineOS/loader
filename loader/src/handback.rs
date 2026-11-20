@@ -378,6 +378,7 @@ fn start_menu<S: RecordStore + plan::SplashStore + Log>(
     answers: &[&str],
 ) -> Option<Answer> {
     epd.partial = entry.rec.get("display_partial") != "0";
+    epd.crc_log = entry.rec.get("display_crc") == "1";
     let mut cur = entry.clone();
     let mut w1 = ep.any.clone();
     w1.extend(menu::open_write(entry));
