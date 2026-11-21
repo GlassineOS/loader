@@ -704,6 +704,85 @@ def override_drawn_once_then_gone():
     assert "OVERRIDE" not in vm.log()
 
 
+def screen_picture_px(w, h):
+    """A screen as a session shows it: a light page, a bar, windows of text-like rows and
+    a photo-like gradient (what LZ4 without the filter meets in a picture of a screen)."""
+    px = []
+    for y in range(h):
+        for x in range(w):
+            if y < 40:
+                p = 0x202428
+            elif 80 <= x < w // 2 - 20 and 80 <= y < h - 80:
+                p = 0x101010 if (y // 6) % 4 == 0 and (x * 7 + y // 24 * 13) % 23 < 15 else 0xFAFAF8
+            elif w // 2 + 20 <= x < w - 80 and 80 <= y < h - 80:
+                p = (((x * 255) // w) << 16) | (((y * 255) // h) << 8) | ((x ^ y) & 0xFF)
+            else:
+                p = 0xE8E6E0
+            px.append(p)
+    return px
+
+
+def encode_screen_picture(px, w, h):
+    """The override as the hibernate step writes it (GlassineOS/boot glassine-splash-store
+    override --picture): gspl-encode --layout rgb888 --compression fast, the mode = the
+    picture's size (no --mode, no --bg)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        src, out = os.path.join(t, "in.ppm"), os.path.join(t, "out.gspl")
+        with open(src, "wb") as f:
+            f.write(b"P6\n%d %d\n255\n" % (w, h))
+            f.write(b"".join(bytes(((p >> 16) & 255, (p >> 8) & 255, p & 255)) for p in px))
+        run(GSPL_ENCODE, "--layout", "rgb888", "--compression", "fast", src, out)
+        return open(out, "rb").read()
+
+
+@case("x86_64", "aarch64")
+def hibernate_picture_override_drawn_then_gone():
+    """011 FR-024, SC-010: a picture of the whole screen as the hibernate step writes it
+    (RGB, LZ4 without the filter, made for the display mode) is drawn pixel for pixel
+    through the kernel's start, is gone after that start, and the next start shows the
+    splash."""
+    px = screen_picture_px(W, H)
+    img = encode_screen_picture(px, W, H)
+    assert (img[8], img[28], img[36], img[38]) == (2, 2, 2, 0), "rgb888, lz4, no filter"
+    d = installed("hibernate-picture")
+    d.put("glassine/splash/splash.gspl", SPLASH)
+    d.put("glassine/splash/override.gspl", img)
+    vm = VM("hibernate-picture-1", d)
+    vm.wait("OVERRIDE_REMOVED")
+    vm.wait("HINT_HIDDEN")
+    assert_exact(vm.shot("hibernate-picture"), px, "the picture of the screen after the wait")
+    vm.wait("START_KERNEL")
+    assert_exact(vm.shot("hibernate-picture-kernel"), px, "the picture of the screen at the kernel's start")
+    stub(vm)
+    vm.finish()
+    assert not d.has("glassine/splash/override.gspl"), "the picture still in the store"
+    vm = VM("hibernate-picture-2", d)
+    vm.wait("SPLASH_DRAWN splash")
+    vm.wait("HINT_HIDDEN")
+    assert_exact(vm.shot("splash"), WANT_SPLASH, "the splash at the next start")
+    stub(vm)
+    vm.finish()
+
+
+@case()
+def hibernate_picture_of_another_mode_is_not_drawn():
+    """011 FR-008, FR-027, SC-006: a picture of the screen made at another mode (the
+    session's mode is not the loader's) is not drawn, the splash is, and it is used up."""
+    w, h = 1024, 768
+    img = encode_screen_picture(screen_picture_px(w, h), w, h)
+    d = installed("hibernate-picture-mode")
+    d.put("glassine/splash/splash.gspl", SPLASH)
+    d.put("glassine/splash/override.gspl", img)
+    vm = VM("hibernate-picture-mode", d)
+    vm.wait(f"override not drawn: made for {w}x{h}, the display is {W}x{H}")
+    vm.wait("HINT_HIDDEN")
+    assert_exact(vm.shot("splash"), WANT_SPLASH, "the splash instead of a picture of another mode")
+    stub(vm)
+    vm.finish()
+    assert not d.has("glassine/splash/override.gspl"), "the picture still in the store"
+
+
 @case()
 def override_on_a_read_only_store_is_not_drawn():
     """011 FR-012, 010 FR-009: a store the loader can't write: no override drawn, no
