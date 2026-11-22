@@ -61,14 +61,14 @@ jobs:
           printf 'P5 4 2 255\n\000\000\000\000\011\011\011\310' > out/t.pgm
           dist/gspl-encode-x86_64-linux --layout grey8 out/t.pgm out/t.gspl
           dist/gspl-encode-x86_64-linux --check out/t.gspl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: loader-${{ matrix.arch }}
           path: dist/
           retention-days: 7
           if-no-files-found: error
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-${{ matrix.arch }}
           path: |
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: make loader ARCH=${{ matrix.arch }}
       - run: make gspl-encode-static ARCH=${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rebuild-${{ matrix.arch }}
           path: |
