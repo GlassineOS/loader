@@ -26,7 +26,7 @@ jobs:
       - run: make loader ARCH=${{ matrix.arch }}
       - run: make test ARCH=${{ matrix.arch }}
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-${{ matrix.arch }}
           path: |
@@ -47,7 +47,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - run: make test-fw2
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-x86_64-fw2
           path: |
