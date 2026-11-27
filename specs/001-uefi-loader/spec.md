@@ -21,8 +21,8 @@ GlassineOS/boot owns what a PC's loader does and the bytes it reads and writes:
 
 This spec is the loader's own. It says how the loader meets those documents, which of
 their requirements it carries (by their numbers), and how it reads them where they leave
-a choice. It pins boot at commit `cf3271dd8947069aa8304b4ac9e16c18f0eafd92`, and the image
-format at `887ee626e9723f4bd722afbb19be2e16c0b84cb7` (format 2). Where the
+a choice. It pins boot at commit `cc179dc0fe85538e7f18c01a50903e96abd391a9`, and the image
+format at `301b4a5a18bdb0e4f37b780866e1f6ced05e02a0` (format 2). Where the
 documents and this spec differ, the documents win and this spec is corrected.
 
 The loader is one program for x86-64 PCs today. The same program is meant to build for
